@@ -562,3 +562,23 @@ network_control:
 MVP decision:
 - Day 1 implementation uses `docker_network`
 - Interface remains compatible with a future `iptables` backend
+
+
+## 11. 实现 Milestones
+
+按依赖关系自底向上推进，每个 milestone 都有可独立验证的产出。
+
+| # | Milestone | 验证标准 |
+|---|-----------|----------|
+| 1 | Local topology runs | `Orchestrator.setup()` 拉起所有容器与网络，`docker ps` 可见全部节点 READY |
+| 2 | Game loop runs | `GameMgr.start()` 跑通 DEFENSE ⇄ ATTACK 状态机（网络开关可先用 no-op stub） |
+| 3 | Network switching works | `set_cross_team_network(allow)` 真实切换 `game_net`，跨队连通性符合 phase 预期 |
+| 4 | Agent works | Agent 在 Dev/Prod 容器内上线，`heartbeat` 与 `deploy_complete` 正确上报 GameMgr |
+| 5 | Flag submit works | `POST /game/flag/submit` 全链路：选手提交 → 验证 → 发出 `FLAG_SUBMITTED` 事件 |
+| 6 | Panel works | `panel.html` 通过 WS 实时显示 Round / Phase / 事件流 |
+
+**依赖与并行性**：
+
+- M2 可在 M3 未完成前用 no-op 网络开关跑通状态机
+- M5 依赖 M2（API）和 M4（队伍上下文），不依赖 M6
+- M6 仅消费 Event Bus，M2 之后任意时点都可接入
