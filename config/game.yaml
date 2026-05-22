@@ -18,7 +18,7 @@ nodes:
   - id: team1_prod
     image: cyberarena/prod-base
     networks: [team1_net, game_net]
-    ports: ["8001:5000"]
+    ports: ["127.0.0.1:8001:5000"]   # host loopback only — blocks container-via-gateway sidechannel
     install_list: []
 
   - id: team2_dev
@@ -29,7 +29,7 @@ nodes:
   - id: team2_prod
     image: cyberarena/prod-base
     networks: [team2_net, game_net]
-    ports: ["8002:5000"]
+    ports: ["127.0.0.1:8002:5000"]   # host loopback only — blocks container-via-gateway sidechannel
     install_list: []
 
 networks:

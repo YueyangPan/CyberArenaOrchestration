@@ -26,11 +26,20 @@
 | 链路 | DEFENSE | ATTACK | 走的网络 | M3 是否插拔 |
 |------|---------|--------|----------|-------------|
 | 跨队 prod ↔ prod | ❌ 断开 | ✅ 双向 | `game_net` | ✅ 唯一会动的链路 |
+| **跨队 dev ↔ 任何（dev/prod）** | ❌ **始终不可达** | ❌ **始终不可达** | 无共享 docker 网络 | ❌ 结构性隔离 |
 | 队内 dev ↔ prod | ✅ | ✅ | `team{N}_net` | ❌ |
 | 队内 prod ↔ prod（自己 dev 跟自己 prod） | ✅ | ✅ | `team{N}_net` | ❌ |
 | Orchestrator host ↔ 任何容器 | ✅ | ✅ | docker SDK / port mapping | ❌ |
 
-也就是说 `set_cross_team_network` 只对 prod 容器在 `game_net` 上的 endpoint 做 connect/disconnect，**不要碰** `team{N}_net`。NetworkManager 推导 service container 列表时也要显式过滤"包含 `game_net`"，不要顺手把 dev 容器一起处理。
+`set_cross_team_network` 只对 prod 容器在 `game_net` 上的 endpoint 做 connect/disconnect，**不要碰** `team{N}_net`。NetworkManager 推导 service container 列表时显式过滤"包含 `game_net`"，不要顺手把 dev 容器一起处理。
+
+### 跨队 dev 隔离：禁止 agent ↔ agent 直接攻击
+
+两个 agent（分别跑在 team1_dev / team2_dev）必须**任何相位都不能直接互相访问对方容器**——攻击只能通过 prod↔prod via `game_net` 这条受控通道。这是为了让游戏机制不被旁路：
+
+1. **Docker 网络层结构性隔离**：dev 容器只挂自己的 `team_net`，永远不在 `game_net` 上，所以跨队 dev↔anything 没有共享网络，docker DNS / IP 都无解。
+2. **Host port mapping 旁路已封堵**：`game.yaml` 里 prod 的端口绑定用 `127.0.0.1:8001:5000`（仅 host loopback）。否则 dev 容器经默认网关到 host 后能直达 `host:8002` → team2_prod，绕过 team_net 隔离。
+3. **集成测试断言**：M3 测试里 assert `team1_dev → team2_prod`、`team1_dev → team2_dev` 在任何相位都失败（不仅是 DEFENSE）。
 
 ### TCP reset 行为
 

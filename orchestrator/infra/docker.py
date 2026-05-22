@@ -76,10 +76,21 @@ class ContainerManager:
         return c.status == "running"
 
     @staticmethod
-    def _parse_ports(specs: list[str]) -> dict[str, int]:
-        """'8001:80' -> {'80/tcp': 8001}."""
-        out: dict[str, int] = {}
+    def _parse_ports(specs: list[str]) -> dict[str, int | tuple[str, int]]:
+        """Parse docker port spec.
+
+        '8001:80'             -> {'80/tcp': 8001}            (bind 0.0.0.0:8001)
+        '127.0.0.1:8001:80'   -> {'80/tcp': ('127.0.0.1', 8001)}  (bind loopback only)
+        """
+        out: dict[str, int | tuple[str, int]] = {}
         for spec in specs:
-            host, container = spec.split(":")
-            out[f"{int(container)}/tcp"] = int(host)
+            parts = spec.split(":")
+            if len(parts) == 2:
+                host, container = parts
+                out[f"{int(container)}/tcp"] = int(host)
+            elif len(parts) == 3:
+                ip, host, container = parts
+                out[f"{int(container)}/tcp"] = (ip, int(host))
+            else:
+                raise ValueError(f"bad port spec: {spec!r}")
         return out
