@@ -146,10 +146,21 @@ orchestrator.node(id).exec(cmd)              # 在容器内执行命令
 orchestrator.node(id).install(pkg)           # 安装软件包
 ```
 
-### 4.2 拓扑配置（YAML 示例）
+### 4.2 拓扑与队伍配置（YAML 示例）
+
+队伍与拓扑耦合度高（每队的 dev/prod 容器一一对应专属 team_net），MVP 合并为单个 `arena.yaml`：
 
 ```yaml
-# config/topology.yaml
+# config/arena.yaml
+
+teams:
+  - id: team1
+    dev: team1_dev
+    prod: team1_prod
+  - id: team2
+    dev: team2_dev
+    prod: team2_prod
+
 nodes:
   - id: team1_dev
     image: kalilinux/kali-rolling
@@ -491,8 +502,7 @@ cyber-arena/
 │   └── events.py              # ✅
 │
 ├── config/
-│   ├── topology.yaml          # ✅ 两队四容器拓扑
-│   └── teams.yaml             # ✅ 队伍配置
+│   └── arena.yaml             # ✅ 队伍 + 两队四容器拓扑 + 网络
 │
 └── main.py                    # ✅ 启动入口
 ```
