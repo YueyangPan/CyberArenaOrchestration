@@ -88,10 +88,13 @@ round_config:
 
 ## Event Bus
 
-`asyncio.Queue` + WS 广播：
+`asyncio.Queue` + 多订阅者（WS broadcast、内存 history、文件 sink）：
 
-- `EventBus.publish(event)` 入队 + fan-out 给所有 WS 订阅
-- `EventBus.history()` 返回历史事件（GET /game/events 用）
+- `EventBus.publish(event)` 入队 + fan-out 给所有订阅者
+- `EventBus.history()` 返回内存历史（GET /game/events 用）
+- **`FileSink`**：每个 event 序列化成一行 JSON 追加到 `runs/<utc-ts>/events.jsonl`，GameMgr.start() 时建目录、open(append)，stop() 时 flush + close
+  - 行格式：`{"ts": <epoch>, "type": "ROUND_START", "team_id": ..., "round_id": ..., "phase": ..., "payload": {...}}`
+  - `runs/` 加入 `.gitignore`
 - M2 实现的 EventType：`ROUND_START`、`PHASE_CHANGE`、`ROUND_STOP`、`SERVICE_DEPLOYED`
 
 ## 任务拆分
@@ -101,7 +104,7 @@ round_config:
 | 1 | `services/notes.py`（实现 Service ABC，无 systemd 版本） | 模块 |
 | 2 | `services/registry.py` + `services/__init__.py` | 模块 |
 | 3 | `config/game.yaml` 新增 `services:` 和 `round_config:` | YAML |
-| 4 | `gamemgr/events.py`（`Event` dataclass + `EventType` enum + `EventBus`） | 模块 |
+| 4 | `gamemgr/events.py`（`Event` dataclass + `EventType` enum + `EventBus` + `FileSink`） | 模块 |
 | 5 | `gamemgr/round.py`（async 状态机 + 相位 timer） | 模块 |
 | 6 | `gamemgr/game_mgr.py`（编排 Service deploy + Round Loop） | 模块 |
 | 7 | `gamemgr/api.py`（FastAPI 路由 + WS） | 模块 |
@@ -118,14 +121,17 @@ sleep 2
 
 curl -s :8000/game/status           # {"phase": "DEFENSE", "round": 1, ...}
 
-docker exec team1_prod bash -c \
-  'echo LIST | nc -q1 localhost 5000' # COUNT 0   (notes adapter healthcheck)
+docker exec team1_dev bash -c \
+  'echo LIST | nc -q1 team1_prod 5000' # COUNT 0   (notes adapter healthcheck via docker DNS)
 
 sleep 12                            # 跨一次 DEFENSE -> ATTACK
 curl -s :8000/game/events | jq      # 至少包含 ROUND_START + PHASE_CHANGE
 
 curl -s -X POST :8000/game/stop     # 触发 stop -> teardown
 wait                                 # main.py 退出
+
+ls runs/                            # 期望：一个 UTC 时间戳目录
+cat runs/*/events.jsonl | head      # 每行一个 JSON event
 
 pytest tests/test_m2_gameloop.py    # 全绿
 ```
