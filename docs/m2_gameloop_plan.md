@@ -41,12 +41,14 @@ services:
 ```
 
 ```python
-# services/registry.py
+# challenges/registry.py
 REGISTRY = {
     "notes": NotesService,
     # "blog": BlogService,
 }
 ```
+
+**命名约定**：vulnerable services（攻防目标）放 `challenges/` 目录，CTF 圈惯用词；`orchestrator/service.py` 里的 `Service` ABC 保持不变（仍是更广义的抽象，将来可能覆盖控制平面 service 如 gateway / telemetry）。
 
 ## Service port & healthcheck
 
@@ -101,8 +103,8 @@ round_config:
 
 | # | 任务 | 输出 |
 |---|------|------|
-| 1 | `services/notes.py`（实现 Service ABC，无 systemd 版本） | 模块 |
-| 2 | `services/registry.py` + `services/__init__.py` | 模块 |
+| 1 | `challenges/notes.py`（实现 Service ABC，无 systemd 版本） | 模块 |
+| 2 | `challenges/registry.py` + `challenges/__init__.py` | 模块 |
 | 3 | `config/game.yaml` 新增 `services:` 和 `round_config:` | YAML |
 | 4 | `gamemgr/events.py`（`Event` dataclass + `EventType` enum + `EventBus` + `FileSink`） | 模块 |
 | 5 | `gamemgr/round.py`（async 状态机 + 相位 timer） | 模块 |
@@ -141,16 +143,17 @@ pytest tests/test_m2_gameloop.py    # 全绿
 ```
 CyberArenaOrchestration/
 ├── config/
-│   ├── game.yaml                  # + services / round_config
+│   ├── game.yaml                  # + challenges / round_config
 │   └── docker/...
 ├── models/topology.py
-├── orchestrator/                  # M1 不动
-├── services/
+├── orchestrator/                  # M1 不动（Service ABC 在此，is_alive 更新为带默认实现）
+├── challenges/                    # vulnerable-service adapters
 │   ├── __init__.py
 │   ├── registry.py
 │   └── notes.py
 ├── gamemgr/
 │   ├── __init__.py
+│   ├── config.py
 │   ├── events.py
 │   ├── round.py
 │   ├── game_mgr.py

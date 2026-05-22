@@ -1,5 +1,5 @@
 # Cyber Arena — match configuration
-# Combines teams + topology (nodes + networks) for MVP.
+# Combines teams + topology + challenges + round config for MVP.
 
 teams:
   - id: team1
@@ -18,7 +18,7 @@ nodes:
   - id: team1_prod
     image: cyberarena/prod-base
     networks: [team1_net, game_net]
-    ports: ["8001:80"]
+    ports: ["8001:5000"]
     install_list: []
 
   - id: team2_dev
@@ -29,7 +29,7 @@ nodes:
   - id: team2_prod
     image: cyberarena/prod-base
     networks: [team2_net, game_net]
-    ports: ["8002:80"]
+    ports: ["8002:5000"]
     install_list: []
 
 networks:
@@ -39,3 +39,14 @@ networks:
     subnet: 10.2.0.0/24
   game_net:
     subnet: 10.0.0.0/24
+
+challenges:
+  - name: notes
+    type: notes
+    port: 5000
+    deploy_on: [team1, team2]   # team ids; resolved to <team>_prod containers
+
+round_config:
+  defense_secs: 10
+  attack_secs: 10
+  total_rounds: 3
