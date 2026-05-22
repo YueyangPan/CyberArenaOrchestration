@@ -1,6 +1,6 @@
 # Cyber Arena Orchestration
 
-Orchestrator for a 2-team Attack/Defense CTF arena. See [docs/design_v1.md](docs/design_v1.md) for the system design and [docs/m1_plan.md](docs/m1_plan.md) for the current milestone scope.
+Orchestrator for a 2-team Attack/Defense CTF arena. See [docs/design_v1.md](docs/design_v1.md) for the system design and [docs/m1_topology_plan.md](docs/m1_topology_plan.md) for the current milestone scope.
 
 ## Prerequisites
 
@@ -42,7 +42,7 @@ python3 main.py teardown         # full cleanup
 ## Tests
 
 ```bash
-pytest tests/test_m1.py -v
+pytest tests/test_m1_topology.py -v
 ```
 
 The integration test auto-skips if the docker daemon is unreachable.
@@ -71,11 +71,11 @@ CyberArenaOrchestration/
 │       ├── docker.py             # container lifecycle
 │       └── network.py            # network lifecycle + set_cross_team_network stub (M3)
 ├── scripts/build_images.sh
-├── tests/test_m1.py              # full setup -> verify -> teardown integration test
+├── tests/test_m1_topology.py              # full setup -> verify -> teardown integration test
 ├── main.py                       # CLI entry point
 ├── requirements.txt
 └── docs/
     ├── design_v1.md              # system design
-    ├── m1_plan.md                # milestone 1 plan
-    └── m1_report.md              # milestone 1 execution report
+    ├── m1_topology_plan.md       # milestone 1 plan (local topology runs)
+    └── m1_topology_report.md     # milestone 1 execution report
 ```

@@ -71,7 +71,7 @@ prod 容器跑的服务通过实现该 ABC 接入；M2 提供首个实现（端�
 | 8 | `orchestrator/service.py`（Service ABC） | 模块 |
 | 9 | `orchestrator/orchestrator.py`（编排 setup / teardown） | 模块 |
 | 10 | `main.py`（argparse `setup` / `teardown`） | CLI |
-| 11 | `tests/test_m1.py` 集成测试 | pytest |
+| 11 | `tests/test_m1_topology.py` 集成测试 | pytest |
 | 12 | `requirements.txt` | 依赖清单 |
 
 ## 验证
@@ -90,7 +90,7 @@ python main.py teardown
 docker ps -a | grep team                     # 期望：无输出
 docker network ls | grep -E 'team[12]_net'   # 期望：无输出
 
-pytest tests/test_m1.py                      # 期望：全绿
+pytest tests/test_m1_topology.py                      # 期望：全绿
 ```
 
 ## 目录结构（M1 完成后）
@@ -116,12 +116,13 @@ CyberArenaOrchestration/
 ├── scripts/
 │   └── build_images.sh
 ├── tests/
-│   └── test_m1.py
+│   └── test_m1_topology.py
 ├── main.py
 ├── requirements.txt
 └── docs/
     ├── design_v1.md
-    └── m1_plan.md
+    ├── m1_topology_plan.md
+    └── m1_topology_report.md
 ```
 
 ## 依赖

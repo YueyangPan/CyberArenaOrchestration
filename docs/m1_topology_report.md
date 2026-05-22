@@ -1,8 +1,8 @@
-# Milestone 1 — Execution Report
+# Milestone 1 — Local Topology Runs — Execution Report
 
 **Goal:** `Orchestrator.setup()` brings up all containers and docker networks; `docker ps` shows all nodes READY; `teardown()` cleans up fully.
 
-**Status:** Complete. All verification steps in [m1_plan.md](m1_plan.md) pass.
+**Status:** Complete. All verification steps in [m1_topology_plan.md](m1_topology_plan.md) pass.
 
 ## What was built
 
@@ -19,7 +19,7 @@
 | `orchestrator/infra/docker.py` | Container create / start / stop / remove / exec; multi-network attach |
 | `orchestrator/orchestrator.py` | `setup()` (networks -> containers -> install_list -> pre-flight) and `teardown()` |
 | `main.py` | CLI: `setup` / `teardown` |
-| `tests/test_m1.py` | Integration test: parses topology, runs setup, asserts container + network state, runs teardown, asserts cleanup |
+| `tests/test_m1_topology.py` | Integration test: parses topology, runs setup, asserts container + network state, runs teardown, asserts cleanup |
 | `requirements.txt` | `docker`, `pyyaml`, `pytest` |
 
 ## Architectural decisions (locked in M1)
@@ -101,9 +101,9 @@ Post-teardown checks: no `team*` containers remain; no `team{1,2}_net` or `game_
 ### pytest
 
 ```
-$ pytest tests/test_m1.py -v
-tests/test_m1.py::test_topology_parse        PASSED
-tests/test_m1.py::test_setup_then_teardown   PASSED
+$ pytest tests/test_m1_topology.py -v
+tests/test_m1_topology.py::test_topology_parse        PASSED
+tests/test_m1_topology.py::test_setup_then_teardown   PASSED
 2 passed in 13.68s
 ```
 
