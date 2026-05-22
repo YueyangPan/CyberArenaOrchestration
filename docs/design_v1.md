@@ -13,6 +13,16 @@
 
 ---
 
+## 设计原则
+
+以最简洁方式实现 MVP 基础功能；保留扩展空间，接口尽量通用。
+
+- **简洁优先**：只实现当前 milestone 需要的逻辑，不预先抽象未使用的能力
+- **预留接口**：对未来需要替换/扩展的模块（Poller / Healthcheck / Scoreboard 等）只暴露稳定接口，内部以 stub 占位
+- **通用接口**：公开方法不绑定具体实现细节（例如 `set_cross_team_network` 不暴露 docker / iptables 区别），便于后续切换底层
+
+---
+
 ## 1. 拓扑结构
 
 ```mermaid
@@ -321,7 +331,7 @@ team_mgr.status() → TeamStatus
 
 ```
 Agent 职责（MVP）
-  ├─ WebSocket 长连接 → Host GameMgr
+  ├─ WebSocket 长连接 → Host GameMgr（通过 host.docker.internal 寻址，兼容 Ubuntu / macOS）
   ├─ 接收指令：round_start(phase) / round_stop
   ├─ 上报：heartbeat（每 5s）
   └─ 上报：deploy_complete(team_id, round_id, timestamp)
@@ -456,6 +466,7 @@ TeamMgr ──► Orchestrator（DevVM / ProdVM 容器引用）
 | 前端面板 | 单文件 HTML + D3.js（CDN） |
 | 配置 | YAML |
 | 语言 | Python 3.11+ |
+| Host OS | Ubuntu 20.10+ / macOS（Docker Engine 或 Docker Desktop 均可） |
 
 ---
 
