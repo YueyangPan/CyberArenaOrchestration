@@ -31,7 +31,7 @@ class Orchestrator:
     ) -> None:
         self.graph = graph
         self.containers = containers or ContainerManager()
-        self.network = network or NetworkManager()
+        self.network = network or NetworkManager(graph=graph)
 
     def setup(self) -> None:
         log.info("orchestrator setup: %d networks, %d nodes",

@@ -5,20 +5,35 @@ import logging
 import docker
 from docker.errors import NotFound
 
-from models.topology import Network
+from models.topology import Network, TopologyGraph
 
 log = logging.getLogger(__name__)
+
+GAME_NET = "game_net"
 
 
 class NetworkManager:
     """Manages docker networks for the arena.
 
-    Exposes a backend-agnostic interface (set_cross_team_network) that
-    GameMgr calls in later milestones — implementation deferred to M3.
+    Owns the cross-team network switch (game_net attach/detach for service
+    containers). Backend is docker network attach/detach for MVP; an
+    iptables backend (Linux optimization, no reconnect interruption) is a
+    future extension that shares this interface.
     """
 
-    def __init__(self, client: docker.DockerClient | None = None) -> None:
+    def __init__(
+        self,
+        client: docker.DockerClient | None = None,
+        graph: TopologyGraph | None = None,
+    ) -> None:
         self._client = client or docker.from_env()
+        # Service containers = nodes attached to game_net (prod containers).
+        # Dev containers are intentionally excluded so they never get touched
+        # by phase switching — see m3_network_plan.md.
+        if graph is not None:
+            self._service_containers = [n.id for n in graph.nodes if GAME_NET in n.networks]
+        else:
+            self._service_containers = []
 
     def create(self, network: Network) -> str:
         """Create a docker network. Idempotent — returns existing id if present."""
@@ -51,9 +66,31 @@ class NetworkManager:
         log.info("removed network %s", name)
 
     def set_cross_team_network(self, allow: bool) -> None:
-        """Open/close the cross-team game_net.
+        """Open or close cross-team game_net for all registered service containers.
 
-        M3 implementation: docker network connect/disconnect each ServiceContainer
-        to/from game_net. Defense=False (disconnect), Attack=True (reconnect).
+        DEFENSE (allow=False) -> disconnect each service container from game_net.
+        ATTACK  (allow=True)  -> connect each service container back to game_net.
+
+        Idempotent: skips containers that are already in the target state. May
+        reset existing TCP connections — see m3_network_plan.md.
         """
-        raise NotImplementedError("set_cross_team_network: implemented in M3")
+        try:
+            net = self._client.networks.get(GAME_NET)
+        except NotFound:
+            log.warning("set_cross_team_network: %s not found", GAME_NET)
+            return
+
+        for name in self._service_containers:
+            try:
+                container = self._client.containers.get(name)
+            except NotFound:
+                log.warning("set_cross_team_network: container %s not found; skip", name)
+                continue
+            container.reload()
+            attached = GAME_NET in container.attrs["NetworkSettings"]["Networks"]
+            if allow and not attached:
+                net.connect(container)
+                log.info("connected %s to %s", name, GAME_NET)
+            elif not allow and attached:
+                net.disconnect(container)
+                log.info("disconnected %s from %s", name, GAME_NET)

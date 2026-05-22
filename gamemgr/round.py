@@ -62,10 +62,7 @@ class RoundLoop:
 
     async def _enter_phase(self, phase: Phase, *, allow_cross_team: bool, duration: int) -> None:
         self.phase = phase
-        try:
-            self.network.set_cross_team_network(allow_cross_team)
-        except NotImplementedError:
-            pass  # M2: network switching is a stub
+        self.network.set_cross_team_network(allow_cross_team)
         await self.bus.publish(
             new_event(EventType.PHASE_CHANGE, round_id=self.round, phase=phase.value)
         )

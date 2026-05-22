@@ -132,7 +132,6 @@ $ head -5 runs/20260522T215343Z/events.jsonl
 
 | Item | Milestone |
 |------|-----------|
-| `NetworkManager.set_cross_team_network()` real implementation | M3 |
 | Agent install + `deploy_complete` reporting (drives real defense duration via `last_deploy_time`) | M4 |
 | `POST /game/flag/submit` real verification + `FLAG_SUBMITTED` event | M5 |
 | Browser panel consuming `/events/stream` | M6 |
