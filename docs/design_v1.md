@@ -158,10 +158,10 @@ orchestrator.node(id).install(pkg)           # 安装软件包
 
 ### 4.2 拓扑与队伍配置（YAML 示例）
 
-队伍与拓扑耦合度高（每队的 dev/prod 容器一一对应专属 team_net），MVP 合并为单个 `arena.yaml`：
+队伍与拓扑耦合度高（每队的 dev/prod 容器一一对应专属 team_net），MVP 合并为单个 `game.yaml`：
 
 ```yaml
-# config/arena.yaml
+# config/game.yaml
 
 teams:
   - id: team1
@@ -513,7 +513,7 @@ cyber-arena/
 │   └── events.py              # ✅
 │
 ├── config/
-│   └── arena.yaml             # ✅ 队伍 + 两队四容器拓扑 + 网络
+│   └── game.yaml              # ✅ 队伍 + 两队四容器拓扑 + 网络
 │
 └── main.py                    # ✅ 启动入口
 ```
