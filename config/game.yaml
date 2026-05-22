@@ -1,0 +1,41 @@
+# Cyber Arena — match configuration
+# Combines teams + topology (nodes + networks) for MVP.
+
+teams:
+  - id: team1
+    dev: team1_dev
+    prod: team1_prod
+  - id: team2
+    dev: team2_dev
+    prod: team2_prod
+
+nodes:
+  - id: team1_dev
+    image: cyberarena/dev-base
+    networks: [team1_net]
+    install_list: []
+
+  - id: team1_prod
+    image: cyberarena/prod-base
+    networks: [team1_net, game_net]
+    ports: ["8001:80"]
+    install_list: []
+
+  - id: team2_dev
+    image: cyberarena/dev-base
+    networks: [team2_net]
+    install_list: []
+
+  - id: team2_prod
+    image: cyberarena/prod-base
+    networks: [team2_net, game_net]
+    ports: ["8002:80"]
+    install_list: []
+
+networks:
+  team1_net:
+    subnet: 10.1.0.0/24
+  team2_net:
+    subnet: 10.2.0.0/24
+  game_net:
+    subnet: 10.0.0.0/24

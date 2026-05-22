@@ -1,0 +1,15 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip \
+        rsync openssh-client curl ca-certificates \
+        nmap netcat-openbsd sqlmap gobuster \
+        vim tmux tcpdump strace \
+    && pip3 install --break-system-packages --no-cache-dir \
+        websockets requests pwntools \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+CMD ["sleep", "infinity"]

@@ -1,0 +1,45 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class Node:
+    id: str
+    image: str
+    networks: list[str]
+    ports: list[str] = field(default_factory=list)
+    install_list: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Network:
+    name: str
+    subnet: str
+
+
+@dataclass(frozen=True)
+class Team:
+    id: str
+    dev: str
+    prod: str
+
+
+@dataclass(frozen=True)
+class TopologyGraph:
+    teams: list[Team]
+    nodes: list[Node]
+    networks: list[Network]
+
+    def node(self, node_id: str) -> Node:
+        for n in self.nodes:
+            if n.id == node_id:
+                return n
+        raise KeyError(f"unknown node id: {node_id!r}")
+
+    def network(self, name: str) -> Network:
+        for net in self.networks:
+            if net.name == name:
+                return net
+        raise KeyError(f"unknown network: {name!r}")
