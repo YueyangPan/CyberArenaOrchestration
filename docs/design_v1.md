@@ -123,8 +123,8 @@ flowchart TD
 
 ### 3.3 网络切换
 
-- **Defense 开始**：调用 `orchestrator.network.set_cross_team(allow=False)`，iptables DROP game_net 跨队流量
-- **Attack 开始**：调用 `orchestrator.network.set_cross_team(allow=True)`，iptables ACCEPT 跨队流量
+- **Defense 开始**：调用 `orchestrator.network.set_cross_team_network(allow=False)`，断开各队 ServiceContainer 与 `game_net` 的连接
+- **Attack 开始**：调用 `orchestrator.network.set_cross_team_network(allow=True)`，重新接入 `game_net`
 - `poller.start()` / `healthcheck.start()` 预留，MVP 暂不调用
 
 ---
@@ -141,7 +141,7 @@ Orchestrator(graph, {docker, network}, install_list)
 # 主要方法
 orchestrator.setup()                         # topology consolidation → runtime setup
 orchestrator.teardown()                      # 销毁所有容器和网络
-orchestrator.network.set_cross_team(allow)   # 跨队流量开关（iptables）
+orchestrator.network.set_cross_team_network(allow)   # 跨队网络开关（docker network attach/detach）
 orchestrator.node(id).exec(cmd)              # 在容器内执行命令
 orchestrator.node(id).install(pkg)           # 安装软件包
 ```
@@ -178,7 +178,7 @@ networks:
 
   game_net:
     subnet: 10.0.0.0/24
-    # Defense: DROP; Attack: ACCEPT（由 GameMgr 调用 set_cross_team 切换）
+    # Defense: 各队 ServiceContainer 与 game_net 断开；Attack: 重新接入（由 GameMgr 调用 set_cross_team_network 切换）
 ```
 
 ### 4.3 执行流程
@@ -438,7 +438,7 @@ TeamMgr ──► Orchestrator（DevVM / ProdVM 容器引用）
 | 组件 | 技术 |
 |------|------|
 | 容器管理 | Docker SDK for Python (docker-py) |
-| 网络控制 | Docker network + iptables（跨队开关） |
+| 网络控制 | Docker network attach/detach（跨队开关） |
 | API | FastAPI（REST + WebSocket） |
 | Agent 通信 | WebSocket（asyncio，双向持久连接） |
 | 事件总线 | asyncio.Queue → broadcast to WS clients |
@@ -456,7 +456,7 @@ cyber-arena/
 │   ├── orchestrator.py        # ✅ MVP
 │   ├── infra/
 │   │   ├── docker.py          # ✅ 容器生命周期
-│   │   └── network.py         # ✅ iptables 跨队开关
+│   │   └── network.py         # ✅ docker network 跨队开关
 │   └── topology.py            # ✅ TopologyGraph 解析
 │
 ├── game_mgr/
@@ -506,62 +506,21 @@ The agent may modify files, run commands, restart service processes, and inspect
 
 The DevContainer does not mount `/var/run/docker.sock` and cannot control the Docker daemon or other containers.
 
-Giving the agent SSH/root access to its own ServiceContainer allows it to fully control the service container itself; however, exposing Docker socket would effectively grant control over the entire arena infrastructure.
-
 
 ## Network Control Strategy
 
-MVP uses a pluggable network control backend.
-
-Public interface:
+Public interface（GameMgr 只调用此接口，不感知实现）：
 
 ```python
 orchestrator.network.set_cross_team_network(allow: bool)
 ```
 
-GameMgr should only call this interface and must not depend on the underlying implementation details.
+MVP 实现：Docker network attach/detach。
 
-### docker_network backend (MVP default)
+- **Defense**：`docker network disconnect game_net <team_service>` 断开各队 ServiceContainer
+- **Attack**：`docker network connect game_net <team_service>` 重新接入
 
-For local macOS development, the default backend is `docker_network`.
-
-Defense phase:
-- disconnect each ServiceContainer from `game_net`
-
-Attack phase:
-- reconnect each ServiceContainer to `game_net`
-
-Implementation example:
-
-```python
-docker network disconnect game_net team1_service
-docker network disconnect game_net team2_service
-```
-
-This may introduce a short reconnect interruption, which is acceptable for MVP.
-
-### iptables backend (future Linux optimization)
-
-For Linux hosts, a future `iptables` backend can be used:
-
-Defense phase:
-- DROP cross-team traffic
-
-Attack phase:
-- ACCEPT cross-team traffic
-
-This avoids reconnect interruptions and keeps containers attached to the Docker network.
-
-### Config
-
-```yaml
-network_control:
-  backend: docker_network   # docker_network | iptables
-```
-
-MVP decision:
-- Day 1 implementation uses `docker_network`
-- Interface remains compatible with a future `iptables` backend
+reconnect 会有短暂中断，MVP 可接受。
 
 
 ## 11. 实现 Milestones
