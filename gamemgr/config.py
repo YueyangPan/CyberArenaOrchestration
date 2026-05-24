@@ -91,7 +91,10 @@ def _expand_str(s: str) -> str:
 
 def _from_dict(raw: dict) -> GameConfig:
     teams_raw = raw.get("teams", [])
-    teams = [Team(id=t["id"], dev=t["dev"], prod=t["prod"]) for t in teams_raw]
+    teams = [
+        Team(id=t["id"], dev=t["dev"], prod=t["prod"], token=t.get("token", ""))
+        for t in teams_raw
+    ]
     nodes = [
         Node(
             id=n["id"],

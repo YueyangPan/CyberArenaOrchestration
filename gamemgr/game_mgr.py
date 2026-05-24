@@ -37,6 +37,11 @@ class GameMgr:
         # (team_id, service_name) -> Service instance, populated by deploy_challenges
         # so plant_initial_flags can find the right adapter per (team, service).
         self._service_by_owner: dict[tuple[str, str], Service] = {}
+        self._last_planted_round: int = -1
+        # token -> team_id, populated from config; lookup for API auth.
+        self._token_to_team: dict[str, str] = {
+            t.token: t.id for t in config.topology.teams if t.token
+        }
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
@@ -62,14 +67,23 @@ class GameMgr:
             self._deployed.append((service, handles))
 
     def plant_initial_flags(self) -> list[tuple[str, str, str]]:
-        """Generate and plant one flag per (team, deployed service).
+        """Pre-game plant (round_id=0). Same as `plant_flags(0)`; kept under
+        its own name because main.py and the M5 tests call it before the
+        round loop starts."""
+        return self.plant_flags(round_id=0)
 
-        Synchronous — runs after deploy_challenges() and before the round
-        loop starts. Returns the list of (team_id, service_name, flag) that
-        were planted (handy for tests; main.py ignores the return value).
+    def plant_flags(self, round_id: int) -> list[tuple[str, str, str]]:
+        """Re-plant one fresh flag per (team, deployed service).
 
-        Per design_v1.md §3.1 this is a one-shot at game start; per-round
-        rotation is deferred to M5.5.
+        Called once at pre-game (round_id=0) by main.py, then again at the
+        start of every DEFENSE phase by the rotation subscriber installed in
+        `start()`. `FlagStore.plant()` drops the prior flag from the inverted
+        index so it can no longer be submitted — rotation invalidates stale
+        flags immediately, by construction.
+
+        Returns the list of (team_id, service_name, flag) planted (handy
+        for tests). Per-round rotation is the M5.5 addition; the design
+        kept this one-shot in M5 but the store API was already shaped for it.
         """
         planted: list[tuple[str, str, str]] = []
         team_to_prod = {t.id: t.prod for t in self.config.topology.teams}
@@ -78,10 +92,11 @@ class GameMgr:
             cname = team_to_prod[team_id]
             handle = self._handle_for(cname)
             flag = new_flag()
-            log.info("planting flag on %s/%s", team_id, service_name)
+            log.info("planting flag on %s/%s (round=%d)", team_id, service_name, round_id)
             service.plant_flag(handle, flag)
             self.flags.plant(team_id, service_name, flag)
             planted.append((team_id, service_name, flag))
+        self._last_planted_round = round_id
         return planted
 
     def teardown_challenges(self) -> None:
@@ -111,19 +126,44 @@ class GameMgr:
                     )
                 )
 
-        # One event per planted (team, service). Flag string deliberately omitted
-        # — the bus is broadcast to the public panel.
+        # One event per pre-game (round_id=0) flag. Flag string deliberately
+        # omitted — the bus is broadcast to the public panel.
         for (team_id, service_name) in self.flags.planted.keys():
             await self.bus.publish(
                 new_event(
                     EventType.FLAG_PLANTED,
                     team_id=team_id,
+                    round_id=0,
                     payload={"service": service_name},
                 )
             )
 
+        # Re-plant at each DEFENSE entry (M5.5). Sequential await in
+        # bus.publish means this handler completes before _enter_phase
+        # returns and the DEFENSE timer begins.
+        self.bus.subscribe(self._on_rotation_event)
+
         self.round_loop = RoundLoop(self.bus, self.orchestrator.network, self.config.rounds)
         await self.round_loop.run()
+
+    async def _on_rotation_event(self, event) -> None:
+        """Subscriber: when PHASE_CHANGE → DEFENSE fires, rotate all flags."""
+        if event.type != EventType.PHASE_CHANGE.value:
+            return
+        if event.phase != Phase.DEFENSE.value:
+            return
+        if event.round_id == self._last_planted_round:
+            return  # already planted for this round (defensive against re-fire)
+        planted = self.plant_flags(round_id=event.round_id)
+        for team_id, service_name, _flag in planted:
+            await self.bus.publish(
+                new_event(
+                    EventType.FLAG_PLANTED,
+                    team_id=team_id,
+                    round_id=event.round_id,
+                    payload={"service": service_name},
+                )
+            )
 
     async def stop(self) -> None:
         if self.round_loop is not None:

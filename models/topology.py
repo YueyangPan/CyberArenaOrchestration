@@ -24,6 +24,7 @@ class Team:
     id: str
     dev: str
     prod: str
+    token: str = ""
 
 
 @dataclass(frozen=True)

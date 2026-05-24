@@ -42,16 +42,19 @@ class FlagStore:
     planted: dict[tuple[str, str], str] = field(default_factory=dict)
     # Inverted index: flag -> (owner_team_id, service_name) for O(1) submit lookup.
     by_flag: dict[str, tuple[str, str]] = field(default_factory=dict)
-    # Successful submissions: (submitter, victim, service). Set guards against
-    # double-counting the same heist.
-    submissions: set[tuple[str, str, str]] = field(default_factory=set)
+    # Per-submitter set of flag strings already accepted. Keying on the flag
+    # string itself (not on (submitter, victim, service)) means rotation
+    # automatically permits re-attack each round — a fresh flag has a new
+    # string and is not yet in any submitter's set. An UNKNOWN check
+    # in submit() runs first so stale-flag retries can never trip DUPLICATE.
+    submissions: dict[str, set[str]] = field(default_factory=dict)
 
     def plant(self, team_id: str, service: str, flag: str) -> None:
         """Record that `team_id` has `flag` planted on its `service`.
 
         Re-planting (same team+service) replaces the prior flag and removes
-        its inverted-index entry so an old/stale flag can no longer be
-        submitted. Useful when M5.5 adds per-round rotation.
+        its inverted-index entry — the old flag becomes UNKNOWN on submit.
+        Per-round rotation depends on this behavior.
         """
         key = (team_id, service)
         old = self.planted.get(key)
@@ -70,13 +73,13 @@ class FlagStore:
                 accepted=False, reason="OWN",
                 victim_team_id=victim_team_id, service=service,
             )
-        key = (submitter_team_id, victim_team_id, service)
-        if key in self.submissions:
+        submitted = self.submissions.setdefault(submitter_team_id, set())
+        if flag in submitted:
             return SubmitResult(
                 accepted=False, reason="DUPLICATE",
                 victim_team_id=victim_team_id, service=service,
             )
-        self.submissions.add(key)
+        submitted.add(flag)
         return SubmitResult(
             accepted=True, reason="ACCEPTED",
             victim_team_id=victim_team_id, service=service,

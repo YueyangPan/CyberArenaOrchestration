@@ -10,7 +10,7 @@ All design lives in [docs/](docs/). Read the relevant doc before changing relate
 - [docs/m3_network_plan.md](docs/m3_network_plan.md) / [docs/m3_network_report.md](docs/m3_network_report.md) — M3: network switching
 - [docs/m4_agent_plan.md](docs/m4_agent_plan.md) / [docs/m4_agent_report.md](docs/m4_agent_report.md) — M4: agent install & launch
 - [docs/m5_flag_plan.md](docs/m5_flag_plan.md) / [docs/m5_flag_report.md](docs/m5_flag_report.md) — M5: flag plant + submit works
-- [docs/m5_5_rotation_plan.md](docs/m5_5_rotation_plan.md) — M5.5: per-round rotation + per-team token auth
+- [docs/m5_5_rotation_plan.md](docs/m5_5_rotation_plan.md) / [docs/m5_5_rotation_report.md](docs/m5_5_rotation_report.md) — M5.5: per-round rotation + per-team token auth
 
 ## Update Rule
 
