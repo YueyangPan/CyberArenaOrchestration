@@ -5,18 +5,28 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 
 from .events import Event
 from .game_mgr import GameMgr
+
+PANEL_HTML_PATH = Path(__file__).parent.parent / "panel" / "panel.html"
 
 log = logging.getLogger(__name__)
 
 
 def build_app(game: GameMgr, shutdown_event: asyncio.Event) -> FastAPI:
     app = FastAPI(title="cyber-arena")
+
+    @app.get("/panel")
+    async def panel_page():
+        """Serve panel/panel.html. Same-origin with /game/* + /events/stream
+        so the browser can WS without CORS / mixed-content fuss."""
+        return FileResponse(PANEL_HTML_PATH, media_type="text/html")
 
     @app.get("/game/status")
     async def status():

@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cyber Arena — Live Panel</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0f0f1a;
+    --bg-card: #181828;
+    --bg-band: rgba(124, 110, 240, 0.07);
+    --text: #e0e0e0;
+    --text-dim: #888;
+    --text-faint: #555;
+
+    --accent: #7c6ef0;            /* purple — header, active phase */
+    --team1: #ffe66d;             /* yellow */
+    --team2: #a8d8ea;             /* light blue */
+    --attack: #ff6b6b;
+    --defense: #4ecdc4;
+    --good: #6ee7b7;              /* ACCEPTED */
+    --bad: #ff8b8b;               /* OWN / UNKNOWN / DUPLICATE */
+    --plant: #ffb86c;
+
+    --mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', Menlo, monospace;
+    --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    padding: 2rem 2.5rem;
+    line-height: 1.4;
+  }
+
+  .container { max-width: 1400px; margin: 0 auto; }
+
+  /* ── header ─────────────────────────────────────────────── */
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    padding-bottom: 1rem;
+    margin-bottom: 1.2rem;
+  }
+  header h1 {
+    font-size: 1.4rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+  }
+  header h1 .accent { color: var(--accent); }
+  header .meta {
+    display: flex;
+    gap: 2rem;
+    align-items: baseline;
+    font-family: var(--mono);
+    font-size: 0.8rem;
+  }
+  header .meta .label { color: var(--text-faint); margin-right: 0.4rem; }
+  header .meta .round { color: var(--text); font-weight: 600; }
+  header .meta .phase {
+    padding: 0.18rem 0.7rem;
+    border-radius: 999px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    border: 1px solid currentColor;
+  }
+  header .meta .phase[data-phase=DEFENSE]  { color: var(--defense); }
+  header .meta .phase[data-phase=ATTACK]   { color: var(--attack); }
+  header .meta .phase[data-phase=INIT],
+  header .meta .phase[data-phase=STOPPED]  { color: var(--text-dim); }
+
+  /* ── timeline strip (phase bands) ───────────────────────── */
+  .timeline {
+    background: var(--bg-card);
+    border-radius: 8px;
+    padding: 0.8rem 1rem;
+    margin-bottom: 1.4rem;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  .timeline .strip-label {
+    font-family: var(--mono);
+    font-size: 0.65rem;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 0.4rem;
+  }
+  .timeline .strip {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+  }
+  .timeline .band {
+    padding: 0.25rem 0.6rem;
+    border-radius: 4px;
+    border: 1px solid currentColor;
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .timeline .band[data-phase=DEFENSE] { color: var(--defense); }
+  .timeline .band[data-phase=ATTACK]  { color: var(--attack); }
+  .timeline .band .ts { color: var(--text-faint); margin-left: 0.4rem; }
+
+  /* ── team lanes ─────────────────────────────────────────── */
+  .lanes {
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
+    margin-bottom: 1.4rem;
+  }
+  .lane {
+    background: var(--bg-card);
+    border-radius: 8px;
+    padding: 1rem 1.2rem;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-left-width: 4px;
+  }
+  .lane[data-team=team1] { border-left-color: var(--team1); }
+  .lane[data-team=team2] { border-left-color: var(--team2); }
+  .lane[data-team=other] { border-left-color: var(--text-faint); }
+
+  .lane .lane-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.8rem;
+    margin-bottom: 0.6rem;
+  }
+  .lane .lane-head .team-name {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 0.95rem;
+  }
+  .lane[data-team=team1] .team-name { color: var(--team1); }
+  .lane[data-team=team2] .team-name { color: var(--team2); }
+  .lane .lane-head .stat {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    color: var(--text-dim);
+  }
+  .lane .lane-head .stat .num { color: var(--text); font-weight: 600; }
+
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  .chip {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: 4px;
+    border: 1px solid currentColor;
+    background: rgba(255, 255, 255, 0.02);
+    white-space: nowrap;
+  }
+  .chip .ts { color: var(--text-faint); margin-left: 0.4rem; font-size: 0.62rem; }
+  .chip-deploy   { color: var(--accent); }
+  .chip-agent    { color: var(--accent); }
+  .chip-plant    { color: var(--plant); }
+  .chip-accept   { color: var(--good); }
+  .chip-reject   { color: var(--bad); }
+  .chip .mark { font-weight: 700; margin-right: 0.3rem; }
+
+  /* ── footer ─────────────────────────────────────────────── */
+  footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    padding-top: 0.8rem;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  footer .conn .dot {
+    display: inline-block;
+    width: 0.55rem; height: 0.55rem;
+    border-radius: 50%;
+    margin-right: 0.5rem;
+    vertical-align: middle;
+  }
+  footer .conn[data-state=ok]      .dot { background: var(--good); box-shadow: 0 0 6px var(--good); }
+  footer .conn[data-state=lost]    .dot { background: var(--bad); }
+  footer .conn[data-state=trying]  .dot { background: var(--plant); }
+  footer .placeholder { color: var(--text-faint); font-style: italic; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <h1>Cyber Arena <span class="accent">— Live Panel</span></h1>
+    <div class="meta">
+      <span>
+        <span class="label">round</span>
+        <span class="round" id="round-num">0</span>
+        <span class="label" style="margin-left: 0.4rem">/</span>
+        <span class="round" id="round-total">?</span>
+      </span>
+      <span class="phase" id="phase" data-phase="INIT">INIT</span>
+    </div>
+  </header>
+
+  <section class="timeline">
+    <div class="strip-label">phase timeline</div>
+    <div class="strip" id="phase-strip"></div>
+  </section>
+
+  <section class="lanes" id="lanes"></section>
+
+  <footer>
+    <span class="conn" id="conn" data-state="trying">
+      <span class="dot"></span>
+      <span class="text">connecting…</span>
+    </span>
+    <span class="placeholder">scoreboard / service-health: pending (Scoreboard milestone)</span>
+  </footer>
+
+</div>
+
+<script>
+  // ── state ────────────────────────────────────────────────
+  const state = {
+    teams: new Map(),      // team_id -> { name, chips: [Element] }
+    seenEventIds: new Set(),
+    t0: null,              // first event timestamp (for relative time display)
+    totalRounds: null,
+  };
+
+  // ── helpers ──────────────────────────────────────────────
+  function $(id) { return document.getElementById(id); }
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls)  e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function fmtTs(ts) {
+    if (state.t0 == null) state.t0 = ts;
+    const rel = Math.max(0, ts - state.t0);
+    return '+' + rel.toFixed(1) + 's';
+  }
+  function getLane(team_id) {
+    let key = team_id || 'other';
+    if (!state.teams.has(key)) {
+      const lane = el('div', 'lane');
+      lane.dataset.team = ['team1', 'team2'].includes(key) ? key : 'other';
+      const head = el('div', 'lane-head');
+      head.appendChild(el('span', 'team-name', key));
+      const stats = el('span', 'stat');
+      stats.innerHTML = '<span class="num" data-stat="accepted">0</span> accepted · '
+                     + '<span class="num" data-stat="rejected">0</span> rejected';
+      head.appendChild(stats);
+      lane.appendChild(head);
+      const chips = el('div', 'chips');
+      lane.appendChild(chips);
+      $('lanes').appendChild(lane);
+      state.teams.set(key, { lane, chips, accepted: 0, rejected: 0 });
+    }
+    return state.teams.get(key);
+  }
+  function ensureTeamsOrdered(ids) {
+    // Render team1, team2 first regardless of event order.
+    for (const id of ids) getLane(id);
+  }
+
+  // ── render dispatch ──────────────────────────────────────
+  function render(ev) {
+    if (state.seenEventIds.has(ev.id)) return;
+    state.seenEventIds.add(ev.id);
+
+    switch (ev.type) {
+      case 'ROUND_START':     return renderRoundStart(ev);
+      case 'ROUND_STOP':      return renderRoundStop(ev);
+      case 'PHASE_CHANGE':    return renderPhaseChange(ev);
+      case 'SERVICE_DEPLOYED':return renderServiceDeployed(ev);
+      case 'AGENT_INSTALLED': return renderAgentInstalled(ev);
+      case 'FLAG_PLANTED':    return renderFlagPlanted(ev);
+      case 'FLAG_SUBMITTED':  return renderFlagSubmitted(ev);
+      default: return; // unknown event types are silently ignored
+    }
+  }
+
+  function renderRoundStart(ev) {
+    $('round-num').textContent = ev.round_id;
+  }
+  function renderRoundStop(ev) {
+    // visual nudge — could grey something out, but round_num already updated
+  }
+  function renderPhaseChange(ev) {
+    const p = $('phase');
+    p.textContent = ev.phase;
+    p.dataset.phase = ev.phase;
+
+    const band = el('span', 'band', `r${ev.round_id || 0} ${ev.phase}`);
+    band.dataset.phase = ev.phase;
+    band.appendChild(el('span', 'ts', fmtTs(ev.ts)));
+    $('phase-strip').appendChild(band);
+  }
+  function renderServiceDeployed(ev) {
+    const pl = ev.payload || {};
+    // Map container name back to a team for the chip's lane.
+    // SERVICE_DEPLOYED's team_id is null (it's a global event), so we
+    // route by the container name suffix.
+    const teamId = (pl.container || '').replace(/_prod$/, '').replace(/_dev$/, '');
+    const lane = getLane(teamId);
+    const chip = el('span', 'chip chip-deploy');
+    chip.append(
+      el('span', 'mark', '▸'),
+      document.createTextNode(`deploy ${pl.service || '?'}:${pl.port || '?'}`),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+  }
+  function renderAgentInstalled(ev) {
+    const lane = getLane(ev.team_id);
+    const chip = el('span', 'chip chip-agent');
+    chip.append(
+      el('span', 'mark', '◆'),
+      document.createTextNode('agent installed'),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+  }
+  function renderFlagPlanted(ev) {
+    const lane = getLane(ev.team_id);
+    const pl = ev.payload || {};
+    const chip = el('span', 'chip chip-plant');
+    chip.append(
+      el('span', 'mark', '🚩'),
+      document.createTextNode(`plant ${pl.service || ''} r${ev.round_id || 0}`),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+  }
+  function renderFlagSubmitted(ev) {
+    const pl = ev.payload || {};
+    const lane = getLane(pl.submitter_team_id || ev.team_id);
+    const ok = !!pl.accepted;
+    const chip = el('span', 'chip ' + (ok ? 'chip-accept' : 'chip-reject'));
+    const victim = pl.victim_team_id ? ` ← ${pl.victim_team_id}` : '';
+    const svc = pl.service ? `/${pl.service}` : '';
+    chip.append(
+      el('span', 'mark', ok ? '✓' : '✗'),
+      document.createTextNode(`submit ${pl.reason}${victim}${svc}`),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+
+    const key = ok ? 'accepted' : 'rejected';
+    lane[key] += 1;
+    lane.lane.querySelector(`[data-stat=${key}]`).textContent = lane[key];
+  }
+
+  // ── data sources ─────────────────────────────────────────
+  async function backfill() {
+    try {
+      const r = await fetch('/game/events');
+      if (!r.ok) return;
+      const events = await r.json();
+      // Pre-seed both teams so they appear in canonical order even if no
+      // events for one of them have arrived yet.
+      ensureTeamsOrdered(['team1', 'team2']);
+      for (const ev of events) render(ev);
+      // Pull current status for total_rounds (and current round/phase).
+      const s = await fetch('/game/status').then(x => x.json()).catch(() => null);
+      if (s) {
+        if (s.total_rounds != null) $('round-total').textContent = s.total_rounds;
+        if (s.round != null && +s.round > +$('round-num').textContent) {
+          $('round-num').textContent = s.round;
+        }
+        if (s.phase) {
+          $('phase').textContent = s.phase;
+          $('phase').dataset.phase = s.phase;
+        }
+      }
+    } catch (e) { /* backfill is best-effort */ }
+  }
+
+  function wsUrl() {
+    const params = new URLSearchParams(location.search);
+    if (params.has('ws')) return params.get('ws');
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${proto}//${location.host}/events/stream`;
+  }
+
+  let backoff = 500;
+  function connect() {
+    const conn = $('conn');
+    conn.dataset.state = 'trying';
+    conn.querySelector('.text').textContent = 'connecting…';
+
+    let ws;
+    try {
+      ws = new WebSocket(wsUrl());
+    } catch (e) {
+      scheduleReconnect(); return;
+    }
+    ws.onopen = () => {
+      backoff = 500;
+      conn.dataset.state = 'ok';
+      conn.querySelector('.text').textContent = 'connected';
+    };
+    ws.onmessage = (m) => {
+      try { render(JSON.parse(m.data)); } catch (e) {}
+    };
+    ws.onclose = () => {
+      conn.dataset.state = 'lost';
+      conn.querySelector('.text').textContent = 'disconnected — reconnecting';
+      scheduleReconnect();
+    };
+    ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  }
+  function scheduleReconnect() {
+    setTimeout(connect, backoff);
+    backoff = Math.min(backoff * 2, 30000);
+  }
+
+  // ── boot ────────────────────────────────────────────────
+  ensureTeamsOrdered(['team1', 'team2']);
+  backfill().then(connect);
+</script>
+</body>
+</html>

@@ -12,7 +12,7 @@ All design lives in [docs/](docs/). Read the relevant doc before changing relate
 - [docs/m5_flag_plan.md](docs/m5_flag_plan.md) / [docs/m5_flag_report.md](docs/m5_flag_report.md) — M5: flag plant + submit works
 - [docs/m5_5_rotation_plan.md](docs/m5_5_rotation_plan.md) / [docs/m5_5_rotation_report.md](docs/m5_5_rotation_report.md) — M5.5: per-round rotation + per-team token auth
 - [docs/m5_6_agent_attack_plan.md](docs/m5_6_agent_attack_plan.md) / [docs/m5_6_agent_attack_report.md](docs/m5_6_agent_attack_report.md) — M5.6: agent-driven attack loop (SSH pivot)
-- [docs/m6_panel_plan.md](docs/m6_panel_plan.md) — M6: observation panel (live event stream)
+- [docs/m6_panel_plan.md](docs/m6_panel_plan.md) / [docs/m6_panel_report.md](docs/m6_panel_report.md) — M6: observation panel (live event stream)
 
 ## Update Rule
 

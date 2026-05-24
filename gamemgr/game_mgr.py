@@ -119,7 +119,26 @@ class GameMgr:
         self.bus.subscribe(self._file_sink)
         log.info("game start; events -> %s", self._file_sink.path)
 
-        # Emit one deploy event per challenge so the log captures setup
+        await self.emit_setup_events()
+
+        # Re-plant at each DEFENSE entry (M5.5). Sequential await in
+        # bus.publish means this handler completes before _enter_phase
+        # returns and the DEFENSE timer begins.
+        self.bus.subscribe(self._on_rotation_event)
+
+        self.round_loop = RoundLoop(self.bus, self.orchestrator.network, self.config.rounds)
+        await self.round_loop.run()
+
+    async def emit_setup_events(self) -> None:
+        """Publish one SERVICE_DEPLOYED per challenge-on-container and one
+        FLAG_PLANTED per (team, service) at round_id=0.
+
+        Called from start() during normal game lifecycle, but also exposed
+        for demos / panel screenshots that don't drive the round loop —
+        without this they'd see an empty event stream even though the
+        underlying state (deployed services, planted flags) is populated.
+        Flag strings are deliberately omitted from FLAG_PLANTED payloads
+        (the bus is broadcast to public observers)."""
         for service, handles in self._deployed:
             for h in handles:
                 await self.bus.publish(
@@ -128,9 +147,6 @@ class GameMgr:
                         payload={"service": service.name, "container": h.name, "port": service.port},
                     )
                 )
-
-        # One event per pre-game (round_id=0) flag. Flag string deliberately
-        # omitted — the bus is broadcast to the public panel.
         for (team_id, service_name) in self.flags.planted.keys():
             await self.bus.publish(
                 new_event(
@@ -140,14 +156,6 @@ class GameMgr:
                     payload={"service": service_name},
                 )
             )
-
-        # Re-plant at each DEFENSE entry (M5.5). Sequential await in
-        # bus.publish means this handler completes before _enter_phase
-        # returns and the DEFENSE timer begins.
-        self.bus.subscribe(self._on_rotation_event)
-
-        self.round_loop = RoundLoop(self.bus, self.orchestrator.network, self.config.rounds)
-        await self.round_loop.run()
 
     async def _on_rotation_event(self, event) -> None:
         """Subscriber: when PHASE_CHANGE → DEFENSE fires, rotate all flags."""
