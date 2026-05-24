@@ -5,9 +5,22 @@ teams:
   - id: team1
     dev: team1_dev
     prod: team1_prod
+    agent:
+      # Claude Code reads ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY (set by
+      # ClaudeAgentManager from api_key/base_url below). Pointing base_url at
+      # a third-party router (e.g. ppapi.ai) routes all traffic through it.
+      cli: claude -p --dangerously-skip-permissions --output-format stream-json --verbose
+      model: claude-sonnet-4-6
+      api_key: ${API_ROUTER_KEY}
+      base_url: ${API_ROUTER_BASE}
   - id: team2
     dev: team2_dev
     prod: team2_prod
+    agent:
+      cli: claude -p --dangerously-skip-permissions --output-format stream-json --verbose
+      model: claude-sonnet-4-6
+      api_key: ${API_ROUTER_KEY}
+      base_url: ${API_ROUTER_BASE}
 
 nodes:
   - id: team1_dev

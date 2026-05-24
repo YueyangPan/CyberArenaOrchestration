@@ -20,6 +20,7 @@ class EventType(str, Enum):
     PHASE_CHANGE = "PHASE_CHANGE"
     ROUND_STOP = "ROUND_STOP"
     SERVICE_DEPLOYED = "SERVICE_DEPLOYED"
+    AGENT_INSTALLED = "AGENT_INSTALLED"
 
 
 @dataclass(frozen=True)
