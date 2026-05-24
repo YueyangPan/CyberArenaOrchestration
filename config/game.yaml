@@ -32,6 +32,10 @@ nodes:
     image: cyberarena/dev-base
     networks: [team1_net]
     install_list: []
+    # Resolve host.docker.internal to the host's gateway so the agent can
+    # POST flag submissions back to the gameserver running on the host.
+    extra_hosts:
+      host.docker.internal: host-gateway
 
   - id: team1_prod
     image: cyberarena/prod-base
@@ -43,6 +47,8 @@ nodes:
     image: cyberarena/dev-base
     networks: [team2_net]
     install_list: []
+    extra_hosts:
+      host.docker.internal: host-gateway
 
   - id: team2_prod
     image: cyberarena/prod-base

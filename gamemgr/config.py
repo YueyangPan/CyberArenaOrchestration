@@ -103,6 +103,7 @@ def _from_dict(raw: dict) -> GameConfig:
             ports=list(n.get("ports", [])),
             install_list=list(n.get("install_list", [])),
             env=dict(n.get("env", {})),
+            extra_hosts=dict(n.get("extra_hosts", {})),
         )
         for n in raw.get("nodes", [])
     ]

@@ -14,7 +14,10 @@ from pathlib import Path
 from orchestrator.orchestrator import Orchestrator
 from orchestrator.service import ContainerHandle, Service
 
+from agents.prompts import build_attack_prompt
 from challenges.registry import build as build_challenge
+from dataclasses import replace
+from models.agent import AgentConfig
 
 from .config import ChallengeConfig, GameConfig
 from .events import EventBus, EventType, FileSink, new_event, new_run_dir
@@ -215,6 +218,41 @@ class GameMgr:
             )
         )
         return result
+
+    # ── agent provisioning (M5.6) ───────────────────────────────────────
+
+    def agent_config_for(
+        self,
+        team_id: str,
+        submit_base_url: str = "http://host.docker.internal:8000",
+    ) -> AgentConfig:
+        """Build the per-team AgentConfig for attack-mode install.
+
+        Pulls the static cli/model/api_key/base_url from config.agents[team_id]
+        (loaded from game.yaml) and layers on the runtime topology context
+        (own prod, opposing prods, token, submit URL, attack prompt).
+        """
+        base = self.config.agents.get(team_id)
+        if base is None:
+            raise KeyError(f"no agent config for team {team_id!r} in game.yaml")
+
+        teams_by_id = {t.id: t for t in self.config.topology.teams}
+        if team_id not in teams_by_id:
+            raise KeyError(f"unknown team_id {team_id!r}")
+        own_team = teams_by_id[team_id]
+        opposing = tuple(t.prod for tid, t in teams_by_id.items() if tid != team_id)
+
+        cfg = replace(
+            base,
+            team_id=team_id,
+            team_token=own_team.token,
+            own_prod_host=own_team.prod,
+            own_prod_container_name=own_team.prod,
+            opposing_prod_hosts=opposing,
+            submit_url=f"{submit_base_url.rstrip('/')}/game/flag/submit",
+        )
+        # Attack prompt is derived from the now-populated fields.
+        return replace(cfg, system_prompt=build_attack_prompt(cfg))
 
     # ── helpers ─────────────────────────────────────────────────────────
 

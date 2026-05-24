@@ -35,6 +35,7 @@ class ContainerManager:
             network=primary_net,
             ports=ports,
             environment=node.env,
+            extra_hosts=node.extra_hosts or None,
             detach=True,
         )
         log.info("created container %s (%s, image=%s)", node.id, container.short_id, node.image)

@@ -23,6 +23,28 @@ class AgentConfig:
     # M5 prompt-builder override this with concrete instructions.
     system_prompt: str = ""
 
+    # ── M5.6 attack-mode fields (all optional; empty → no SSH provisioning) ──
+    # The team this agent belongs to; carried through to agent.env as
+    # CYBERARENA_TEAM_ID so the LLM can self-identify in shell commands.
+    team_id: str = ""
+    # Sent as X-Team-Token on /game/flag/submit (matches game.yaml.teams[].token).
+    team_token: str = ""
+    # Hostname the agent will SSH into to pivot (its own prod's docker DNS name).
+    own_prod_host: str = ""
+    # Container name on the local docker daemon — the AgentManager uses it
+    # to inject the pubkey + start sshd as part of install(). When empty,
+    # ClaudeAgentManager skips the SSH provisioning step.
+    own_prod_container_name: str = ""
+    # Docker DNS names of opposing prod containers — the agent's attack targets.
+    opposing_prod_hosts: tuple[str, ...] = ()
+    # Where the agent POSTs flag submissions (typically resolves via
+    # host.docker.internal which is wired in by Node.extra_hosts).
+    submit_url: str = ""
+    # Arbitrary extra env vars exported into agent.env. Useful escape hatch
+    # for future adapters that need provider-specific or runtime knobs without
+    # growing this dataclass further.
+    extra_env: dict[str, str] = field(default_factory=dict)
+
 
 @dataclass(frozen=True)
 class AgentLogs:

@@ -20,7 +20,10 @@ any other cli (e.g. "sleep 60" used by tests) is launched as-is.
 from __future__ import annotations
 
 import logging
+import os
 import shlex
+import subprocess
+import tempfile
 import time
 
 import docker
@@ -78,21 +81,94 @@ class ClaudeAgentManager(AgentManager):
                 check=True,
             )
 
+        # Set up SSH pivot into own prod if requested (M5.6). Generates a key
+        # per install() invocation — keys never persist across runs.
+        if cfg.own_prod_container_name:
+            self._provision_ssh_pivot(container, cfg)
+
         prompt = cfg.system_prompt or DEFAULT_PROMPT
         self._write_file(container, PROMPT_PATH, prompt.rstrip() + "\n")
-        self._write_file(
-            container,
-            ENV_PATH,
-            (
-                f"export ANTHROPIC_API_KEY={shlex.quote(cfg.api_key)}\n"
-                f"export ANTHROPIC_BASE_URL={shlex.quote(cfg.base_url)}\n"
-                f"export IS_SANDBOX=1\n"
-            ),
-        )
+        self._write_file(container, ENV_PATH, self._build_env_file(cfg))
 
         self._launch(container, cfg)
         self._wait_for_pid(container, timeout_s=5.0)
         log.info("agent installed on %s (cli=%r)", container.name, cfg.cli)
+
+    def _build_env_file(self, cfg: AgentConfig) -> str:
+        """Render the agent.env file. Anthropic + IS_SANDBOX always present;
+        M5.6 attack-mode fields included when populated; cfg.extra_env merged
+        last so it can override anything."""
+        lines = [
+            f"export ANTHROPIC_API_KEY={shlex.quote(cfg.api_key)}",
+            f"export ANTHROPIC_BASE_URL={shlex.quote(cfg.base_url)}",
+            "export IS_SANDBOX=1",
+        ]
+        if cfg.team_id:
+            lines.append(f"export CYBERARENA_TEAM_ID={shlex.quote(cfg.team_id)}")
+        if cfg.team_token:
+            lines.append(f"export CYBERARENA_TEAM_TOKEN={shlex.quote(cfg.team_token)}")
+        if cfg.own_prod_host:
+            lines.append(f"export CYBERARENA_OWN_PROD={shlex.quote(cfg.own_prod_host)}")
+        if cfg.opposing_prod_hosts:
+            lines.append(
+                "export CYBERARENA_OPPOSING_PRODS="
+                + shlex.quote(",".join(cfg.opposing_prod_hosts))
+            )
+        if cfg.submit_url:
+            lines.append(f"export CYBERARENA_SUBMIT_URL={shlex.quote(cfg.submit_url)}")
+        for k, v in cfg.extra_env.items():
+            lines.append(f"export {k}={shlex.quote(v)}")
+        return "\n".join(lines) + "\n"
+
+    def _provision_ssh_pivot(self, dev_container: ContainerHandle, cfg: AgentConfig) -> None:
+        """Generate an ed25519 keypair on host, inject pubkey + start sshd on
+        own prod, drop privkey + ssh config into dev. Keys are ephemeral
+        (host tmpdir scoped to this install() call)."""
+        prod_name = cfg.own_prod_container_name
+        log.info("provisioning ssh pivot %s -> %s", dev_container.name, prod_name)
+
+        with tempfile.TemporaryDirectory(prefix="cyberarena-keys-") as keydir:
+            priv = os.path.join(keydir, "id_ed25519")
+            pub = priv + ".pub"
+            r = subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", priv, "-q", "-C", f"agent-{cfg.team_id}"],
+                check=False, capture_output=True,
+            )
+            if r.returncode != 0:
+                raise RuntimeError(f"ssh-keygen failed: {r.stderr.decode(errors='replace')!r}")
+            with open(priv) as f:
+                privkey = f.read()
+            with open(pub) as f:
+                pubkey = f.read()
+
+        # Pubkey + sshd on prod.
+        prod_container = ContainerHandle(container_id="", name=prod_name, networks=[])
+        self._exec(prod_container, ["mkdir", "-p", "/root/.ssh"], check=True)
+        self._exec(prod_container, ["chmod", "700", "/root/.ssh"], check=True)
+        self._write_file(prod_container, "/root/.ssh/authorized_keys", pubkey)
+        self._exec(prod_container, ["chmod", "600", "/root/.ssh/authorized_keys"], check=True)
+        # Generate host keys + start sshd; missing pidfile dir on ubuntu:24.04
+        # minimal install bites if you skip the mkdir.
+        self._exec(prod_container, ["mkdir", "-p", "/run/sshd"], check=True)
+        self._exec(prod_container, ["ssh-keygen", "-A"], check=True)  # generate host keys
+        # PermitRootLogin: default in Ubuntu's sshd_config is "prohibit-password" → key-only root OK.
+        self._exec(prod_container, ["/usr/sbin/sshd"], check=True)
+
+        # Privkey + ssh config on dev.
+        self._exec(dev_container, ["mkdir", "-p", "/root/.ssh"], check=True)
+        self._exec(dev_container, ["chmod", "700", "/root/.ssh"], check=True)
+        self._write_file(dev_container, "/root/.ssh/id_ed25519", privkey)
+        self._exec(dev_container, ["chmod", "600", "/root/.ssh/id_ed25519"], check=True)
+        ssh_config = (
+            f"Host {cfg.own_prod_host}\n"
+            f"    User root\n"
+            f"    IdentityFile /root/.ssh/id_ed25519\n"
+            f"    StrictHostKeyChecking no\n"
+            f"    UserKnownHostsFile /dev/null\n"
+            f"    LogLevel ERROR\n"
+        )
+        self._write_file(dev_container, "/root/.ssh/config", ssh_config)
+        self._exec(dev_container, ["chmod", "600", "/root/.ssh/config"], check=True)
 
     def status(self, container: ContainerHandle) -> AgentState:
         wrapper_pid = self._read_int(container, WRAPPER_PID_PATH)
