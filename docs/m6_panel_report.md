@@ -15,18 +15,19 @@
 - Empty stats (`0 accepted · 0 rejected`)
 - Footer: scoreboard placeholder; "connecting…" because chrome's render budget ended before the WS handshake completed (cosmetic — the chips already came in via the HTTP backfill `GET /game/events`)
 
-### After live attack (real Claude submitted an ACCEPTED flag)
+### After live attack — both agents running (real Claude on both teams)
 
 ![panel after attack](screenshots/m5_6_attack/02_after_attack.png)
 
-- team2 row gained three chips:
-  - `◆ agent installed +31.7s`
-  - **`✓ submit ACCEPTED ← team1/notes +47.6s`** (green) — the agent successfully SSH-pivoted, scraped the flag, and submitted it
-  - `✗ submit DUPLICATE ← team1/notes +61.5s` (red) — the agent tried again before rotation; correctly rejected
-- Stats updated: `1 accepted · 1 rejected`
-- team1 lane unchanged — it's the victim, never submitted anything
+Symmetric attack: both teams install attack agents, both succeed in stealing
+the opposing flag.
 
-Both screenshots in `docs/screenshots/m5_6_attack/`, version-controlled so reports stay self-contained.
+- **team1**: `◆ agent installed +32.0s`, **`✓ submit ACCEPTED ← team2/notes +47.0s`** (green), `✗ submit DUPLICATE ← team2/notes +63.4s` (red retry) — stats `1 accepted · 1 rejected`
+- **team2**: `◆ agent installed +37.7s`, **`✓ submit ACCEPTED ← team1/notes +52.1s`** (green), then four `✗ DUPLICATE` retries at +61.5, +66.7, +72.0, +77.2s (without rotation enabled, the second submit always fails — visible as a row of red chips) — stats `1 accepted · 4 rejected`
+- Footer dot has gone green (`connected`) — the WS handshake completed during the longer wait window
+- Both agents landed `ACCEPTED` within **15 s** of being installed; both running entirely independently of each other and of the orchestrator
+
+Both screenshots live in `docs/screenshots/m5_6_attack/`, version-controlled so reports stay self-contained.
 
 ## What was built
 
@@ -82,18 +83,22 @@ tests/test_m6_panel.py::test_panel_renders_in_headless_chrome        PASSED
 4 passed in 33.40s
 ```
 
-### Live demo (real Claude attack, ~10-30¢)
+### Live demo (real Claude on both teams, ~20-60¢)
 
 ```
 $ python scripts/m6_screenshot_demo.py
   📸 screenshot after plant -> docs/screenshots/m5_6_attack/01_after_plant.png
+  🤖 installing attack agent on team1_dev …
   🤖 installing attack agent on team2_dev …
-  ...waiting (~0s elapsed)
-  ✅ ACCEPTED submission landed after 20s
+  ...waiting (~0s elapsed, accepted_by=[])
+  ✅ both teams landed ACCEPTED after 15s
   📸 screenshot after attack -> docs/screenshots/m5_6_attack/02_after_attack.png
 ```
 
-Agent completed pivot → steal → submit in **20 seconds** (faster than the M5.6 standalone run because there's no extra round-loop interference, just the attack agent running flat-out).
+Both agents installed concurrently, each pivoting through its own prod and
+attacking the opposing team. **15 seconds** total from second `install()`
+return to the second `ACCEPTED` landing — agents are completely independent
+of each other.
 
 ### Full regression
 

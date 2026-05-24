@@ -133,41 +133,50 @@ def main() -> int:
         time.sleep(0.5)
         _shot(SHOTS_DIR / "01_after_plant.png", "after plant", chrome, PORT)
 
-        print("  🤖 installing attack agent on team2_dev …")
-        agent_cfg = game.agent_config_for("team2")
+        # Install attack agents on BOTH teams so the panel shows symmetric
+        # activity — team1 attacks team2, team2 attacks team1. Both share the
+        # same router quota so costs ~2x the single-agent run.
         mgr = ClaudeAgentManager(client=client)
-        mgr.install(_handle(client, "team2_dev"), agent_cfg)
+        agent_cfgs = {tid: game.agent_config_for(tid) for tid in ("team1", "team2")}
+        for tid, cfg_ in agent_cfgs.items():
+            print(f"  🤖 installing attack agent on {tid}_dev …")
+            mgr.install(_handle(client, f"{tid}_dev"), cfg_)
+            # AGENT_INSTALLED is in the EventType enum (M4 design) but no
+            # production code path emits it yet. Surface it here so the panel
+            # shows the installed-agent chip. Future M4.5 will emit from
+            # ClaudeAgentManager directly.
+            asyncio.run(game.bus.publish(new_event(
+                EventType.AGENT_INSTALLED,
+                team_id=tid,
+                payload={"cli": cfg_.cli.split()[0]},
+            )))
 
-        # AGENT_INSTALLED is in the EventType enum (M4 design) but no
-        # production code path emits it yet. Surface it here so the panel
-        # can show the installed-agent chip. Future M4.5 will emit from
-        # ClaudeAgentManager directly.
-        asyncio.run(game.bus.publish(new_event(
-            EventType.AGENT_INSTALLED,
-            team_id="team2",
-            payload={"cli": agent_cfg.cli.split()[0]},
-        )))
-
+        # Wait for BOTH teams to land at least one ACCEPTED. If only one
+        # lands within the budget we still take the screenshot — partial
+        # success is more informative than failure.
         deadline = time.monotonic() + WAIT_S
         last_log = 0.0
+        accepted_by = set()
         while time.monotonic() < deadline:
-            accepted = [e for e in game.bus.history()
-                        if e.type == "FLAG_SUBMITTED" and e.payload.get("accepted")]
-            if accepted:
-                print(f"  ✅ ACCEPTED submission landed after {int(WAIT_S - (deadline - time.monotonic()))}s")
+            for e in game.bus.history():
+                if e.type == "FLAG_SUBMITTED" and e.payload.get("accepted"):
+                    accepted_by.add(e.payload.get("submitter_team_id"))
+            if {"team1", "team2"}.issubset(accepted_by):
+                print(f"  ✅ both teams landed ACCEPTED after {int(WAIT_S - (deadline - time.monotonic()))}s")
                 break
             if time.monotonic() - last_log > 30:
-                print(f"  ...waiting (~{int(WAIT_S - (deadline - time.monotonic()))}s elapsed)")
+                print(f"  ...waiting (~{int(WAIT_S - (deadline - time.monotonic()))}s elapsed, accepted_by={sorted(accepted_by)})")
                 last_log = time.monotonic()
             time.sleep(POLL_S)
         else:
-            print("  ⚠️  no ACCEPTED in time — capturing anyway", file=sys.stderr)
+            print(f"  ⚠️  not all teams ACCEPTED within budget; accepted_by={sorted(accepted_by)} — capturing anyway", file=sys.stderr)
 
         time.sleep(1.5)
         _shot(SHOTS_DIR / "02_after_attack.png", "after attack", chrome, PORT)
 
-        try: mgr.kill(_handle(client, "team2_dev"))
-        except Exception: pass
+        for tid in ("team1", "team2"):
+            try: mgr.kill(_handle(client, f"{tid}_dev"))
+            except Exception: pass
 
     finally:
         try:
