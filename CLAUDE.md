@@ -9,6 +9,7 @@ All design lives in [docs/](docs/). Read the relevant doc before changing relate
 - [docs/m2_gameloop_plan.md](docs/m2_gameloop_plan.md) / [docs/m2_gameloop_report.md](docs/m2_gameloop_report.md) — M2: game loop
 - [docs/m3_network_plan.md](docs/m3_network_plan.md) / [docs/m3_network_report.md](docs/m3_network_report.md) — M3: network switching
 - [docs/m4_agent_plan.md](docs/m4_agent_plan.md) / [docs/m4_agent_report.md](docs/m4_agent_report.md) — M4: agent install & launch
+- [docs/m5_flag_plan.md](docs/m5_flag_plan.md) — M5: flag plant + submit works
 
 ## Update Rule
 
