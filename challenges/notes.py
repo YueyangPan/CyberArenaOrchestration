@@ -136,3 +136,29 @@ class NotesService(Service):
             return False
         out = (result.output or b"").decode(errors="replace").strip()
         return out.startswith("COUNT ")
+
+    def plant_flag(self, container: ContainerHandle, flag: str) -> None:
+        """PUT the flag as a note. Notes server replies 'OK <idx>'.
+
+        We connect from inside the container (127.0.0.1) so this works
+        regardless of cross-team network state — planting happens at
+        game-start and must succeed even before ATTACK opens game_net.
+        """
+        # repr() handles any quote/backslash in `flag` safely for the python -c body.
+        probe = (
+            f"import socket, sys\n"
+            f"s = socket.socket(); s.settimeout(3)\n"
+            f"s.connect(('127.0.0.1', {self._port}))\n"
+            f"s.sendall(b'PUT ' + {flag!r}.encode() + b'\\n')\n"
+            f"resp = s.recv(64).decode(errors='replace').strip()\n"
+            f"print(resp)\n"
+            f"sys.exit(0 if resp.startswith('OK ') else 1)\n"
+        )
+        result = self._client.containers.get(container.name).exec_run(
+            ["python3", "-c", probe]
+        )
+        if result.exit_code != 0:
+            out = (result.output or b"").decode(errors="replace").strip()
+            raise RuntimeError(
+                f"plant_flag failed on {container.name}: rc={result.exit_code}, out={out!r}"
+            )

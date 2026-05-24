@@ -18,6 +18,7 @@ from challenges.registry import build as build_challenge
 
 from .config import ChallengeConfig, GameConfig
 from .events import EventBus, EventType, FileSink, new_event, new_run_dir
+from .flag import FlagStore, SubmitResult, new_flag
 from .round import Phase, RoundLoop
 
 log = logging.getLogger(__name__)
@@ -32,6 +33,10 @@ class GameMgr:
         self.run_dir: Path | None = None
         self._file_sink: FileSink | None = None
         self._deployed: list[tuple[Service, list[ContainerHandle]]] = []
+        self.flags = FlagStore()
+        # (team_id, service_name) -> Service instance, populated by deploy_challenges
+        # so plant_initial_flags can find the right adapter per (team, service).
+        self._service_by_owner: dict[tuple[str, str], Service] = {}
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
@@ -53,7 +58,31 @@ class GameMgr:
                 service.install(handle)
                 service.start(handle)
                 handles.append(handle)
+                self._service_by_owner[(team_id, service.name)] = service
             self._deployed.append((service, handles))
+
+    def plant_initial_flags(self) -> list[tuple[str, str, str]]:
+        """Generate and plant one flag per (team, deployed service).
+
+        Synchronous — runs after deploy_challenges() and before the round
+        loop starts. Returns the list of (team_id, service_name, flag) that
+        were planted (handy for tests; main.py ignores the return value).
+
+        Per design_v1.md §3.1 this is a one-shot at game start; per-round
+        rotation is deferred to M5.5.
+        """
+        planted: list[tuple[str, str, str]] = []
+        team_to_prod = {t.id: t.prod for t in self.config.topology.teams}
+
+        for (team_id, service_name), service in self._service_by_owner.items():
+            cname = team_to_prod[team_id]
+            handle = self._handle_for(cname)
+            flag = new_flag()
+            log.info("planting flag on %s/%s", team_id, service_name)
+            service.plant_flag(handle, flag)
+            self.flags.plant(team_id, service_name, flag)
+            planted.append((team_id, service_name, flag))
+        return planted
 
     def teardown_challenges(self) -> None:
         for service, handles in self._deployed:
@@ -82,6 +111,17 @@ class GameMgr:
                     )
                 )
 
+        # One event per planted (team, service). Flag string deliberately omitted
+        # — the bus is broadcast to the public panel.
+        for (team_id, service_name) in self.flags.planted.keys():
+            await self.bus.publish(
+                new_event(
+                    EventType.FLAG_PLANTED,
+                    team_id=team_id,
+                    payload={"service": service_name},
+                )
+            )
+
         self.round_loop = RoundLoop(self.bus, self.orchestrator.network, self.config.rounds)
         await self.round_loop.run()
 
@@ -103,9 +143,38 @@ class GameMgr:
             "total_rounds": self.config.rounds.total_rounds,
         }
 
-    def submit_flag(self, team_id: str, flag: str) -> bool:
-        # M5 wires this up.
-        return False
+    async def submit_flag(self, team_id: str, flag: str) -> SubmitResult:
+        """Verify a flag submission and emit FLAG_SUBMITTED.
+
+        Any phase is accepted (DEFENSE submissions just can't reach the
+        target service over the network, so this rarely matters in practice).
+        The phase is carried in the event payload so consumers (panel,
+        scoreboard) can render / weight it however they like.
+
+        The flag string itself is never written to the event — the bus is
+        fanned out to the public panel WebSocket and persisted to a JSONL
+        log; leaking flags there would give every observer an
+        attack-for-free.
+        """
+        result = self.flags.submit(team_id, flag)
+        st = self.status()
+        await self.bus.publish(
+            new_event(
+                EventType.FLAG_SUBMITTED,
+                team_id=team_id,
+                round_id=st.get("round", 0),
+                phase=st.get("phase", ""),
+                payload={
+                    "accepted": result.accepted,
+                    "reason": result.reason,
+                    "submitter_team_id": team_id,
+                    "victim_team_id": result.victim_team_id,
+                    "service": result.service,
+                    "phase": st.get("phase", ""),
+                },
+            )
+        )
+        return result
 
     # ── helpers ─────────────────────────────────────────────────────────
 

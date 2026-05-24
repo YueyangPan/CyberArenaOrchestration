@@ -46,8 +46,8 @@ def build_app(game: GameMgr, shutdown_event: asyncio.Event) -> FastAPI:
 
     @app.post("/game/flag/submit")
     async def submit_flag(body: dict):
-        accepted = game.submit_flag(body.get("team_id", ""), body.get("flag", ""))
-        return {"accepted": accepted}
+        result = await game.submit_flag(body.get("team_id", ""), body.get("flag", ""))
+        return {"accepted": result.accepted, "reason": result.reason}
 
     @app.websocket("/events/stream")
     async def events_stream(websocket: WebSocket):
