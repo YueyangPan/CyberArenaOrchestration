@@ -4,7 +4,8 @@
 
 All design lives in [docs/](docs/). Read the relevant doc before changing related code.
 
-- [docs/design_v1.md](docs/design_v1.md) — overall system design
+- [docs/design_v1.6.md](docs/design_v1.6.md) — overall system design (current; supersedes v1)
+- [docs/design_v1.md](docs/design_v1.md) — historical v1 baseline (kept for lineage)
 - [docs/m1_topology_plan.md](docs/m1_topology_plan.md) / [docs/m1_topology_report.md](docs/m1_topology_report.md) — M1: topology
 - [docs/m2_gameloop_plan.md](docs/m2_gameloop_plan.md) / [docs/m2_gameloop_report.md](docs/m2_gameloop_report.md) — M2: game loop
 - [docs/m3_network_plan.md](docs/m3_network_plan.md) / [docs/m3_network_report.md](docs/m3_network_report.md) — M3: network switching
