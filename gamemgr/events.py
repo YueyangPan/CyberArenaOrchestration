@@ -50,6 +50,11 @@ class EventType(str, Enum):
     # to own the agent supervisor (lets the API server / demo / tests
     # wire whichever manager they need).
     DEFENSE_KICKOFF = "DEFENSE_KICKOFF"
+    # Mirror of DEFENSE_KICKOFF — emitted once per team on
+    # PHASE_CHANGE → ATTACK entry. One attack agent per team per round
+    # (vs. defense's per-team-per-service) because an attack agent from
+    # M5.6 attacks every opposing team in a single run.
+    ATTACK_KICKOFF = "ATTACK_KICKOFF"
 
 
 @dataclass(frozen=True)

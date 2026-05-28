@@ -81,14 +81,22 @@ class GameMgr:
         self._defense_kickoff_handler: (
             Callable[[str, AgentConfig], Awaitable[None]] | None
         ) = None
-        # Set of (team_id, service_name) pairs we've already kicked off this
-        # phase, so a re-fire of PHASE_CHANGE for the same round doesn't
-        # spawn duplicate agents.
+        # Set of (round_id, team_id, service_name) tuples we've already
+        # kicked off, so a re-fire of PHASE_CHANGE for the same round
+        # doesn't spawn duplicate agents.
         self._defense_kickoff_done: set[tuple[int, str, str]] = set()
-        # Subscribe at construction time (not start()): the subscriber has
-        # no file-sink dependency and tests routinely drive PHASE_CHANGE
-        # events directly onto the bus without invoking the round loop.
+        # Attack-side parallel of the defense kickoff handler. One agent
+        # per team per round (no per-service split — the M5.6 attack
+        # prompt walks every opposing prod from one install).
+        self._attack_kickoff_handler: (
+            Callable[[str, AgentConfig], Awaitable[None]] | None
+        ) = None
+        self._attack_kickoff_done: set[tuple[int, str]] = set()
+        # Subscribe at construction time (not start()): the subscribers
+        # have no file-sink dependency and tests routinely drive
+        # PHASE_CHANGE events directly onto the bus without the round loop.
         self.bus.subscribe(self._on_defense_kickoff)
+        self.bus.subscribe(self._on_attack_kickoff)
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
@@ -387,6 +395,67 @@ class GameMgr:
                         "defense kickoff handler raised for (%s, %s); skipping",
                         team_id, chcfg.name,
                     )
+
+    # ── DEFCON: attack kickoff on PHASE_CHANGE → ATTACK ─────────────────
+
+    def register_attack_kickoff_handler(
+        self,
+        handler: Callable[[str, AgentConfig], Awaitable[None]],
+    ) -> None:
+        """Register the callable that spawns an attack agent per team.
+
+        Signature: `async def handler(team_id: str, cfg: AgentConfig)`.
+        Called once per team on every ATTACK phase entry. Replaces any
+        previously-registered handler.
+        """
+        self._attack_kickoff_handler = handler
+
+    async def _on_attack_kickoff(self, event) -> None:
+        """Subscriber: on every ATTACK entry, emit ATTACK_KICKOFF per team
+        and invoke the registered handler.
+
+        Per team (not per-team-per-service) because the M5.6 attack prompt
+        walks every opposing prod from a single install. Idempotent per
+        (round_id, team_id) so a re-fire of PHASE_CHANGE in the same round
+        doesn't double-spawn.
+        """
+        if event.type != EventType.PHASE_CHANGE.value:
+            return
+        if event.phase != Phase.ATTACK.value:
+            return
+
+        for team in self.config.topology.teams:
+            key = (event.round_id, team.id)
+            if key in self._attack_kickoff_done:
+                continue
+            self._attack_kickoff_done.add(key)
+
+            await self.bus.publish(
+                new_event(
+                    EventType.ATTACK_KICKOFF,
+                    team_id=team.id,
+                    round_id=event.round_id,
+                    phase=event.phase,
+                    payload={},
+                )
+            )
+
+            if self._attack_kickoff_handler is None:
+                continue
+
+            try:
+                cfg = self.agent_config_for(team.id)
+            except Exception:
+                log.exception("agent_config_for failed for %s; skipping attack kickoff", team.id)
+                continue
+
+            try:
+                await self._attack_kickoff_handler(team.id, cfg)
+            except Exception:
+                log.exception(
+                    "attack kickoff handler raised for %s; skipping",
+                    team.id,
+                )
 
     async def stop(self) -> None:
         if self.round_loop is not None:

@@ -136,31 +136,38 @@ def _build_challenge_images(config_path: str) -> None:
 
 
 def _wire_defense_kickoff(game: GameMgr) -> None:
-    """Register a defense-kickoff handler that installs the Claude agent
-    on the team's dev container on every DEFENSE entry.
+    """Register defense + attack kickoff handlers that install a Claude
+    agent on the team's dev container on every DEFENSE / ATTACK entry.
 
-    The kickoff fires once per (team, defense-capable service); the
-    handler bridges from the round loop's async context into
-    `ClaudeAgentManager.install` (sync) via `run_in_executor`.
+    Both phases share one ClaudeAgentManager (state is per-container, not
+    per-handler) so subsequent installs on the same dev container reuse
+    SSH keys / npm-installed CLI / etc.
+
+    Sync `install()` is bridged into the async loop via run_in_executor.
+    The kickoff event also publishes regardless — observers (panel) see
+    the signal even if the install raises.
     """
     client = docker.from_env()
     agent_mgr = ClaudeAgentManager(client=client)
 
-    async def handler(team_id: str, cfg) -> None:
-        team = next((t for t in game.config.topology.teams if t.id == team_id), None)
-        if team is None or not team.dev:
-            log.warning("defense kickoff: team %s has no dev container; skipping", team_id)
-            return
-        try:
-            handle = game._handle_for(team.dev)
-        except Exception:
-            log.exception("defense kickoff: cannot resolve dev handle for %s", team_id)
-            return
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, agent_mgr.install, handle, cfg)
-        log.info("defense agent installed on %s", team.dev)
+    def _make_handler(mode: str):
+        async def handler(team_id: str, cfg) -> None:
+            team = next((t for t in game.config.topology.teams if t.id == team_id), None)
+            if team is None or not team.dev:
+                log.warning("%s kickoff: team %s has no dev container; skipping", mode, team_id)
+                return
+            try:
+                handle = game._handle_for(team.dev)
+            except Exception:
+                log.exception("%s kickoff: cannot resolve dev handle for %s", mode, team_id)
+                return
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, agent_mgr.install, handle, cfg)
+            log.info("%s agent installed on %s", mode, team.dev)
+        return handler
 
-    game.register_defense_kickoff_handler(handler)
+    game.register_defense_kickoff_handler(_make_handler("defense"))
+    game.register_attack_kickoff_handler(_make_handler("attack"))
 
 
 if __name__ == "__main__":

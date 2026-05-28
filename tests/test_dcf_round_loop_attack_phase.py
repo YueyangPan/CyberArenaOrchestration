@@ -1,0 +1,201 @@
+"""DEFCON: attack kickoff on PHASE_CHANGE → ATTACK.
+
+Mirror of test_dcf_round_loop_defense_phase.py for the ATTACK side.
+One agent per team per round (not per-team-per-service) because the
+M5.6 attack prompt walks every opposing prod from a single install.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from gamemgr.config import ChallengeConfig, GameConfig, RoundConfig
+from gamemgr.events import EventType, new_event
+from gamemgr.game_mgr import GameMgr
+from gamemgr.round import Phase
+from models.agent import AgentConfig
+from models.topology import Team, TopologyGraph
+
+
+class _StubOrchestrator:
+    network = None
+
+
+def _make_game(
+    *,
+    challenges: list[ChallengeConfig] | None = None,
+    teams: list[Team] | None = None,
+    agents: dict[str, AgentConfig] | None = None,
+) -> GameMgr:
+    if teams is None:
+        teams = [
+            Team(id="team1", dev="team1_dev", prod="team1_prod", token="tok-team1"),
+            Team(id="team2", dev="team2_dev", prod="team2_prod", token="tok-team2"),
+        ]
+    topology = TopologyGraph(teams=teams, nodes=[], networks=[])
+    cfg = GameConfig(
+        topology=topology,
+        challenges=challenges
+        or [ChallengeConfig(name="notes", type="notes", port=5000, deploy_on=["team1", "team2"])],
+        rounds=RoundConfig(),
+        agents=agents or {},
+    )
+    return GameMgr(config=cfg, orchestrator=_StubOrchestrator())
+
+
+def _phase_change(phase: Phase, round_id: int):
+    return new_event(EventType.PHASE_CHANGE, round_id=round_id, phase=phase.value)
+
+
+# ── ATTACK_KICKOFF emission ───────────────────────────────────────────
+
+
+def test_attack_kickoff_emits_one_event_per_team():
+    """One per team in topology — independent of how many challenges /
+    services are deployed."""
+    game = _make_game()
+
+    async def run():
+        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
+
+    asyncio.run(run())
+
+    kickoffs = [e for e in game.bus.history() if e.type == EventType.ATTACK_KICKOFF.value]
+    assert len(kickoffs) == 2
+    assert sorted(e.team_id for e in kickoffs) == ["team1", "team2"]
+    for e in kickoffs:
+        assert e.round_id == 1
+        assert e.phase == Phase.ATTACK.value
+
+
+def test_attack_kickoff_does_not_fire_outside_attack_phase():
+    """DEFENSE / SETUP / PREFLIGHT must not trigger attack kickoff."""
+    game = _make_game()
+
+    async def run():
+        for p in (Phase.PREFLIGHT, Phase.SETUP, Phase.DEFENSE):
+            await game.bus.publish(_phase_change(p, round_id=1))
+
+    asyncio.run(run())
+
+    kickoffs = [e for e in game.bus.history() if e.type == EventType.ATTACK_KICKOFF.value]
+    assert kickoffs == []
+
+
+def test_attack_kickoff_is_idempotent_within_a_round():
+    """Re-fire of PHASE_CHANGE → ATTACK in the same round MUST NOT double-spawn."""
+    game = _make_game()
+
+    async def run():
+        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
+        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
+        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=2))
+
+    asyncio.run(run())
+
+    kickoffs = [e for e in game.bus.history() if e.type == EventType.ATTACK_KICKOFF.value]
+    # 2 teams × 2 distinct rounds = 4 kickoffs (not 6 — round 1's duplicate dropped).
+    assert len(kickoffs) == 4
+    by_round = sorted((e.round_id, e.team_id) for e in kickoffs)
+    assert by_round == [(1, "team1"), (1, "team2"), (2, "team1"), (2, "team2")]
+
+
+# ── Handler dispatch ──────────────────────────────────────────────────
+
+
+def test_registered_attack_kickoff_handler_receives_attack_prompt():
+    """Handler called once per team with an attack-mode AgentConfig.
+    The system_prompt fingerprints the attack recipe (opposing prods,
+    LIST/GET protocol commands)."""
+    agents = {
+        tid: AgentConfig(
+            cli="claude --print",
+            model="claude-sonnet-4-5",
+            api_key="test-key",
+            base_url="https://api.anthropic.com",
+        )
+        for tid in ("team1", "team2")
+    }
+    game = _make_game(agents=agents)
+
+    calls: list[tuple[str, AgentConfig]] = []
+
+    async def handler(team_id: str, cfg: AgentConfig) -> None:
+        calls.append((team_id, cfg))
+
+    game.register_attack_kickoff_handler(handler)
+
+    async def run():
+        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
+
+    asyncio.run(run())
+
+    assert len(calls) == 2
+    by_team = dict(calls)
+    assert set(by_team) == {"team1", "team2"}
+    for tid, cfg in by_team.items():
+        # Attack prompt fingerprints: mentions attack/steal + opposing prods.
+        assert "attack agent" in cfg.system_prompt.lower()
+        # Defense vocabulary should NOT appear.
+        assert "edit the source" not in cfg.system_prompt.lower()
+        # Opposing prods are populated for attack (defense leaves it empty).
+        assert cfg.opposing_prod_hosts != tuple()
+
+
+def test_handler_exception_does_not_break_subsequent_kickoffs():
+    """A handler raising for team1 must not stop the team2 kickoff."""
+    agents = {
+        tid: AgentConfig(
+            cli="claude --print", model="claude-sonnet-4-5",
+            api_key="test-key", base_url="https://api.anthropic.com",
+        )
+        for tid in ("team1", "team2")
+    }
+    game = _make_game(agents=agents)
+
+    invoked: list[str] = []
+
+    async def handler(team_id: str, cfg: AgentConfig) -> None:
+        invoked.append(team_id)
+        if team_id == "team1":
+            raise RuntimeError("simulated handler crash")
+
+    game.register_attack_kickoff_handler(handler)
+
+    async def run():
+        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
+
+    asyncio.run(run())
+
+    assert sorted(invoked) == ["team1", "team2"]
+
+
+def test_no_handler_registered_still_emits_event():
+    """Signal-only mode: observers see ATTACK_KICKOFF even without an agent wired."""
+    game = _make_game()  # no handler registered
+    async def run():
+        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
+    asyncio.run(run())
+
+    kickoffs = [e for e in game.bus.history() if e.type == EventType.ATTACK_KICKOFF.value]
+    assert len(kickoffs) == 2
+
+
+def test_defense_and_attack_kickoffs_are_independent():
+    """Both subscribers wired; firing DEFENSE doesn't trigger attack and vice versa."""
+    game = _make_game(
+        challenges=[ChallengeConfig(name="nautilus-ico", type="nautilus-ico", port=4265, deploy_on=["team1", "team2"])],
+    )
+
+    async def run():
+        await game.bus.publish(_phase_change(Phase.DEFENSE, round_id=1))
+        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
+
+    asyncio.run(run())
+
+    defense = [e for e in game.bus.history() if e.type == EventType.DEFENSE_KICKOFF.value]
+    attack = [e for e in game.bus.history() if e.type == EventType.ATTACK_KICKOFF.value]
+    assert len(defense) == 2, defense  # team1 + team2, ico is defense-capable
+    assert len(attack) == 2, attack
