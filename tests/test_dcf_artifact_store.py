@@ -29,37 +29,38 @@ def test_artifact_kinds_are_a_closed_set_with_distinct_values():
 
     # Pin the v1 names so future renames are caught — downstream tools
     # may grep these paths.
-    assert ArtifactKind.API_LOG.value == "api-logs"
-    assert ArtifactKind.AGENT_LOG.value == "agent-logs"
-    assert ArtifactKind.SERVICE_LOG.value == "service-logs"
+    assert ArtifactKind.API_LOG.value == "api-log"
+    assert ArtifactKind.AGENT_LOG.value == "agent-log"
+    assert ArtifactKind.SERVICE_LOG.value == "service-log"
 
 
 # ── store construction: reserves layout up-front ───────────────────────
 
 
-def test_store_creates_artifacts_root_with_all_kind_subdirs(tmp_path):
-    """At construction time, artifacts/ exists with one subdir per kind +
-    a README — so the layout is visible even before any artifact lands."""
+def test_store_creates_artifacts_root_and_readme(tmp_path):
+    """At construction time, artifacts/ exists with a README — per-team
+    subdirs appear lazily as artifacts land (no upfront reservation)."""
     store = ArtifactStore(tmp_path)
 
     root = tmp_path / "artifacts"
     assert root.is_dir()
     assert store.root == root
-
-    for kind in ArtifactKind:
-        assert (root / kind.value).is_dir(), f"missing reserved subdir for {kind.value}"
-
     assert (root / "README.md").is_file()
+    # Layout is team-first now — no `<kind>/` subdirs at the top level.
+    # No team dirs exist yet because nothing has been written.
+    assert list(p.name for p in root.iterdir() if p.is_dir()) == []
 
 
 def test_store_construction_is_idempotent(tmp_path):
     """Constructing twice over the same run dir doesn't blow up or rewrite
     the README. Lets GameMgr re-init defensively without losing state."""
-    ArtifactStore(tmp_path)
+    store = ArtifactStore(tmp_path)
     readme = tmp_path / "artifacts" / "README.md"
     original = readme.read_text()
-    # Drop a sentinel file so we can detect any clobber.
-    sentinel = tmp_path / "artifacts" / "api-logs" / "sentinel.txt"
+    # Drop a sentinel via path_for so the second construction sees it.
+    sentinel = store.path_for(
+        ArtifactKind.API_LOG, team_id="team1", round_id=0, filename="sentinel.txt",
+    )
     sentinel.write_text("keep me")
 
     ArtifactStore(tmp_path)  # second construction
@@ -72,15 +73,30 @@ def test_store_construction_is_idempotent(tmp_path):
 
 
 def test_path_for_returns_expected_layout(tmp_path):
-    """runs/<ts>/artifacts/<kind>/<team_id>/round-<N>/<filename>."""
+    """runs/<ts>/artifacts/<team_id>/round-<N>/<filename>.
+
+    Kind is a closed-set tag for the caller but does not appear in the
+    path — different kinds live side-by-side under the same round dir,
+    disambiguated by filename convention.
+    """
     store = ArtifactStore(tmp_path)
     p = store.path_for(
         ArtifactKind.API_LOG,
         team_id="team1",
         round_id=3,
-        filename="stream.jsonl",
+        filename="stream-defense.jsonl",
     )
-    assert p == tmp_path / "artifacts" / "api-logs" / "team1" / "round-3" / "stream.jsonl"
+    assert p == tmp_path / "artifacts" / "team1" / "round-3" / "stream-defense.jsonl"
+
+
+def test_path_for_groups_all_kinds_under_one_round_dir(tmp_path):
+    """All artifact kinds for the same (team, round) share one directory."""
+    store = ArtifactStore(tmp_path)
+    api_p = store.path_for(ArtifactKind.API_LOG, team_id="team1", round_id=1, filename="stream-defense.jsonl")
+    agent_p = store.path_for(ArtifactKind.AGENT_LOG, team_id="team1", round_id=1, filename="agent-defense.log")
+    svc_p = store.path_for(ArtifactKind.SERVICE_LOG, team_id="team1", round_id=1, filename="docker.log")
+    assert api_p.parent == agent_p.parent == svc_p.parent
+    assert api_p.parent == tmp_path / "artifacts" / "team1" / "round-1"
 
 
 def test_path_for_creates_parent_dirs_lazily(tmp_path):
@@ -161,5 +177,18 @@ def test_path_for_allows_nested_filename(tmp_path):
         filename="sub/stream.jsonl",
     )
     p.write_text("ok")
-    assert p == tmp_path / "artifacts" / "api-logs" / "team1" / "round-1" / "sub" / "stream.jsonl"
+    assert p == tmp_path / "artifacts" / "team1" / "round-1" / "sub" / "stream.jsonl"
     assert p.read_text() == "ok"
+
+
+def test_path_for_rejects_non_enum_kind(tmp_path):
+    """Passing a raw string instead of an ArtifactKind member must raise —
+    otherwise the closed-set discipline silently degrades to free-form."""
+    store = ArtifactStore(tmp_path)
+    with pytest.raises(TypeError, match="ArtifactKind"):
+        store.path_for(
+            "api-log",  # type: ignore[arg-type]
+            team_id="team1",
+            round_id=1,
+            filename="x.log",
+        )

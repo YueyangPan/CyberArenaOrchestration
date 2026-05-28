@@ -1,14 +1,17 @@
 """Per-run artifact persistence — typed path allocator.
 
 Forensic / replay / scoring milestones drop their outputs into stable
-paths under `runs/<utc-ts>/artifacts/<kind>/team{N}/round-{N}/<filename>`.
-The kinds are a closed set (one enum value per slot), so new artifact
-types add a single line here + one consumer — no per-caller path
-negotiation.
+paths under `runs/<utc-ts>/artifacts/<team>/round-<N>/<filename>`.
 
-v1 fills three kinds (api-logs, agent-logs, service-logs); the rest
-are reserved as empty subdirs so callers landing later don't have to
-re-decide paths.
+Layout groups by team + round first (matches how operators read a run:
+"show me everything team1 did in round 2"); the artifact KIND lives in
+the filename via stable conventions (`stream-defense.jsonl` /
+`agent-attack.log` / `docker.log` / ...).
+
+The `ArtifactKind` enum is kept as a closed-set type-tag so callers
+don't invent new categories ad-hoc, but it no longer influences the
+path — only the filename does. Each kind has a canonical filename
+convention documented inline.
 
 See docs/DEFCON_challenge_framework_plan_v1.md for the full design.
 """
@@ -20,16 +23,29 @@ from pathlib import Path
 
 
 class ArtifactKind(str, Enum):
-    """Closed set of artifact slots under runs/<ts>/artifacts/<kind>/."""
+    """Closed-set tag for artifacts. Doesn't affect the on-disk path —
+    use the conventional filenames below so consumers can grep one kind.
 
-    API_LOG = "api-logs"              # LLM stream-json transcript per agent phase
-    AGENT_LOG = "agent-logs"          # supervisor stderr / exit_code (process-level)
-    SERVICE_LOG = "service-logs"      # docker logs snapshot per round
-    SOURCE_SNAPSHOT = "source-snapshots"  # reserved: tar of /srv/challenge/<chal>/
-    BINARY_DIFF = "binary-diffs"     # reserved
-    PCAP = "pcaps"                    # reserved
-    EXPLOIT = "exploits"              # reserved
-    REPLAY_BUNDLE = "replay-bundles"  # reserved
+    Filename conventions per kind (see callers in `gamemgr.game_mgr`):
+
+      API_LOG          stream-{phase}.jsonl   (LLM stream-json transcript)
+      AGENT_LOG        agent-{phase}.log      (stderr + exit_code)
+      SERVICE_LOG      docker.log             (docker logs of team prod)
+      SOURCE_SNAPSHOT  source.tar             (reserved)
+      BINARY_DIFF      binary.diff            (reserved)
+      PCAP             traffic.pcap           (reserved)
+      EXPLOIT          exploit.bin            (reserved)
+      REPLAY_BUNDLE    replay.tar             (reserved)
+    """
+
+    API_LOG = "api-log"
+    AGENT_LOG = "agent-log"
+    SERVICE_LOG = "service-log"
+    SOURCE_SNAPSHOT = "source-snapshot"
+    BINARY_DIFF = "binary-diff"
+    PCAP = "pcap"
+    EXPLOIT = "exploit"
+    REPLAY_BUNDLE = "replay-bundle"
 
 
 _ARTIFACTS_DIRNAME = "artifacts"
@@ -41,21 +57,20 @@ _README = """\
 Per-run forensic outputs. Layout:
 
 ```
-artifacts/<kind>/team{N}/round-{N}/<filename>
+artifacts/<team>/round-<N>/<filename>
 ```
 
-Kinds (per `gamemgr.artifacts.ArtifactKind`):
+Per-kind filename conventions (see `gamemgr.artifacts.ArtifactKind`):
 
-- `api-logs/` — LLM stream-json transcript per agent phase (every turn:
-  prompt, assistant message, tool_use, tool_result, usage tokens)
-- `agent-logs/` — supervisor diagnostics (stderr, exit_code) at the
-  process level — distinct from the API trace
-- `service-logs/` — `docker logs` snapshot per (team, challenge, round)
-- `source-snapshots/` — reserved (tar of /srv/challenge/<chal>/)
-- `binary-diffs/` — reserved
-- `pcaps/` — reserved
-- `exploits/` — reserved
-- `replay-bundles/` — reserved
+- `stream-defense.jsonl` / `stream-attack.jsonl` — LLM stream-json
+  transcript (api-log) for that phase: every turn's prompt, assistant
+  message, tool_use, tool_result, usage tokens.
+- `agent-defense.log` / `agent-attack.log` — supervisor stderr +
+  exit_code (agent-log) for that phase.
+- `docker.log` — `docker logs --timestamps <team{N}_prod>` snapshot at
+  end of round (service-log).
+- `source.tar`, `binary.diff`, `traffic.pcap`, `exploit.bin`,
+  `replay.tar` — reserved for future milestones.
 """
 
 
@@ -66,10 +81,6 @@ class ArtifactStore:
         self._run_dir = Path(run_dir)
         self._root = self._run_dir / _ARTIFACTS_DIRNAME
         self._root.mkdir(parents=True, exist_ok=True)
-        # Reserve empty subdirs for every kind so the layout is visible
-        # even before any artifact lands. README explains the contract.
-        for kind in ArtifactKind:
-            (self._root / kind.value).mkdir(exist_ok=True)
         readme = self._root / "README.md"
         if not readme.exists():
             readme.write_text(_README)
@@ -82,17 +93,26 @@ class ArtifactStore:
         round_id: int,
         filename: str,
     ) -> Path:
-        """Return runs/<ts>/artifacts/<kind>/<team_id>/round-<N>/<filename>.
+        """Return runs/<ts>/artifacts/<team_id>/round-<N>/<filename>.
 
-        Parents are created on demand. Rejects `..` in filename — paths
-        must stay inside the run's artifact root. (Without this guard a
-        filename like '../../etc/passwd' would write outside the run dir.)
+        `kind` is kept as a closed-set tag (callers can't invent new
+        categories) but does not affect the path — the filename does.
+        See `ArtifactKind` for the per-kind filename conventions. The
+        runtime check below catches callers that accidentally pass a
+        raw string instead of the enum member.
+
+        Parents are created on demand. Rejects `..` and absolute paths
+        in filename so a hostile / buggy caller can't write outside the
+        run's artifact root.
         """
+        if not isinstance(kind, ArtifactKind):
+            raise TypeError(
+                f"kind must be an ArtifactKind, got {type(kind).__name__}: {kind!r}"
+            )
         if ".." in Path(filename).parts:
             raise ValueError(
                 f"filename must not contain '..': {filename!r}"
             )
-        # Reject absolute filenames too — they'd silently bypass the prefix.
         if Path(filename).is_absolute():
             raise ValueError(
                 f"filename must be relative: {filename!r}"
@@ -100,7 +120,6 @@ class ArtifactStore:
 
         dest = (
             self._root
-            / kind.value
             / team_id
             / f"round-{round_id}"
             / filename

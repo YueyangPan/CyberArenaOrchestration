@@ -82,10 +82,9 @@ def test_start_constructs_artifact_store_in_run_dir(tmp_path):
 
     assert game.artifacts is not None
     assert game.artifacts.root == tmp_path / "artifacts"
-    # Reserved subdirs all present (per ArtifactStore.__init__).
-    from gamemgr.artifacts import ArtifactKind
-    for kind in ArtifactKind:
-        assert (tmp_path / "artifacts" / kind.value).is_dir()
+    # Per-team / round dirs are created lazily; only the root + README
+    # exist immediately. (No `<kind>/` reservations in the new layout.)
+    assert (tmp_path / "artifacts" / "README.md").is_file()
 
 
 # ── PHASE_CHANGE → ATTACK: defense agent logs persisted ───────────────
@@ -124,13 +123,13 @@ def test_phase_change_to_attack_writes_defense_agent_logs(tmp_path, monkeypatch)
 
     asyncio.run(run())
 
-    # Both teams' defense logs should exist under round-1/.
+    # Both teams' defense logs should exist under <team>/round-1/.
     for team in ("team1", "team2"):
-        api_p = tmp_path / "artifacts" / "api-logs" / team / "round-1" / "stream-defense.jsonl"
+        api_p = tmp_path / "artifacts" / team / "round-1" / "stream-defense.jsonl"
         assert api_p.is_file(), f"missing {api_p}"
         assert f"hello from {team}" in api_p.read_text()
 
-        agent_p = tmp_path / "artifacts" / "agent-logs" / team / "round-1" / "agent-defense.log"
+        agent_p = tmp_path / "artifacts" / team / "round-1" / "agent-defense.log"
         assert agent_p.is_file(), f"missing {agent_p}"
         body = agent_p.read_text()
         assert "exit_code=0" in body
@@ -159,10 +158,10 @@ def test_round_stop_writes_attack_agent_logs(tmp_path, monkeypatch):
     asyncio.run(run())
 
     for team in ("team1", "team2"):
-        api_p = tmp_path / "artifacts" / "api-logs" / team / "round-2" / "stream-attack.jsonl"
+        api_p = tmp_path / "artifacts" / team / "round-2" / "stream-attack.jsonl"
         assert api_p.is_file(), f"missing {api_p}"
         assert "attack-stream-content" in api_p.read_text()
-        agent_p = tmp_path / "artifacts" / "agent-logs" / team / "round-2" / "agent-attack.log"
+        agent_p = tmp_path / "artifacts" / team / "round-2" / "agent-attack.log"
         assert agent_p.is_file()
 
 
@@ -203,7 +202,7 @@ def test_round_stop_writes_service_logs_via_docker_logs(tmp_path, monkeypatch):
     asyncio.run(run())
 
     for team in ("team1", "team2"):
-        p = tmp_path / "artifacts" / "service-logs" / team / "round-3" / "docker.log"
+        p = tmp_path / "artifacts" / team / "round-3" / "docker.log"
         assert p.is_file(), f"missing {p}"
         assert f"docker stdout for {team}_prod" in p.read_text()
 
@@ -231,8 +230,8 @@ def test_defense_phase_entry_does_not_write_artifacts(tmp_path, monkeypatch):
     asyncio.run(run())
 
     assert fetched == [], "fetch should NOT happen on DEFENSE entry"
-    # api-logs/team1 round-1 dir should NOT exist (no file written).
-    assert not (tmp_path / "artifacts" / "api-logs" / "team1" / "round-1").exists()
+    # team1/round-1 dir should NOT exist (no file written).
+    assert not (tmp_path / "artifacts" / "team1" / "round-1").exists()
 
 
 # ── No handler registered: subscriber no-ops cleanly ─────────────────
@@ -252,6 +251,7 @@ def test_persist_no_handler_silently_skips_agent_logs(tmp_path):
         )
     asyncio.run(run())
 
-    # No api-logs / agent-logs files written.
-    assert list((tmp_path / "artifacts" / "api-logs").rglob("*.jsonl")) == []
-    assert list((tmp_path / "artifacts" / "agent-logs").rglob("*.log")) == []
+    # No agent stream / stderr files anywhere (only docker.log can land,
+    # but no service subscriber fired in this scenario either).
+    assert list((tmp_path / "artifacts").rglob("stream-*.jsonl")) == []
+    assert list((tmp_path / "artifacts").rglob("agent-*.log")) == []
