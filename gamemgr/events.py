@@ -55,6 +55,11 @@ class EventType(str, Enum):
     # (vs. defense's per-team-per-service) because an attack agent from
     # M5.6 attacks every opposing team in a single run.
     ATTACK_KICKOFF = "ATTACK_KICKOFF"
+    # Round loop terminated — fired exactly once at the end of the game,
+    # whether via natural exit (round counter == total_rounds), stop()
+    # signal, or unhandled exception. Payload carries the cause and the
+    # final round / phase the loop exited from.
+    GAME_END = "GAME_END"
 
 
 @dataclass(frozen=True)
