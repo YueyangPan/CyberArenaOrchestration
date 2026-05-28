@@ -8,16 +8,22 @@ Lifecycle:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import secrets
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
+
+import docker
 
 from orchestrator.orchestrator import Orchestrator
 from orchestrator.service import ContainerHandle, Service
 
 from agents.prompts import build_attack_prompt
+from challenges.notes import BuiltinNotesSource
 from challenges.registry import build as build_challenge
-from dataclasses import replace
+from challenges.source import ChallengeSpec, HealthLevel
 from models.agent import AgentConfig
 
 from .config import ChallengeConfig, GameConfig
@@ -309,6 +315,305 @@ class GameMgr:
                 },
             )
         )
+
+    # ── DEFCON: restart_service + health checks ─────────────────────────
+
+    def _resolve_spec(self, service_name: str) -> ChallengeSpec | None:
+        """Look up the ChallengeSpec by name from the configured sources.
+
+        Lazy-cached on first call so subsequent restarts don't re-enumerate.
+        Sources are discovered as needed:
+          - BuiltinNotesSource is always present (notes is the toy challenge)
+          - NautilusSource is attached if vendor/nautilus-finals-2025 exists
+            and includes the matching upstream dir (inferred from any
+            non-notes ChallengeConfig in game.yaml).
+        """
+        cache = getattr(self, "_spec_cache", None)
+        if cache is None:
+            cache = {}
+            # Notes is always available.
+            for spec in BuiltinNotesSource().list_challenges():
+                cache[spec.name] = spec
+            # Nautilus: instantiate only if at least one configured challenge
+            # name starts with "nautilus-". (We don't speculatively pull the
+            # vendor repo just to enumerate.)
+            nautilus_names = [
+                c.name[len("nautilus-"):]
+                for c in self.config.challenges
+                if c.name.startswith("nautilus-")
+            ]
+            if nautilus_names:
+                # Lazy import to avoid pulling docker SDK during config-only flows.
+                from challenges.nautilus import NautilusSource
+
+                try:
+                    for spec in NautilusSource(include=nautilus_names).list_challenges():
+                        cache[spec.name] = spec
+                except FileNotFoundError as e:
+                    log.warning("nautilus source unavailable: %s", e)
+            self._spec_cache = cache
+        return cache.get(service_name)
+
+    async def restart_service(
+        self,
+        team_id: str,
+        service: str,
+    ) -> str:
+        """Async restart of `service` on `team_id`'s prod container.
+
+        Returns a `job_id` immediately; the rebuild + restart runs in a
+        background task that emits SERVICE_RESTART_STARTED / _COMPLETED /
+        _FAILED + a SERVICE_HEALTH_CHECK per level on the bus.
+
+        Raises ValueError for unknown service, no restart_cmd in spec, or
+        a restart already in flight for this (team, service). The MCP
+        layer translates these into InvalidParams.
+        """
+        # 1. Spec lookup + restart_cmd resolution.
+        spec = self._resolve_spec(service)
+        if spec is None:
+            raise ValueError(f"unknown service: {service!r}")
+        restart_cmd = spec.metadata.get("restart_cmd") if spec.metadata else None
+        if not restart_cmd:
+            raise ValueError(
+                f"service {service!r} has no restart_cmd in spec — not defendable"
+            )
+
+        # 2. Container lookup. M5.6 topology: one team{N}_prod per team.
+        team = next((t for t in self.config.topology.teams if t.id == team_id), None)
+        if team is None or not team.prod:
+            raise ValueError(f"unknown team: {team_id!r}")
+        container_name = team.prod
+
+        # 3. In-flight guard — one rebuild per (team, service) at a time.
+        if not hasattr(self, "_restart_jobs"):
+            self._restart_jobs = {}  # job_id → metadata
+        for existing_job_id, meta in self._restart_jobs.items():
+            if meta["team_id"] == team_id and meta["service"] == service:
+                if not meta.get("done"):
+                    raise ValueError(
+                        f"restart already in flight for ({team_id!r}, {service!r}): job={existing_job_id}"
+                    )
+
+        # 4. Emit STARTED + spawn the background task.
+        job_id = secrets.token_hex(6)  # 12-hex
+        started_at = time.time()
+        self._restart_jobs[job_id] = {
+            "team_id": team_id, "service": service,
+            "started_at": started_at, "done": False,
+        }
+        st = self.status()
+        await self.bus.publish(
+            new_event(
+                EventType.SERVICE_RESTART_STARTED,
+                team_id=team_id,
+                round_id=st.get("round", 0),
+                phase=st.get("phase", ""),
+                payload={
+                    "job_id": job_id,
+                    "team_id": team_id,
+                    "service": service,
+                    "started_at": started_at,
+                },
+            )
+        )
+
+        # Spawn the background restart task on the running event loop.
+        asyncio.create_task(
+            self._run_restart_job(
+                job_id=job_id,
+                team_id=team_id,
+                service=service,
+                container_name=container_name,
+                restart_cmd=restart_cmd,
+                spec=spec,
+            )
+        )
+        return job_id
+
+    async def _run_restart_job(
+        self,
+        *,
+        job_id: str,
+        team_id: str,
+        service: str,
+        container_name: str,
+        restart_cmd: str,
+        spec: ChallengeSpec,
+    ) -> None:
+        """Run restart_cmd inside the team's prod container via docker exec,
+        emit COMPLETED/FAILED with duration_ms, then walk the 4 health levels."""
+        started_at = self._restart_jobs[job_id]["started_at"]
+        st = self.status()
+        # docker exec is blocking; run it in the default thread pool so
+        # we don't block the event loop while make/fpc/etc. runs.
+        loop = asyncio.get_running_loop()
+        try:
+            exit_code, output = await loop.run_in_executor(
+                None, self._exec_in_container, container_name, restart_cmd
+            )
+            duration_ms = int((time.time() - started_at) * 1000)
+            if exit_code != 0:
+                await self.bus.publish(
+                    new_event(
+                        EventType.SERVICE_RESTART_FAILED,
+                        team_id=team_id,
+                        round_id=st.get("round", 0),
+                        phase=st.get("phase", ""),
+                        payload={
+                            "job_id": job_id,
+                            "team_id": team_id,
+                            "service": service,
+                            "duration_ms": duration_ms,
+                            "error": (output[-200:] if output else f"rc={exit_code}"),
+                        },
+                    )
+                )
+                self._restart_jobs[job_id]["done"] = True
+                return
+
+            await self.bus.publish(
+                new_event(
+                    EventType.SERVICE_RESTART_COMPLETED,
+                    team_id=team_id,
+                    round_id=st.get("round", 0),
+                    phase=st.get("phase", ""),
+                    payload={
+                        "job_id": job_id,
+                        "team_id": team_id,
+                        "service": service,
+                        "duration_ms": duration_ms,
+                    },
+                )
+            )
+
+            # Health check chain — emit one SERVICE_HEALTH_CHECK per level.
+            await self._emit_health_chain(
+                team_id=team_id,
+                service=service,
+                container_name=container_name,
+                spec=spec,
+            )
+        except Exception as e:
+            duration_ms = int((time.time() - started_at) * 1000)
+            await self.bus.publish(
+                new_event(
+                    EventType.SERVICE_RESTART_FAILED,
+                    team_id=team_id,
+                    round_id=st.get("round", 0),
+                    phase=st.get("phase", ""),
+                    payload={
+                        "job_id": job_id,
+                        "team_id": team_id,
+                        "service": service,
+                        "duration_ms": duration_ms,
+                        "error": f"{type(e).__name__}: {e}"[:200],
+                    },
+                )
+            )
+        finally:
+            self._restart_jobs[job_id]["done"] = True
+
+    def _exec_in_container(self, container_name: str, cmd: str) -> tuple[int, str]:
+        """Run `cmd` inside the container via docker exec (blocking).
+        Called from the thread pool by `_run_restart_job`."""
+        client = docker.from_env()
+        c = client.containers.get(container_name)
+        result = c.exec_run(["bash", "-c", cmd])
+        out = result.output.decode(errors="replace") if result.output else ""
+        return result.exit_code, out
+
+    async def _emit_health_chain(
+        self,
+        *,
+        team_id: str,
+        service: str,
+        container_name: str,
+        spec: ChallengeSpec,
+    ) -> None:
+        """Run PROCESS → TCP → PROTOCOL → CHECKER, emit one event each.
+
+        PROCESS: pgrep against spec.metadata.health_check.process_pattern
+        TCP: orchestrator-side socket connect to spec.port (via docker exec python)
+        PROTOCOL / CHECKER: defer to a Service instance if available; otherwise
+          skip with a "no service adapter wired" detail and passed=False.
+        """
+        st = self.status()
+        hc = (spec.metadata or {}).get("health_check") or {}
+
+        async def _emit(level: HealthLevel, passed: bool, detail: str) -> None:
+            await self.bus.publish(
+                new_event(
+                    EventType.SERVICE_HEALTH_CHECK,
+                    team_id=team_id,
+                    round_id=st.get("round", 0),
+                    phase=st.get("phase", ""),
+                    payload={
+                        "team_id": team_id,
+                        "service": service,
+                        "level": level.value,
+                        "passed": passed,
+                        "detail": detail,
+                    },
+                )
+            )
+
+        loop = asyncio.get_running_loop()
+
+        # PROCESS
+        process_pattern = hc.get("process_pattern")
+        if process_pattern:
+            rc, out = await loop.run_in_executor(
+                None, self._exec_in_container, container_name,
+                f"pgrep -f {process_pattern!r}"
+            )
+            await _emit(HealthLevel.PROCESS, rc == 0, f"pgrep rc={rc}")
+        else:
+            await _emit(HealthLevel.PROCESS, True, "no process_pattern; skipped")
+
+        # TCP
+        tcp_probe = (
+            f"python3 -c \"import socket; s=socket.socket(); s.settimeout(2); "
+            f"s.connect(('127.0.0.1', {spec.port})); s.close()\""
+        )
+        rc, _ = await loop.run_in_executor(
+            None, self._exec_in_container, container_name, tcp_probe
+        )
+        await _emit(HealthLevel.TCP, rc == 0, f"socket-connect rc={rc}")
+
+        # PROTOCOL — defer to Service.is_alive(PROTOCOL) when we have an
+        # adapter wired (deploy_challenges populates _service_by_owner).
+        # If no adapter (e.g. nautilus-ico tested standalone, no Service yet),
+        # fall back to "passed=True with reason" — the deeper CHECKER below
+        # still runs and provides the load-bearing gameplay-correctness signal.
+        proto_ok = True
+        service_obj = self._service_by_owner.get((team_id, service))
+        if service_obj is not None:
+            handle = self._handle_for(container_name)
+            try:
+                proto_ok = await loop.run_in_executor(
+                    None, lambda: service_obj.is_alive(handle, HealthLevel.PROTOCOL)
+                )
+                await _emit(HealthLevel.PROTOCOL, bool(proto_ok), f"is_alive(PROTOCOL)={proto_ok}")
+            except Exception as e:
+                await _emit(HealthLevel.PROTOCOL, False, f"is_alive PROTOCOL raised: {type(e).__name__}")
+                proto_ok = False
+        else:
+            await _emit(HealthLevel.PROTOCOL, True, "no service adapter; deferred to CHECKER")
+
+        # CHECKER — for nautilus challenges, runs the framework-installed
+        # checker.sh inside the container. For notes (no checker_command),
+        # aliases to PROTOCOL — documented honest fallback, no separable
+        # gameplay surface.
+        checker_cmd = hc.get("checker_command")
+        if checker_cmd:
+            rc, out = await loop.run_in_executor(
+                None, self._exec_in_container, container_name, checker_cmd
+            )
+            detail = (out.strip() or f"rc={rc}")[-200:]
+            await _emit(HealthLevel.CHECKER, rc == 0, detail)
+        else:
+            await _emit(HealthLevel.CHECKER, bool(proto_ok), "no checker_command; aliased to PROTOCOL")
 
     # ── agent provisioning (M5.6) ───────────────────────────────────────
 

@@ -187,7 +187,15 @@ class ClaudeAgentManager(AgentManager):
     def _provision_ssh_pivot(self, dev_container: ContainerHandle, cfg: AgentConfig) -> None:
         """Generate an ed25519 keypair on host, inject pubkey + start sshd on
         own prod, drop privkey + ssh config into dev. Keys are ephemeral
-        (host tmpdir scoped to this install() call)."""
+        (host tmpdir scoped to this install() call).
+
+        SSH user selection: if the target prod image has an `arena_agent`
+        non-root user (DEFCON framework image, e.g. cyberarena/chal-nautilus-ico),
+        the key lands in `/home/arena_agent/.ssh/` and ssh config uses
+        `User arena_agent`. Otherwise (legacy cyberarena/prod-base used by
+        notes/M5/M5.6 tests), falls back to root. Detected at runtime by
+        probing the target container for the user.
+        """
         prod_name = cfg.own_prod_container_name
         log.info("provisioning ssh pivot %s -> %s", dev_container.name, prod_name)
 
@@ -205,27 +213,42 @@ class ClaudeAgentManager(AgentManager):
             with open(pub) as f:
                 pubkey = f.read()
 
-        # Pubkey + sshd on prod.
+        # Probe for the arena_agent user; pick the SSH target user accordingly.
         prod_container = ContainerHandle(container_id="", name=prod_name, networks=[])
-        self._exec(prod_container, ["mkdir", "-p", "/root/.ssh"], check=True)
-        self._exec(prod_container, ["chmod", "700", "/root/.ssh"], check=True)
-        self._write_file(prod_container, "/root/.ssh/authorized_keys", pubkey)
-        self._exec(prod_container, ["chmod", "600", "/root/.ssh/authorized_keys"], check=True)
-        # Generate host keys + start sshd; missing pidfile dir on ubuntu:24.04
-        # minimal install bites if you skip the mkdir.
+        rc, _ = self._exec(prod_container, ["id", "arena_agent"])
+        if rc == 0:
+            ssh_user = "arena_agent"
+            ssh_home = "/home/arena_agent"
+        else:
+            ssh_user = "root"
+            ssh_home = "/root"
+        log.info("ssh pivot target user on %s: %s", prod_name, ssh_user)
+
+        # Pubkey + sshd on prod (write into the chosen user's home).
+        ssh_dir = f"{ssh_home}/.ssh"
+        self._exec(prod_container, ["mkdir", "-p", ssh_dir], check=True)
+        self._exec(prod_container, ["chmod", "700", ssh_dir], check=True)
+        self._write_file(prod_container, f"{ssh_dir}/authorized_keys", pubkey)
+        self._exec(prod_container, ["chmod", "600", f"{ssh_dir}/authorized_keys"], check=True)
+        if ssh_user != "root":
+            self._exec(prod_container, ["chown", "-R", f"{ssh_user}:{ssh_user}", ssh_dir], check=True)
+
+        # Host keys + sshd. sshd's config in the framework image already sets
+        # PermitRootLogin no; legacy prod-base inherits Ubuntu default
+        # (prohibit-password — root login still works via key, which is what M5.6 used).
         self._exec(prod_container, ["mkdir", "-p", "/run/sshd"], check=True)
-        self._exec(prod_container, ["ssh-keygen", "-A"], check=True)  # generate host keys
-        # PermitRootLogin: default in Ubuntu's sshd_config is "prohibit-password" → key-only root OK.
+        self._exec(prod_container, ["ssh-keygen", "-A"], check=True)
         self._exec(prod_container, ["/usr/sbin/sshd"], check=True)
 
-        # Privkey + ssh config on dev.
+        # Privkey + ssh config on dev (always under dev's /root/.ssh since
+        # the dev container runs the agent CLI as root).
         self._exec(dev_container, ["mkdir", "-p", "/root/.ssh"], check=True)
         self._exec(dev_container, ["chmod", "700", "/root/.ssh"], check=True)
         self._write_file(dev_container, "/root/.ssh/id_ed25519", privkey)
         self._exec(dev_container, ["chmod", "600", "/root/.ssh/id_ed25519"], check=True)
         ssh_config = (
             f"Host {cfg.own_prod_host}\n"
-            f"    User root\n"
+            f"    User {ssh_user}\n"
             f"    IdentityFile /root/.ssh/id_ed25519\n"
             f"    StrictHostKeyChecking no\n"
             f"    UserKnownHostsFile /dev/null\n"

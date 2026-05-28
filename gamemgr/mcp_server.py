@@ -127,6 +127,31 @@ def build_mcp_app(game: "GameMgr") -> tuple[FastMCP, "Starlette"]:
         await game.record_deploy_complete(team_id, service, duration_ms)
         return {"ok": True}
 
+    @mcp.tool()
+    async def restart_service(service: str, ctx: Context) -> dict:
+        """Restart the team's service container after a defense edit.
+
+        Async by design: returns `{job_id}` immediately. The orchestrator
+        runs the per-challenge restart_cmd via docker exec in a background
+        task; STARTED / COMPLETED|FAILED + per-level SERVICE_HEALTH_CHECK
+        events land on the bus as the job progresses. Agent waits for the
+        service to be reachable (TCP-probe its own prod) and then calls
+        report_deploy_complete.
+
+        Returns:
+          {"job_id": "<12-hex>"} — restart accepted, running in background.
+        Raises:
+          InvalidParams: unknown service, no restart_cmd in spec, or a
+            restart is already in flight for (team, service).
+          Unauthorized: bad / missing X-Team-Token (silent on the bus).
+        """
+        team_id = _team_id_from_ctx(ctx)
+        try:
+            job_id = await game.restart_service(team_id, service)
+        except ValueError as e:
+            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+        return {"job_id": job_id}
+
     asgi_app = mcp.streamable_http_app()
     return mcp, asgi_app
 
