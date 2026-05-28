@@ -31,6 +31,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.exceptions import McpError
 from mcp.types import ErrorData, INVALID_PARAMS
 
@@ -68,7 +69,25 @@ def build_mcp_app(game: "GameMgr") -> tuple[FastMCP, "Starlette"]:
     (server, asgi_app). The caller mounts asgi_app under MCP_MOUNT_PATH
     and runs server.session_manager.run() inside the outer app's lifespan.
     """
-    mcp = FastMCP("cyberarena")
+    # FastMCP auto-enables DNS rebinding protection when host is localhost
+    # (default), restricting allowed Host headers to 127.0.0.1/localhost/::1.
+    # Agents inside dev containers reach us through host.docker.internal —
+    # add it (and bare localhost without the port-wildcard quirks) so the
+    # 421 Misdirected Request doesn't kill every tool call.
+    mcp = FastMCP(
+        "cyberarena",
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[
+                "127.0.0.1:*", "localhost:*", "[::1]:*",
+                "host.docker.internal:*",
+            ],
+            allowed_origins=[
+                "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
+                "http://host.docker.internal:*",
+            ],
+        ),
+    )
     # Mount the sub-app at "/" internally so the public wire path is just
     # whatever prefix the outer FastAPI mounts at (MCP_MOUNT_PATH + "/").
     mcp.settings.streamable_http_path = "/"
