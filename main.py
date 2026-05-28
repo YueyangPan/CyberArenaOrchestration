@@ -9,13 +9,17 @@ import signal
 import sys
 from pathlib import Path
 
+import docker
 import uvicorn
 
+from agents.claude import ClaudeAgentManager
 from gamemgr.api import build_app
 from gamemgr.config import load as load_game_config
 from gamemgr.game_mgr import GameMgr
 from orchestrator import topology
 from orchestrator.orchestrator import Orchestrator
+
+log = logging.getLogger("main")
 
 DEFAULT_CONFIG = Path(__file__).parent / "config" / "game.yaml"
 
@@ -35,6 +39,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.command == "setup":
+        # Build every challenge image the config references before
+        # container create — otherwise Orchestrator.setup() will try to
+        # docker-pull the unpublished local tag and fail.
+        _build_challenge_images(args.config)
         graph = topology.load(args.config)
         Orchestrator(graph=graph).setup()
         return 0
@@ -52,12 +60,20 @@ def main(argv: list[str] | None = None) -> int:
 
 async def _run_start(args) -> int:
     cfg = load_game_config(args.config)
+    # Build challenge images before Orchestrator.setup() — same reason
+    # as the `setup` subcommand path.
+    _build_challenge_images(args.config)
     orch = Orchestrator(graph=cfg.topology)
     orch.setup()
 
     game = GameMgr(config=cfg, orchestrator=orch)
     game.deploy_challenges()
     game.plant_initial_flags()
+
+    # DEFCON Phase 4b: spawn a defense agent on each team's dev container
+    # when the round loop enters DEFENSE. Handler is sync (ClaudeAgentManager.install
+    # is sync) → run in the default thread pool to avoid blocking the loop.
+    _wire_defense_kickoff(game)
 
     shutdown = asyncio.Event()
     app = build_app(game, shutdown)
@@ -99,6 +115,52 @@ async def _run_start(args) -> int:
     game.teardown_challenges()
     orch.teardown()
     return 0
+
+
+def _build_challenge_images(config_path: str) -> None:
+    """Build every challenge image referenced by `config_path`.
+
+    Delegates to `challenges.registry.build_all_images` — the registry
+    owns the source set, so adding a new adapter (picoCTF, custom git)
+    only needs one branch there, not here.
+
+    Idempotent: each source's `build_image` skips when the tag is already
+    present locally.
+    """
+    from challenges.registry import build_all_images
+
+    cfg = load_game_config(config_path)
+    tags = build_all_images(cfg)
+    if tags:
+        log.info("built/cached %d challenge image(s): %s", len(tags), tags)
+
+
+def _wire_defense_kickoff(game: GameMgr) -> None:
+    """Register a defense-kickoff handler that installs the Claude agent
+    on the team's dev container on every DEFENSE entry.
+
+    The kickoff fires once per (team, defense-capable service); the
+    handler bridges from the round loop's async context into
+    `ClaudeAgentManager.install` (sync) via `run_in_executor`.
+    """
+    client = docker.from_env()
+    agent_mgr = ClaudeAgentManager(client=client)
+
+    async def handler(team_id: str, cfg) -> None:
+        team = next((t for t in game.config.topology.teams if t.id == team_id), None)
+        if team is None or not team.dev:
+            log.warning("defense kickoff: team %s has no dev container; skipping", team_id)
+            return
+        try:
+            handle = game._handle_for(team.dev)
+        except Exception:
+            log.exception("defense kickoff: cannot resolve dev handle for %s", team_id)
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, agent_mgr.install, handle, cfg)
+        log.info("defense agent installed on %s", team.dev)
+
+    game.register_defense_kickoff_handler(handler)
 
 
 if __name__ == "__main__":

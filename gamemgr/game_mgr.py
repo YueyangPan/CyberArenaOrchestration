@@ -23,8 +23,9 @@ from orchestrator.service import ContainerHandle, Service
 from agents.prompts import build_attack_prompt, build_defense_prompt
 from challenges.notes import BuiltinNotesSource
 from challenges.registry import build as build_challenge
-from challenges.source import ChallengeSpec, HealthLevel
+from challenges.source import ChallengeSpec, FlagMechanism, HealthLevel
 from models.agent import AgentConfig
+import shlex
 from typing import Awaitable, Callable
 
 from .config import ChallengeConfig, GameConfig
@@ -47,7 +48,17 @@ class GameMgr:
         self.flags = FlagStore()
         # (team_id, service_name) -> Service instance, populated by deploy_challenges
         # so plant_initial_flags can find the right adapter per (team, service).
+        # Only SERVICE_PROTOCOL challenges (notes) populate this map; FILE_AT_PATH
+        # challenges (nautilus-ico) ship the service as part of the image and
+        # plant flags via direct docker-exec writes — they go in _spec_by_owner.
         self._service_by_owner: dict[tuple[str, str], Service] = {}
+        # (team_id, service_name) -> ChallengeSpec, populated by deploy_challenges
+        # for FILE_AT_PATH challenges. plant_flags walks this for direct
+        # flag-file writes; emit_setup_events emits SERVICE_DEPLOYED for them.
+        self._spec_by_owner: dict[tuple[str, str], ChallengeSpec] = {}
+        # Container names that hosted FILE_AT_PATH challenge deploys — kept
+        # so emit_setup_events can emit SERVICE_DEPLOYED uniformly.
+        self._deployed_file_at_path: list[tuple[ChallengeSpec, list[str]]] = []
         self._last_planted_round: int = -1
         # token -> team_id, populated from config; lookup for API auth.
         self._token_to_team: dict[str, str] = {
@@ -82,12 +93,53 @@ class GameMgr:
     # ── lifecycle ───────────────────────────────────────────────────────
 
     def deploy_challenges(self) -> None:
-        """Build every challenge from the registry, install + start on each
-        target container.  Runs synchronously before the round loop starts."""
+        """Install + start every challenge on its target containers.
+        Runs synchronously before the round loop starts.
+
+        Two deploy paths depending on `spec.flag_mechanism`:
+        - SERVICE_PROTOCOL (e.g. notes): legacy Service-based install/start.
+          The Service class ships the binary into the container at deploy
+          time and plant_flag delivers the flag via the service's own
+          protocol (e.g. PUT for notes).
+        - FILE_AT_PATH (e.g. nautilus-ico): the service is already baked
+          into the image; the entrypoint built it and started sshd. We
+          just trigger `spec.metadata.restart_cmd` so the service binary
+          is running with the (initial) source. The flag is written
+          directly as a file by plant_flags.
+        """
 
         team_to_prod = {t.id: t.prod for t in self.config.topology.teams}
 
         for chcfg in self.config.challenges:
+            spec = self._resolve_spec(chcfg.name)
+            mechanism = spec.flag_mechanism if spec is not None else FlagMechanism.SERVICE_PROTOCOL
+
+            if mechanism == FlagMechanism.FILE_AT_PATH:
+                # Image-bundled service. Trigger the framework restart_cmd
+                # (e.g. /arena/restart.sh) so the service binary is running.
+                restart_cmd = (spec.metadata or {}).get("restart_cmd")
+                cnames: list[str] = []
+                for team_id in chcfg.deploy_on:
+                    cname = team_to_prod.get(team_id)
+                    if cname is None:
+                        raise KeyError(f"challenge {chcfg.name!r}: unknown team_id {team_id!r}")
+                    log.info(
+                        "deploying challenge %s -> %s (FILE_AT_PATH, port %d)",
+                        chcfg.name, cname, chcfg.port,
+                    )
+                    if restart_cmd:
+                        rc, out = self._exec_in_container(cname, restart_cmd)
+                        if rc != 0:
+                            log.warning(
+                                "initial restart_cmd failed on %s rc=%d out=%r",
+                                cname, rc, out[-200:] if out else "",
+                            )
+                    self._spec_by_owner[(team_id, chcfg.name)] = spec
+                    cnames.append(cname)
+                self._deployed_file_at_path.append((spec, cnames))
+                continue
+
+            # SERVICE_PROTOCOL path (legacy notes-style adapter).
             service = build_challenge(chcfg.type, port=chcfg.port)
             handles: list[ContainerHandle] = []
             for team_id in chcfg.deploy_on:
@@ -124,16 +176,49 @@ class GameMgr:
         planted: list[tuple[str, str, str]] = []
         team_to_prod = {t.id: t.prod for t in self.config.topology.teams}
 
+        # SERVICE_PROTOCOL plants (notes: PUT over its own TCP socket).
         for (team_id, service_name), service in self._service_by_owner.items():
             cname = team_to_prod[team_id]
             handle = self._handle_for(cname)
             flag = new_flag()
-            log.info("planting flag on %s/%s (round=%d)", team_id, service_name, round_id)
+            log.info("planting flag on %s/%s (round=%d, SERVICE_PROTOCOL)", team_id, service_name, round_id)
             service.plant_flag(handle, flag)
             self.flags.plant(team_id, service_name, flag)
             planted.append((team_id, service_name, flag))
+
+        # FILE_AT_PATH plants (nautilus-ico: docker-exec write to /flag).
+        for (team_id, service_name), spec in self._spec_by_owner.items():
+            cname = team_to_prod[team_id]
+            flag = new_flag()
+            flag_path = (spec.metadata or {}).get("flag_path", "/flag")
+            log.info(
+                "planting flag on %s/%s -> %s (round=%d, FILE_AT_PATH)",
+                team_id, service_name, flag_path, round_id,
+            )
+            self._plant_file_at_path(cname, flag_path, flag)
+            self.flags.plant(team_id, service_name, flag)
+            planted.append((team_id, service_name, flag))
+
         self._last_planted_round = round_id
         return planted
+
+    def _plant_file_at_path(self, container_name: str, flag_path: str, flag: str) -> None:
+        """Write `flag` (no trailing newline) to `flag_path` inside the
+        container as root, mode 644. Raises if the write fails — a missing
+        flag would silently break every CHECKER probe (ico reads /flag on
+        CONNECT) and we want that surfaced loudly at deploy time.
+        """
+        # shlex.quote handles any quote/dollar/backtick in `flag` safely.
+        cmd = (
+            f"sh -c 'printf %s {shlex.quote(flag)} > {shlex.quote(flag_path)} "
+            f"&& chmod 644 {shlex.quote(flag_path)}'"
+        )
+        rc, out = self._exec_in_container(container_name, cmd)
+        if rc != 0:
+            raise RuntimeError(
+                f"FILE_AT_PATH plant failed on {container_name}:{flag_path}: "
+                f"rc={rc}, out={out[-200:]!r}"
+            )
 
     def teardown_challenges(self) -> None:
         for service, handles in self._deployed:
@@ -180,6 +265,14 @@ class GameMgr:
                     new_event(
                         EventType.SERVICE_DEPLOYED,
                         payload={"service": service.name, "container": h.name, "port": service.port},
+                    )
+                )
+        for spec, cnames in self._deployed_file_at_path:
+            for cn in cnames:
+                await self.bus.publish(
+                    new_event(
+                        EventType.SERVICE_DEPLOYED,
+                        payload={"service": spec.name, "container": cn, "port": spec.port},
                     )
                 )
         for (team_id, service_name) in self.flags.planted.keys():

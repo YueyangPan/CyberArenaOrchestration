@@ -32,6 +32,51 @@ def default_sources() -> list["ChallengeSource"]:
     return [BuiltinNotesSource()]
 
 
+def sources_for(cfg) -> list["ChallengeSource"]:
+    """Return every ChallengeSource needed to materialize `cfg.challenges`.
+
+    Always includes the built-in notes source. For challenges whose name
+    is prefixed by an external adapter key (e.g. `nautilus-<chal>`), the
+    matching adapter is instantiated with the right `include=` list.
+
+    Until the two-section `challenge_sources:` yaml schema lands, this is
+    the single point of source discovery — main.py + GameMgr both call
+    here so a new adapter (picoCTF, custom git) only needs one branch.
+    """
+    sources: list["ChallengeSource"] = list(default_sources())
+
+    nautilus_includes = [
+        c.name[len("nautilus-"):]
+        for c in cfg.challenges
+        if c.name.startswith("nautilus-")
+    ]
+    if nautilus_includes:
+        # Lazy import — keep the docker SDK out of notes-only paths.
+        from challenges.nautilus import NautilusSource
+        sources.append(NautilusSource(include=nautilus_includes))
+
+    return sources
+
+
+def build_all_images(cfg) -> list[str]:
+    """Build (or cache-hit) every image needed by `cfg.challenges`.
+
+    Iterates `sources_for(cfg)` and calls `source.build_image(spec)` for
+    each spec whose `name` matches an entry in `cfg.challenges`. Returns
+    the list of resolved image tags.
+
+    Idempotent: each adapter's `build_image` skips when the tag is already
+    present locally. Safe to call from both `setup` and `start` paths.
+    """
+    wanted_names = {c.name for c in cfg.challenges}
+    tags: list[str] = []
+    for src in sources_for(cfg):
+        for spec in src.list_challenges():
+            if spec.name in wanted_names:
+                tags.append(src.build_image(spec))
+    return tags
+
+
 # ── Legacy back-compat shim ───────────────────────────────────────────
 #
 # game_mgr.deploy_challenges still calls `build(chcfg.type, port=...)`.
