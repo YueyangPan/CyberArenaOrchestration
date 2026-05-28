@@ -45,31 +45,26 @@ New module `challenges/source.py` exports:
 
 ---
 
-## Topology
+## Topology — unchanged from M5.6
 
-One container per `(team, challenge)`, named `team{N}_chal_{name}`.
-Replaces M5.6's shared `teamN_prod`.
+**One service container per team**, named `team{N}_prod`. That single
+container hosts whatever challenge the game is configured to run. Game
+runs one challenge at a time across both teams; multi-challenge in a
+single game is out of scope for v1.
 
-**Networks** — rename + split from v1.6's `team{N}_net` + `game_net` so
-lateral movement is greppable on `docker network inspect`:
+Networks inherit M5.6 verbatim:
+- `team{N}_net` (per team, never switched) — dev + prod
+- `game_net` (cross-team, switched per phase — ATTACK attached, DEFENSE detached)
 
-| Network | Members | Switched? | What "traffic here" means |
-|---------|---------|-----------|---------------------------|
-| `team{N}_agent_net` | `team{N}_dev` only | never | Agent control plane |
-| `team{N}_service_net` | `team{N}_dev` + every `team{N}_chal_*` | never | Team-internal; SSH pivot lives here |
-| `public_attack_net` | every `team{N}_chal_*` (all teams) | **yes** (ATTACK = attached) | Only place cross-team attacks happen |
+Implication: when v1 changes the active challenge (e.g. from `notes`
+to `nautilus-ico`), the team's `prod` container image must change too
+(notes runs in `cyberarena/prod-base`; ico needs `cyberarena/chal-nautilus-ico:<sha>`).
+That image switch is the game configuration's responsibility — written
+into `game.yaml`'s `nodes[].image` for the prod containers.
 
-Invariants (enforced by `orchestrator/orchestrator.py`, pinned by `test_dcf_network_isolation.py`):
-
-- Dev container is on agent_net + service_net only — **never** `public_attack_net`.
-- Challenge containers are **never** on any `*_agent_net`.
-- Cross-team reach happens only via `public_attack_net` during ATTACK.
-
-Migration:
-```
-team{N}_net  →  team{N}_agent_net  +  team{N}_service_net   (split)
-game_net     →  public_attack_net                            (rename)
-```
+The split-net / per-(team, challenge) topology that an earlier draft
+proposed is deferred. If a future game needs multiple challenges
+running simultaneously per team, revisit.
 
 ---
 
@@ -116,21 +111,21 @@ Crib from upstream: `service/` dir (via build context), package list, `fpc ... -
 
 DEFENSE phase enters → defense agent spawns (fresh per phase) → agent runs:
 
-1. **Edit** — SSH into own challenge container (M5.6 pivot, over `team{N}_service_net`). Edit `/srv/challenge/<name>/` — own container's writable layer.
+1. **Edit** — SSH into own `team{N}_prod` (M5.6 pivot, over `team{N}_net`). Edit `/srv/challenge/<name>/` — the prod container's own writable layer.
 2. **Restart** — call `mcp__cyberarena__restart_service(service=<name>)`. **Returns `{job_id}` immediately**; orchestrator runs `spec.restart_cmd` via `docker exec` in a background task.
-3. **Wait + smoke** — TCP-probe own challenge every few seconds (loopback over `team{N}_service_net`) until it answers. Bound the wait (~60s).
+3. **Wait + smoke** — TCP-probe own prod's service port every few seconds (loopback inside the team's network) until it answers. Bound the wait (~60s).
 4. **Report** — call `mcp__cyberarena__report_deploy_complete(...)` (M4.5 tool).
 
 ### Critical invariants
 
 **Filesystem isolation** (pinned by `test_dcf_filesystem_isolation.py`):
-- No host bind mount. Period. Each `(team, challenge)` container gets its own copy via entrypoint `cp -r /opt/challenge_src/<name>/ /srv/challenge/<name>/`.
-- A write to `/srv/challenge/<name>/foo` in team1's container is invisible to team2's container AND to `vendor/.../ico/service/foo` on host.
+- No host bind mount. Period. Each `team{N}_prod` container gets its own copy via entrypoint `cp -r /opt/challenge_src/<name>/ /srv/challenge/<name>/`.
+- A write to `/srv/challenge/<name>/foo` in team1's prod is invisible to team2's prod (separate container filesystems) AND invisible to `vendor/.../ico/service/foo` on host (no bind mount).
 
 **Authorization** (pinned by `test_dcf_restart_tool.py` + `test_dcf_user_perms.py`):
-- `restart_service(service)` resolves `team_id` from `X-Team-Token` header (M4.5 flow), then looks up `f"team{N}_chal_{service}"`. Tool argument is the **bare** challenge name — no syntax for "restart team2's container".
+- `restart_service(service)` resolves `team_id` from `X-Team-Token` header (M4.5 flow), then looks up `f"team{N}_prod"`. Tool argument is the **bare** challenge name — no syntax for "restart team2's container".
 - No docker socket in any agent-reachable container (re-confirms M5.6 §10).
-- **Orchestrator is the only entity allowed to attach/detach `public_attack_net`**; agents never receive Docker or network privileges. The agent's only path to "modify network state" is the MCP `restart_service` tool, which the orchestrator executes under its own privilege.
+- **Orchestrator is the only entity allowed to attach/detach `game_net`**; agents never receive Docker or network privileges. The agent's only path to "modify network state" is the MCP `restart_service` tool, which the orchestrator executes under its own privilege.
 - `restart_cmd` + `checker_command` live in `spec.toml` (framework-provided). Never LLM-supplied.
 
 **User + permission model inside the challenge container** (revises M5.6's "root SSH" stance — the M5.6 root-access was for *attack* introspection on own prod; with M7's defense-mode + restart MCP, the agent doesn't need root in-container anymore):
@@ -278,29 +273,29 @@ v1 yaml declares: the built-in `notes` source + nautilus source with `include: [
 | 3 | `challenges/nautilus.py` | `NautilusSource`; reads `spec.toml`; `build_image()` calls `docker build` |
 | 4 | `challenges/nautilus/ico/` | `Dockerfile` (single-stage, fpc + fp-units; creates `arena_agent` non-root user; installs `/arena/restart.sh` + `/arena/checker.sh` both `root:root 555`; `/srv/challenge/ico/` chowned `arena_agent:arena_agent 755`; sshd with `PermitRootLogin no`), `spec.toml` (incl. `[health_check]`), `restart.sh`, `checker.sh` (lifts nautilus poller) |
 | 5 | `challenges/registry.py` | Replace hardcoded dict with `ChallengeSource`-list discovery |
-| 6 | `orchestrator/orchestrator.py` | Per-(team, challenge) container; create three networks; attach/detach `public_attack_net` per phase; dev dual-homed on agent_net + service_net |
+| 6 | `orchestrator/orchestrator.py` | No topology change. (Earlier draft proposed per-(team, challenge) containers + 3-net split; v1 keeps M5.6 topology — one `team{N}_prod` per team, `team{N}_net` + `game_net`.) |
 | 7 | `gamemgr/config.py` | Parse `challenge_sources:` + new `challenges:` shape |
 | 8 | `scripts/sync_nautilus.sh` | `git clone` + `git checkout <pinned-sha>` |
 | 9 | `gamemgr/events.py` | Add `SERVICE_RESTART_STARTED` / `COMPLETED` / `FAILED` + `SERVICE_HEALTH_CHECK` |
 | 10 | `gamemgr/game_mgr.py` | `restart_service(team_id, service) → job_id`: emit STARTED, spawn `asyncio.create_task` (run via `docker exec`, emit COMPLETED/FAILED with `duration_ms`); after COMPLETED, run all 4 health levels (emit one `SERVICE_HEALTH_CHECK` each); reject if (team, service) already in-flight. Track in `_restart_jobs`. Plus defense-phase subscriber |
 | 11 | `gamemgr/mcp_server.py` | `restart_service(service)` MCP tool (4th on M4.5 server). Returns `{job_id}` synchronously; long work runs in GameMgr background |
-| 12 | `gamemgr/artifacts.py` | `ArtifactKind` + `ArtifactStore.path_for(...)`. Wire end-of-phase + end-of-round hooks in `GameMgr`: agent stdout → `API_LOG`, stderr+exit_code → `AGENT_LOG`, `docker logs <team{N}_chal_<chal>>` → `SERVICE_LOG` |
+| 12 | `gamemgr/artifacts.py` | `ArtifactKind` + `ArtifactStore.path_for(...)`. Wire end-of-phase + end-of-round hooks in `GameMgr`: agent stdout → `API_LOG`, stderr+exit_code → `AGENT_LOG`, `docker logs <team{N}_prod>` → `SERVICE_LOG` |
 | 13 | `agents/prompts.py` | `build_defense_prompt(cfg, spec)` — edit / restart / report |
-| 14 | `agents/claude.py` | `_provision_ssh_pivot` writes pubkey to `/home/arena_agent/.ssh/authorized_keys` (not `/root/.ssh/`) when target is a challenge container; dev-side `ssh_config` sets `User arena_agent` for `team{N}_chal_*` hosts. Source view is baked into the image; no source-mount work here |
+| 14 | `agents/claude.py` | `_provision_ssh_pivot` writes pubkey to `/home/arena_agent/.ssh/authorized_keys` (not `/root/.ssh/`) when target is a challenge-bearing prod (`spec.metadata.health_check` is set); dev-side `ssh_config` sets `User arena_agent` for `team{N}_prod`. Source view is baked into the image; no source-mount work here |
 | 15 | `config/docker/Dockerfile.prod` | Stays as fallback for sources without their own image (notes) |
 | 16 | `config/game.yaml` | Two-section split: `challenge_sources:` + `challenges:` |
 | 17 | `tests/test_dcf_source_contract.py` | Parametrized over `notes` + `nautilus-ico` |
 | 18 | `tests/test_dcf_nautilus_ico.py` | Build image, plant flag, port 4265 alive, TCP probe round-trips |
 | 19 | `tests/test_dcf_restart_tool.py` | (a) async return shape `{job_id}`; (b) STARTED → COMPLETED ordering + matching `job_id`; (c) failure → FAILED with `error`; (d) concurrent restart rejected; (e) auth pinning (bad token, unknown service, cross-team unreachable) |
 | 20 | `tests/test_dcf_filesystem_isolation.py` | Write to `/srv/challenge/ico/foo` in team1 invisible to team2 + invisible on host vendor dir |
-| 21 | `tests/test_dcf_network_isolation.py` | (a) dev reaches own chals on service_net; (b) dev cannot reach `public_attack_net`; (c) chals cannot reach any `*_agent_net`; (d) DEFENSE detaches `public_attack_net` |
+| 21 | `tests/test_dcf_network_isolation.py` | M5.6 invariants still hold under the new image: (a) dev reaches own prod via `team{N}_net`; (b) dev cannot reach opposing prod (no interface on `game_net`); (c) DEFENSE detaches prod from `game_net` (existing M3 behavior unchanged) |
 | 22 | `tests/test_dcf_artifact_store.py` | `path_for` returns stable paths; parents lazy-created; rejects `..` in filename; all `ArtifactKind` values distinct; mock `ClaudeAgentManager.fetch_logs()` → assert stdout lands under `api-logs/` and stderr under `agent-logs/` (split is verifiable, not just intent) |
 | 23 | `tests/test_dcf_user_perms.py` | SSH in as `arena_agent` to a live `team1_chal_ico` container: (a) `id` returns non-zero UID; (b) `cat /arena/restart.sh` succeeds; (c) `echo x >> /arena/restart.sh` **fails** with permission denied; (d) write to `/srv/challenge/ico/foo` succeeds; (e) sshd rejects a `root@host` key (per `PermitRootLogin no`) |
 | 24 | `tests/test_dcf_health_levels.py` | (a) known-good ico → all 4 levels pass + emit events; (b) **cheese-path**: ico binary replaced with `socat -` → PROCESS+TCP pass but PROTOCOL+CHECKER fail |
 | 25 | `tests/test_dcf_round_loop_defense_phase.py` | Phase entry → defense kickoff fires; mocked agent records `DEPLOY_COMPLETE` |
 | 26 | `tests/test_dcf_defense_workflow.py` (live, env-gated) | Real Claude agent runs defense recipe on ico end-to-end |
 | 27 | `docs/DEFCON_challenge_framework_plan_v1.md` + `..._report_v1.md` | docs |
-| 28 | `docs/design_v1.7.md` (new, supersedes v1.6 the way v1.6 superseded v1) | Written **after** implementation lands, capturing the actual post-M7 state: per-(team, challenge) topology, 3-network split with the new names, `ChallengeSource` + `ChallengeSpec` + `HealthLevel`, defense-phase flow, MCP `restart_service` tool + restart event chain, `arena_agent` non-root SSH user, artifact persistence layout (api-logs split from agent-logs). v1.6 stays in `docs/` as the prior baseline, untouched |
+| 28 | `docs/design_v1.7.md` (new, supersedes v1.6 the way v1.6 superseded v1) | Written **after** implementation lands, capturing the actual post-DEFCON state: `ChallengeSource` + `ChallengeSpec` + `HealthLevel` framework, ico challenge running on the unchanged M5.6 topology (one `team{N}_prod` per team), defense-phase flow, MCP `restart_service` tool + restart event chain, `arena_agent` non-root SSH user, artifact persistence layout (api-logs split from agent-logs). v1.6 stays in `docs/` as the prior baseline, untouched |
 
 ---
 
@@ -320,7 +315,7 @@ Pass criteria (each maps to a test):
 - **Auth invariant** — no token-path lets a team restart another team's container.
 - **Async invariant** — `restart_service` returns `{job_id}` within MCP request budget; STARTED → COMPLETED|FAILED with matching `job_id`.
 - **Filesystem isolation** — cross-team and host-vendor writes invisible.
-- **Network isolation** — dev never on `public_attack_net`; chals never on any `*_agent_net`; cross-team only via `public_attack_net` during ATTACK. Orchestrator is the only entity attaching/detaching it.
+- **Network isolation** — M3 invariants unchanged: dev never on `game_net`; cross-team reach only during ATTACK on `game_net`. Orchestrator is the only entity attaching/detaching.
 - **In-container user perms** — agent SSHes in as non-root `arena_agent`; `/arena/*` framework scripts are `root:root 555` so the agent can read/exec but not modify; `/srv/challenge/<name>/` is agent-writable.
 - **Cheese-path detection** — hollow patches (socat-stub) visibly fail PROTOCOL + CHECKER on the bus.
 - Defense kickoff fires on DEFENSE entry; full restart + health chain lands on the bus.
