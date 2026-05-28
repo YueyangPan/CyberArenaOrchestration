@@ -31,29 +31,35 @@ teams:
       base_url: ${ANTHROPIC_BASE_URL_TEAM2}
 
 nodes:
+  # Per-team attack networks let each dev container reach the OPPOSING
+  # team's prod directly (no SSH pivot through own_prod). Devs are
+  # intentionally NOT on the same network as each other — team1_dev's
+  # only cross-team reach is attack_net_team1 (which only contains
+  # team2_prod), and vice versa. NetworkManager toggles all `game_net`
+  # + `attack_net_*` nets in lockstep with each phase.
   - id: team1_dev
     image: cyberarena/dev-base
-    networks: [team1_net]
+    networks: [team1_net, attack_net_team1]
     install_list: []
     extra_hosts:
       host.docker.internal: host-gateway
 
   - id: team1_prod
     image: cyberarena/chal-nautilus-ico:366520c0cc43
-    networks: [team1_net, game_net]
+    networks: [team1_net, game_net, attack_net_team2]
     ports: ["127.0.0.1:8001:4265"]
     install_list: []
 
   - id: team2_dev
     image: cyberarena/dev-base
-    networks: [team2_net]
+    networks: [team2_net, attack_net_team2]
     install_list: []
     extra_hosts:
       host.docker.internal: host-gateway
 
   - id: team2_prod
     image: cyberarena/chal-nautilus-ico:366520c0cc43
-    networks: [team2_net, game_net]
+    networks: [team2_net, game_net, attack_net_team1]
     ports: ["127.0.0.1:8002:4265"]
     install_list: []
 
@@ -64,6 +70,12 @@ networks:
     subnet: 10.2.0.0/24
   game_net:
     subnet: 10.0.0.0/24
+  # team1_dev + team2_prod  (team1 attacks team2)
+  attack_net_team1:
+    subnet: 10.11.0.0/24
+  # team2_dev + team1_prod  (team2 attacks team1)
+  attack_net_team2:
+    subnet: 10.12.0.0/24
 
 challenges:
   - name: nautilus-ico
