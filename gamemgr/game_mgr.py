@@ -9,6 +9,7 @@ Lifecycle:
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from orchestrator.orchestrator import Orchestrator
@@ -45,6 +46,15 @@ class GameMgr:
         self._token_to_team: dict[str, str] = {
             t.token: t.id for t in config.topology.teams if t.token
         }
+        # M4.5: agent self-reports via MCP. Overwrite-per-(team, service);
+        # only the latest deploy report survives. Adaptive defense duration
+        # (future) will read duration_ms; nothing in this milestone reads it.
+        self.deploy_reports: dict[str, dict[str, dict]] = {}
+        # M4.5: service-name whitelist built from yaml `challenges:`. Plugin
+        # model intact — we never compare against a hardcoded literal.
+        self._known_services: frozenset[str] = frozenset(
+            c.name for c in config.challenges
+        )
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
@@ -227,6 +237,79 @@ class GameMgr:
         )
         return result
 
+    # ── M4.5: lifecycle / report emitters ───────────────────────────────
+
+    def is_known_service(self, name: str) -> bool:
+        """White-list check for agent-self-reported service names.
+
+        Source of truth is `game.yaml.challenges:` (loaded into
+        `config.challenges`). Anything else gets rejected before it reaches
+        deploy_reports — adaptive-duration aggregation downstream depends
+        on this being clean.
+        """
+        return name in self._known_services
+
+    async def record_agent_installed(self, team_id: str) -> None:
+        """Host emit: install preparation finished (files / env / mcp.json /
+        ssh ready), supervisor NOT yet launched."""
+        await self.bus.publish(
+            new_event(
+                EventType.AGENT_INSTALLED,
+                team_id=team_id,
+                payload={"team_id": team_id, "ts": time.time()},
+            )
+        )
+
+    async def record_agent_launched(self, team_id: str, wrapper_pid: int) -> None:
+        """Host emit: supervisor process running, wrapper pid captured."""
+        await self.bus.publish(
+            new_event(
+                EventType.AGENT_LAUNCHED,
+                team_id=team_id,
+                payload={"team_id": team_id, "wrapper_pid": wrapper_pid, "ts": time.time()},
+            )
+        )
+
+    async def record_agent_ready(self, team_id: str) -> None:
+        """MCP-driven emit: LLM successfully called `report_ready`. Confirms
+        the MCP channel works end-to-end. Best-effort — never load-bearing."""
+        await self.bus.publish(
+            new_event(
+                EventType.AGENT_READY,
+                team_id=team_id,
+                payload={"team_id": team_id, "ts": time.time()},
+            )
+        )
+
+    async def record_deploy_complete(
+        self, team_id: str, service: str, duration_ms: int | None
+    ) -> None:
+        """MCP-driven emit: agent finished its defense deploy. Overwrite-per-
+        (team, service) in deploy_reports; emit `DEPLOY_COMPLETE` event.
+
+        Caller must have already validated `service` via `is_known_service()`.
+        """
+        completed_at = time.time()
+        self.deploy_reports.setdefault(team_id, {})[service] = {
+            "duration_ms": duration_ms,
+            "completed_at": completed_at,
+        }
+        st = self.status()
+        await self.bus.publish(
+            new_event(
+                EventType.DEPLOY_COMPLETE,
+                team_id=team_id,
+                round_id=st.get("round", 0),
+                phase=st.get("phase", ""),
+                payload={
+                    "team_id": team_id,
+                    "service": service,
+                    "duration_ms": duration_ms,
+                    "completed_at": completed_at,
+                },
+            )
+        )
+
     # ── agent provisioning (M5.6) ───────────────────────────────────────
 
     def agent_config_for(
@@ -250,6 +333,10 @@ class GameMgr:
         own_team = teams_by_id[team_id]
         opposing = tuple(t.prod for tid, t in teams_by_id.items() if tid != team_id)
 
+        # Import locally to avoid a top-of-module circular: mcp_server
+        # imports GameMgr (via TYPE_CHECKING) for the type annotation.
+        from .mcp_server import canonical_endpoint_url
+
         cfg = replace(
             base,
             team_id=team_id,
@@ -258,6 +345,7 @@ class GameMgr:
             own_prod_container_name=own_team.prod,
             opposing_prod_hosts=opposing,
             submit_url=f"{submit_base_url.rstrip('/')}/game/flag/submit",
+            mcp_endpoint=canonical_endpoint_url(submit_base_url),
         )
         # Attack prompt is derived from the now-populated fields.
         return replace(cfg, system_prompt=build_attack_prompt(cfg))

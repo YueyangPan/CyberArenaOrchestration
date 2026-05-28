@@ -40,6 +40,12 @@ class AgentConfig:
     # Where the agent POSTs flag submissions (typically resolves via
     # host.docker.internal which is wired in by Node.extra_hosts).
     submit_url: str = ""
+    # M4.5: MCP endpoint URL. Empty → no MCP, agent stays on the curl/REST
+    # fallback path (lets non-MCP tests keep working unchanged). Non-empty
+    # → ClaudeAgentManager.install writes mcp.json and adds --mcp-config.
+    # Composed from `MCP_PUBLIC_ENDPOINT` constant in gamemgr.mcp_server —
+    # never hand-write "/mcp" / "/mcp/" literals elsewhere.
+    mcp_endpoint: str = ""
     # Arbitrary extra env vars exported into agent.env. Useful escape hatch
     # for future adapters that need provider-specific or runtime knobs without
     # growing this dataclass further.

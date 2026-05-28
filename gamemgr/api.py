@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import asdict
 from pathlib import Path
@@ -13,6 +14,7 @@ from fastapi.responses import FileResponse
 
 from .events import Event
 from .game_mgr import GameMgr
+from .mcp_server import MCP_MOUNT_PATH, MCP_PUBLIC_ENDPOINT, build_mcp_app
 
 PANEL_HTML_PATH = Path(__file__).parent.parent / "panel" / "panel.html"
 
@@ -20,7 +22,23 @@ log = logging.getLogger(__name__)
 
 
 def build_app(game: GameMgr, shutdown_event: asyncio.Event) -> FastAPI:
-    app = FastAPI(title="cyber-arena")
+    # MCP server must be built before the FastAPI lifespan closure because
+    # the lifespan needs a reference to the FastMCP instance to run its
+    # session manager (otherwise tools error out with "Task group is not
+    # initialized" on the first request).
+    mcp_server, mcp_asgi = build_mcp_app(game)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        log.info(
+            "cyberarena MCP endpoint: http://<host>:<port>%s",
+            MCP_PUBLIC_ENDPOINT,
+        )
+        async with mcp_server.session_manager.run():
+            yield
+
+    app = FastAPI(title="cyber-arena", lifespan=lifespan)
+    app.mount(MCP_MOUNT_PATH, mcp_asgi)
 
     @app.get("/panel")
     async def panel_page():

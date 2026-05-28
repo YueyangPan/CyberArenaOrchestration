@@ -5,3 +5,6 @@ pytest>=8.0
 fastapi>=0.110
 uvicorn[standard]>=0.27
 httpx>=0.27
+# MCP SDK is pinned (not >=) because sub-app routing and FastMCP API still
+# shift between minors; upgrade behind a parity-test gate (M4.5 plan §1).
+mcp==1.27.1

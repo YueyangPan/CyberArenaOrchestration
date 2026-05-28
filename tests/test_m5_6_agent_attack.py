@@ -93,7 +93,23 @@ def test_live_agent_attacks_and_submits():
         agent_cfg = game.agent_config_for("team2")
         dev_handle = _handle(client, "team2_dev")
         mgr = ClaudeAgentManager(client=client)
-        mgr.install(dev_handle, agent_cfg)
+
+        # M4.5: bridge sync install() callbacks → async GameMgr.record_*.
+        # No WS subscribers active in this test, so a per-call asyncio.run
+        # is safe; in main.py this gets replaced by run_coroutine_threadsafe
+        # against the uvicorn loop.
+        def _on_installed(team_id):
+            asyncio.run(game.record_agent_installed(team_id))
+
+        def _on_launched(team_id, wrapper_pid):
+            asyncio.run(game.record_agent_launched(team_id, wrapper_pid))
+
+        mgr.install(
+            dev_handle,
+            agent_cfg,
+            on_installed=_on_installed,
+            on_launched=_on_launched,
+        )
 
         # Poll for a successful submission. The agent is autonomous — once
         # install() returned the supervisor-bash kicked claude off, and the
@@ -148,6 +164,23 @@ def test_live_agent_attacks_and_submits():
             and e.payload.get("service") == "notes"
         ]
         assert winning, f"no event matched team2-stole-team1-notes shape: {all_flag_events}"
+
+        # M4.5: lifecycle chain — both host-emitted events must appear in
+        # order for the attacking team (deterministic; AGENT_READY is LLM-
+        # dependent and intentionally not asserted).
+        lifecycle = [
+            e for e in game.bus.history()
+            if e.type in ("AGENT_INSTALLED", "AGENT_LAUNCHED")
+            and e.team_id == "team2"
+        ]
+        installed = [e for e in lifecycle if e.type == "AGENT_INSTALLED"]
+        launched = [e for e in lifecycle if e.type == "AGENT_LAUNCHED"]
+        assert installed, f"AGENT_INSTALLED missing for team2: {lifecycle}"
+        assert launched, f"AGENT_LAUNCHED missing for team2: {lifecycle}"
+        assert installed[0].ts <= launched[0].ts, (
+            f"INSTALLED ts must be ≤ LAUNCHED ts; "
+            f"got {installed[0].ts} vs {launched[0].ts}"
+        )
     finally:
         try:
             server.should_exit = True

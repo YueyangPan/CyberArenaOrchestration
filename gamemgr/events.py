@@ -20,9 +20,17 @@ class EventType(str, Enum):
     PHASE_CHANGE = "PHASE_CHANGE"
     ROUND_STOP = "ROUND_STOP"
     SERVICE_DEPLOYED = "SERVICE_DEPLOYED"
+    # M4.5 lifecycle chain: host-emitted INSTALLED (prep done, not launched)
+    # → host-emitted LAUNCHED (supervisor pid captured) → MCP-emitted READY
+    # (LLM proved the channel works). Only the first two are load-bearing.
     AGENT_INSTALLED = "AGENT_INSTALLED"
+    AGENT_LAUNCHED = "AGENT_LAUNCHED"
+    AGENT_READY = "AGENT_READY"
     FLAG_PLANTED = "FLAG_PLANTED"
     FLAG_SUBMITTED = "FLAG_SUBMITTED"
+    # Agent-self-reported deploy completion (M4.5; agent → MCP).
+    # Distinct from SERVICE_DEPLOYED which is the host-side initial install.
+    DEPLOY_COMPLETE = "DEPLOY_COMPLETE"
 
 
 @dataclass(frozen=True)

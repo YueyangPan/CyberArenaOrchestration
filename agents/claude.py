@@ -19,12 +19,14 @@ any other cli (e.g. "sleep 60" used by tests) is launched as-is.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shlex
 import subprocess
 import tempfile
 import time
+from typing import Callable
 
 import docker
 
@@ -41,11 +43,20 @@ RUN_DIR = "/var/run/cyberarena"
 
 PROMPT_PATH = f"{STATE_DIR}/prompt.txt"
 ENV_PATH = f"{STATE_DIR}/agent.env"
+MCP_CONFIG_PATH = f"{STATE_DIR}/mcp.json"
 PID_PATH = f"{RUN_DIR}/agent.pid"
 WRAPPER_PID_PATH = f"{RUN_DIR}/agent.wrapper.pid"
 EXIT_CODE_PATH = f"{RUN_DIR}/agent.exit_code"
 STDOUT_PATH = f"{LOG_DIR}/agent.stdout"
 STDERR_PATH = f"{LOG_DIR}/agent.stderr"
+
+# M4.5 callback shapes: optional, may be None for non-MCP tests (M4
+# hello-world etc. that don't run with a GameMgr). Sync — the install()
+# itself is sync and called from non-async contexts; if the caller needs
+# to dispatch into async code (e.g. EventBus.publish on a uvicorn loop),
+# it wraps with asyncio.run_coroutine_threadsafe.
+OnInstalled = Callable[[str], None]
+OnLaunched = Callable[[str, int], None]
 
 DEFAULT_PROMPT = "You are an A/D CTF agent. Wait for instructions."
 
@@ -56,7 +67,25 @@ class ClaudeAgentManager(AgentManager):
 
     # ── public API ──────────────────────────────────────────────────────
 
-    def install(self, container: ContainerHandle, cfg: AgentConfig) -> None:
+    def install(
+        self,
+        container: ContainerHandle,
+        cfg: AgentConfig,
+        *,
+        on_installed: OnInstalled | None = None,
+        on_launched: OnLaunched | None = None,
+    ) -> None:
+        """Install + launch the supervisor.
+
+        M4.5 split: the callable runs in two phases with optional callbacks
+        at the boundary — `on_installed` fires after the prep stage (files /
+        env / ssh / mcp.json / npm install all done) and *before* the
+        supervisor starts; `on_launched` fires after `_wait_for_pid`
+        confirms the supervisor pid was captured. Both callbacks are
+        sync — wrap with `asyncio.run_coroutine_threadsafe` if you need
+        to dispatch into async (e.g. an EventBus on the uvicorn loop).
+        """
+        # ── prep stage ─────────────────────────────────────────────────
         self._exec(container, ["mkdir", "-p", STATE_DIR, LOG_DIR, RUN_DIR], check=True)
 
         # Re-install must replace any running supervisor, not race with it.
@@ -90,9 +119,44 @@ class ClaudeAgentManager(AgentManager):
         self._write_file(container, PROMPT_PATH, prompt.rstrip() + "\n")
         self._write_file(container, ENV_PATH, self._build_env_file(cfg))
 
+        # M4.5 MCP config (only when mcp_endpoint is populated; empty keeps
+        # the non-MCP path intact for older tests).
+        if cfg.mcp_endpoint:
+            self._write_mcp_config(container, cfg)
+
+        # Prep done. Fire on_installed BEFORE launch so it stays diagnostic
+        # of "files ready, about to launch" — if _launch then crashes, the
+        # absence of AGENT_LAUNCHED tells the operator exactly where to look.
+        if on_installed is not None and cfg.team_id:
+            on_installed(cfg.team_id)
+
+        # ── launch stage ──────────────────────────────────────────────
         self._launch(container, cfg)
         self._wait_for_pid(container, timeout_s=5.0)
         log.info("agent installed on %s (cli=%r)", container.name, cfg.cli)
+
+        if on_launched is not None and cfg.team_id:
+            wrapper_pid = self._read_int(container, WRAPPER_PID_PATH) or 0
+            on_launched(cfg.team_id, wrapper_pid)
+
+    def _write_mcp_config(self, container: ContainerHandle, cfg: AgentConfig) -> None:
+        """Drop mcp.json with the team token in headers, chmod 600.
+
+        token-in-headers, never as a tool argument — keeps the LLM from
+        ever seeing the string (defends against accidental complete /
+        echo in stream-json transcripts).
+        """
+        payload = {
+            "mcpServers": {
+                "cyberarena": {
+                    "type": "http",
+                    "url": cfg.mcp_endpoint,
+                    "headers": {"X-Team-Token": cfg.team_token},
+                }
+            }
+        }
+        self._write_file(container, MCP_CONFIG_PATH, json.dumps(payload, indent=2) + "\n")
+        self._exec(container, ["chmod", "600", MCP_CONFIG_PATH], check=True)
 
     def _build_env_file(self, cfg: AgentConfig) -> str:
         """Render the agent.env file. Anthropic + IS_SANDBOX always present;
@@ -235,12 +299,18 @@ class ClaudeAgentManager(AgentManager):
         # The supervisor bash runs inside `setsid` so it becomes a new session
         # AND process-group leader. We capture $BASHPID (the leader's pid) and
         # use it as the killpg target later.
+        cli = cfg.cli
+        # M4.5: add --mcp-config only when MCP is enabled for this agent.
+        # Goes on the cli command line, not as an env var, because Claude
+        # Code expects this as a flag.
+        if cfg.mcp_endpoint and cfg.cli.startswith("claude"):
+            cli = f"{cfg.cli} --mcp-config {MCP_CONFIG_PATH}"
         script = f"""
 set -e
 nohup setsid bash -c '
   echo $BASHPID > {WRAPPER_PID_PATH}
   set -a; . {ENV_PATH}; set +a
-  {cfg.cli} < {PROMPT_PATH} > {STDOUT_PATH} 2> {STDERR_PATH} &
+  {cli} < {PROMPT_PATH} > {STDOUT_PATH} 2> {STDERR_PATH} &
   CHILD_PID=$!
   echo $CHILD_PID > {PID_PATH}
   wait $CHILD_PID

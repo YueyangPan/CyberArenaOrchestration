@@ -13,7 +13,7 @@
 > | Agent (LLM) | ✅ shipped | Claude Code CLI in dev container, SSH pivot to own prod |
 > | Observation Panel | ✅ shipped | single-file HTML served from FastAPI |
 > | TeamMgr (v1) | ❌ removed | folded into GameMgr + agents/; no separate module |
-> | Reverse channel (heartbeat, deploy_complete) | ⬜ deferred | M4.5 |
+> | Reverse channel — MCP agent action channel (`submit_flag` / `report_ready` / `report_deploy_complete`) + host-emit `AGENT_INSTALLED` / `AGENT_LAUNCHED` | ✅ shipped (M4.5) | replaces v1's WS reverse channel; agent-side WS removed |
 > | Poller / Healthcheck | ⬜ deferred | no interface yet |
 > | Scoreboard | ⬜ deferred | `FlagStore.submissions` is the time series source |
 >
@@ -302,8 +302,11 @@ Event types currently emitted:
 | `ROUND_STOP` | RoundLoop | end of each round |
 | `SERVICE_DEPLOYED` | GameMgr | once per (service × prod) at `emit_setup_events()` |
 | `FLAG_PLANTED` | GameMgr | once per (team, service) at round_id=0 and every DEFENSE entry |
-| `FLAG_SUBMITTED` | GameMgr.submit_flag | every accepted/rejected submission with a *valid token* (BAD_TOKEN is silent) |
-| `AGENT_INSTALLED` | demo only ([scripts/m6_screenshot_demo.py](../scripts/m6_screenshot_demo.py)) | declared in enum but not emitted from agents/ yet — M4.5 will wire this |
+| `FLAG_SUBMITTED` | GameMgr.submit_flag | every accepted/rejected submission with a *valid token* (BAD_TOKEN is silent on both REST and MCP) |
+| `AGENT_INSTALLED` | host — `ClaudeAgentManager.install` prep stage end (M4.5) | install files / env / mcp.json / ssh provisioned, **before** launch |
+| `AGENT_LAUNCHED` | host — after `_wait_for_pid` (M4.5) | supervisor process running, wrapper pid captured |
+| `AGENT_READY` | MCP `report_ready` tool (M4.5) | LLM proved the MCP channel works; best-effort — never load-bearing |
+| `DEPLOY_COMPLETE` | MCP `report_deploy_complete` tool (M4.5) | agent self-reports defense deploy finished; pre-validated against `is_known_service` |
 
 Sinks attached during `start()`:
 
@@ -666,17 +669,34 @@ cyber-arena-orch-v2/
 | M5.5 | Per-round rotation + per-team token auth | [m5_5_rotation_*](m5_5_rotation_plan.md) | ✅ done |
 | M5.6 | Agent-driven attack via SSH pivot | [m5_6_agent_attack_*](m5_6_agent_attack_plan.md) | ✅ done |
 | M6 | Observation panel | [m6_panel_*](m6_panel_plan.md) | ✅ done |
+| M4.5 | MCP agent channel (replaces deferred WS reverse channel) | [m4_5_mcp_*](m4_5_mcp_plan.md) | ✅ done |
 
 ### Deferred
 
 | Item | Owning milestone |
 |------|------------------|
-| `AGENT_INSTALLED` emitted by `ClaudeAgentManager` (not just demos) | M4.5 (reverse channel) |
-| Heartbeat / agent connected-dot on panel | M4.5 |
-| `deploy_complete` reverse channel + adaptive defense duration | M4.5 |
-| `arena-deploy` in-container CLI for the defense workflow | M4.5 |
+| Adaptive defense duration (consumes `deploy_reports` from M4.5) | Adaptive duration milestone |
+| `AGENT_CONNECTED` / `AGENT_DISCONNECTED` (MCP session lifecycle) | future panel-liveness milestone |
+| `arena-deploy` in-container CLI for the defense workflow | Defense workflow milestone |
 | Poller / Healthcheck / `SERVICE_UP` / `SERVICE_DOWN` | Poller milestone |
 | Scoreboard (`/game/scoreboard`, `SCORE_UPDATE`, panel table) | Scoreboard milestone |
 | Multi-flavor agent support (codex / gpt) | trivial extension to `agents/registry.py` |
 | iptables-based network switching (no reconnect blip) | future, behind existing interface |
 | Multi-team (N>2) | requires only config changes; no design change anticipated |
+
+---
+
+## 14. MCP agent channel (M4.5)
+
+Agent ↔ host reverse path is an **MCP server** mounted on FastAPI at
+`/mcp/`, not WebSocket. Agent-side WS removed entirely. Three tools:
+`submit_flag` (shares handler with REST `/game/flag/submit`),
+`report_ready`, `report_deploy_complete`. Auth via `X-Team-Token`
+header preset in mcp.json; bad token returns generic `Unauthorized`.
+
+Agent lifecycle is a three-event chain — `AGENT_INSTALLED` and
+`AGENT_LAUNCHED` are host-emitted around `_launch` (deterministic;
+mid-install failures are observable), `AGENT_READY` is LLM-emitted via
+the MCP tool (best-effort).
+
+Full design: [m4_5_mcp_plan.md](m4_5_mcp_plan.md).
