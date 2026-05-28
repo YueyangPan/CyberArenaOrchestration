@@ -72,9 +72,14 @@ challenges:
     deploy_on: [team1, team2]
 
 round_config:
-  # Defense + attack tuned a little longer than notes — ico's fpc rebuild
-  # is ~1s and a real defense edit + agent turn takes more than the 10s
-  # used for notes.
-  defense_secs: 90
-  attack_secs: 60
+  # Tuned for ico's full LLM-driven loop:
+  # DEFENSE = parallel install (~15s on cold first round, ~3s warm) +
+  #   SSH edit (10-30s of agent thinking) + restart_service (1-2s fpc) +
+  #   smoke probe + report_deploy_complete. 90s was tight in practice;
+  #   180s lets the agent take its time and still leaves headroom.
+  # ATTACK  = install + protocol walk + PNG render + tEXt extraction +
+  #   submit. The binary protocol is non-trivial — 120s gives the agent
+  #   room to iterate if the first attempt EOFs.
+  defense_secs: 180
+  attack_secs: 120
   total_rounds: 3
