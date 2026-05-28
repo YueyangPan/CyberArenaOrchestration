@@ -105,15 +105,26 @@ class GameMgr:
         self._fetch_agent_logs_handler: (
             Callable[[ContainerHandle], AgentLogs] | None
         ) = None
+        # Defense-phase early-end tracking. On every DEFENSE_KICKOFF we add
+        # (team_id, service) to the set for that round; DEPLOY_COMPLETE
+        # drains it; when the set is empty the round loop is signalled to
+        # cut DEFENSE short without waiting for the timer.
+        self._defense_pending: dict[int, set[tuple[str, str]]] = {}
         # Subscribe at construction time (not start()): the subscribers
         # have no file-sink dependency and tests routinely drive
         # PHASE_CHANGE events directly onto the bus without the round loop.
-        # ORDER MATTERS: _on_persist_artifacts must run before the kickoff
-        # subscribers so a defense agent's stdout is fetched off the dev
-        # container before the attack-phase kickoff overwrites it.
+        # ORDER MATTERS:
+        #   _on_persist_artifacts        — snapshot defense agent logs first
+        #   _on_defense_end_health_check — final per-team health probe
+        #   _on_defense_kickoff          — only fires on DEFENSE
+        #   _on_attack_kickoff           — only fires on ATTACK
+        #   _on_deploy_complete          — drains _defense_pending, may
+        #                                  signal RoundLoop early-end
         self.bus.subscribe(self._on_persist_artifacts)
+        self.bus.subscribe(self._on_defense_end_health_check)
         self.bus.subscribe(self._on_defense_kickoff)
         self.bus.subscribe(self._on_attack_kickoff)
+        self.bus.subscribe(self._on_deploy_complete)
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
@@ -396,6 +407,12 @@ class GameMgr:
                         payload={"service": chcfg.name},
                     )
                 )
+                # Track expected DEPLOY_COMPLETE. _on_deploy_complete drains
+                # this; when empty for the current round we cut the
+                # DEFENSE timer short.
+                self._defense_pending.setdefault(event.round_id, set()).add(
+                    (team_id, chcfg.name)
+                )
 
                 if self._defense_kickoff_handler is None:
                     continue
@@ -598,6 +615,75 @@ class GameMgr:
                     "artifact: write SERVICE_LOG failed for %s round=%d",
                     team.id, round_id,
                 )
+
+    # ── DEFCON: defense-phase early-end + end-of-defense health check ───
+
+    async def _on_deploy_complete(self, event) -> None:
+        """When an agent self-reports DEPLOY_COMPLETE for the current round,
+        drain `_defense_pending`. If every defense-capable (team, service)
+        is done, tell the round loop to cut the DEFENSE timer short.
+
+        Note: DEPLOY_COMPLETE arrives via MCP from the agent (see
+        gamemgr/mcp_server.py:report_deploy_complete). The host doesn't
+        cross-check that the agent actually succeeded — it trusts the
+        report. The end-of-defense health check in `_on_defense_end_health_check`
+        is the host's independent verification.
+        """
+        if event.type != EventType.DEPLOY_COMPLETE.value:
+            return
+        team_id = event.team_id
+        service = (event.payload or {}).get("service")
+        if team_id is None or service is None:
+            return
+        pending = self._defense_pending.get(event.round_id)
+        if pending is None:
+            return  # no defense kickoff was recorded for this round
+        pending.discard((team_id, service))
+        if not pending and self.round_loop is not None:
+            log.info(
+                "all defense-capable teams reported DEPLOY_COMPLETE for round %d; "
+                "ending DEFENSE phase early",
+                event.round_id,
+            )
+            self.round_loop.end_phase_early()
+
+    async def _on_defense_end_health_check(self, event) -> None:
+        """At the DEFENSE→ATTACK transition, run a final 4-level health
+        chain for every (team, defense-capable service) — independent of
+        whether the team called restart_service this round.
+
+        Two reasons to do this:
+        1. A team that skipped restart_service entirely still gets a
+           CHECKER probe — catches "defense by inaction" attempts.
+        2. The DEPLOY_COMPLETE-driven early-end above trusts the agent's
+           report. The independent health check is the verification:
+           passed=true at level=checker confirms the patch holds; failed
+           tells the operator the agent's claim was hollow.
+        """
+        if event.type != EventType.PHASE_CHANGE.value:
+            return
+        if event.phase != Phase.ATTACK.value:
+            return  # we want the DEFENSE→ATTACK edge
+
+        tasks = []
+        for chcfg in self.config.challenges:
+            spec = self._resolve_spec(chcfg.name)
+            if spec is None:
+                continue
+            if not (spec.metadata or {}).get("restart_cmd"):
+                continue
+            for team_id in chcfg.deploy_on:
+                team = next((t for t in self.config.topology.teams if t.id == team_id), None)
+                if team is None or not team.prod:
+                    continue
+                tasks.append(self._emit_health_chain(
+                    team_id=team_id,
+                    service=chcfg.name,
+                    container_name=team.prod,
+                    spec=spec,
+                ))
+        if tasks:
+            await asyncio.gather(*tasks)
 
     async def stop(self) -> None:
         if self.round_loop is not None:
