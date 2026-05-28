@@ -57,6 +57,7 @@ async def _run_start(args) -> int:
 
     game = GameMgr(config=cfg, orchestrator=orch)
     game.deploy_challenges()
+    game.plant_initial_flags()
 
     shutdown = asyncio.Event()
     app = build_app(game, shutdown)

@@ -8,21 +8,21 @@ Orchestrator for a 2-team Attack/Defense CTF arena. See [docs/design_v1.md](docs
 |-------------|-------|--------|
 | Docker | Docker Desktop or OrbStack (running) | Docker Engine 20.10+ (`sudo apt install docker.io`) |
 | Docker permission | — | Add your user to the `docker` group: `sudo usermod -aG docker $USER`, then log out / back in |
-| Python | 3.11+ (`brew install python@3.12`) | 3.11+ (Ubuntu 24.04 ships 3.12; on 22.04 use `apt install python3.11` from deadsnakes PPA) |
+| Python | conda / miniconda (any recent version) | conda / miniconda (any recent version) |
 
 Verify both backends:
 
 ```bash
 docker version --format '{{.Server.Version}}'
-python3 --version
+conda --version
 ```
 
 ## Setup
 
 ```bash
 # from repo root
-python3 -m venv .venv
-source .venv/bin/activate
+conda create -n cyberarena python=3.11 -y
+conda activate cyberarena
 pip install -r requirements.txt
 
 ./scripts/build_images.sh        # builds cyberarena/dev-base + cyberarena/prod-base (~5 min first time)
@@ -31,12 +31,12 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-source .venv/bin/activate
+conda activate cyberarena
 
-python3 main.py setup            # creates 3 networks + 4 containers
+python main.py setup             # creates 3 networks + 4 containers
 docker ps                        # should show team1_dev / team1_prod / team2_dev / team2_prod, all Up
 
-python3 main.py teardown         # full cleanup
+python main.py teardown          # full cleanup
 ```
 
 ## Tests

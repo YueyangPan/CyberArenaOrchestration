@@ -11,6 +11,9 @@ class Node:
     ports: list[str] = field(default_factory=list)
     install_list: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    # docker --add-host equivalents. Most useful for dev containers that need
+    # to reach the host's gameserver API: `{"host.docker.internal": "host-gateway"}`.
+    extra_hosts: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,7 @@ class Team:
     id: str
     dev: str
     prod: str
+    token: str = ""
 
 
 @dataclass(frozen=True)

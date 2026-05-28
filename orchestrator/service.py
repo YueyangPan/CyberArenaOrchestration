@@ -66,3 +66,12 @@ class Service(ABC):
             ["python3", "-c", probe]
         )
         return result.exit_code == 0
+
+    def plant_flag(self, container: ContainerHandle, flag: str) -> None:
+        """Plant `flag` onto this service's instance in `container`.
+
+        No default — every challenge that participates in the M5 flag chain
+        must implement this in a way that fits its own protocol (notes does
+        a PUT; an HTTP challenge would POST to a write endpoint; etc.).
+        """
+        raise NotImplementedError(f"{self.name} does not implement plant_flag")
