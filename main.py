@@ -168,6 +168,11 @@ def _wire_defense_kickoff(game: GameMgr) -> None:
 
     game.register_defense_kickoff_handler(_make_handler("defense"))
     game.register_attack_kickoff_handler(_make_handler("attack"))
+    # Artifact persistence — same agent_mgr reads stdout/stderr/exit_code
+    # off the dev container so the run_dir gets api-logs/ + agent-logs/.
+    # docker logs → service-logs/ are owned by GameMgr directly (no
+    # AgentManager needed for that path).
+    game.register_fetch_agent_logs_handler(agent_mgr.fetch_logs)
 
 
 if __name__ == "__main__":

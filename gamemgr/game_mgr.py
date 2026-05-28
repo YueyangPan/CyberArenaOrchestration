@@ -24,9 +24,11 @@ from agents.prompts import build_attack_prompt, build_defense_prompt
 from challenges.notes import BuiltinNotesSource
 from challenges.registry import build as build_challenge
 from challenges.source import ChallengeSpec, FlagMechanism, HealthLevel
-from models.agent import AgentConfig
+from models.agent import AgentConfig, AgentLogs
 import shlex
 from typing import Awaitable, Callable
+
+from .artifacts import ArtifactKind, ArtifactStore
 
 from .config import ChallengeConfig, GameConfig
 from .events import EventBus, EventType, FileSink, new_event, new_run_dir
@@ -92,9 +94,24 @@ class GameMgr:
             Callable[[str, AgentConfig], Awaitable[None]] | None
         ) = None
         self._attack_kickoff_done: set[tuple[int, str]] = set()
+        # Artifact persistence (api-logs / agent-logs / service-logs).
+        # ArtifactStore is built lazily in start() once run_dir is known.
+        # Until then the persistence subscriber no-ops.
+        self.artifacts: ArtifactStore | None = None
+        # Sync callable that reads stdout/stderr/exit_code from a dev
+        # container. main.py supplies this (typically ClaudeAgentManager.fetch_logs)
+        # via register_fetch_agent_logs_handler; without it the agent-side
+        # artifact persistence no-ops (event-only mode for tests).
+        self._fetch_agent_logs_handler: (
+            Callable[[ContainerHandle], AgentLogs] | None
+        ) = None
         # Subscribe at construction time (not start()): the subscribers
         # have no file-sink dependency and tests routinely drive
         # PHASE_CHANGE events directly onto the bus without the round loop.
+        # ORDER MATTERS: _on_persist_artifacts must run before the kickoff
+        # subscribers so a defense agent's stdout is fetched off the dev
+        # container before the attack-phase kickoff overwrites it.
+        self.bus.subscribe(self._on_persist_artifacts)
         self.bus.subscribe(self._on_defense_kickoff)
         self.bus.subscribe(self._on_attack_kickoff)
 
@@ -243,7 +260,12 @@ class GameMgr:
         self.run_dir = run_dir or new_run_dir()
         self._file_sink = FileSink(self.run_dir / "events.jsonl")
         self.bus.subscribe(self._file_sink)
-        log.info("game start; events -> %s", self._file_sink.path)
+        # Artifact persistence under the same run_dir as events.jsonl.
+        # Each ArtifactKind gets a reserved subdir (created on construction);
+        # api-logs / agent-logs / service-logs get filled as the round loop
+        # runs. See gamemgr/artifacts.py for the layout.
+        self.artifacts = ArtifactStore(self.run_dir)
+        log.info("game start; events -> %s ; artifacts -> %s", self._file_sink.path, self.artifacts.root)
 
         await self.emit_setup_events()
 
@@ -464,6 +486,118 @@ class GameMgr:
                         team_id,
                     )
             await asyncio.gather(*(_safe(t, c) for t, c in pending))
+
+    # ── DEFCON: artifact persistence (api-logs / agent-logs / service-logs)
+
+    def register_fetch_agent_logs_handler(
+        self,
+        handler: Callable[["ContainerHandle"], AgentLogs],
+    ) -> None:
+        """Register the callable that reads an agent's stdout / stderr /
+        exit_code off its dev container. Typically `ClaudeAgentManager.fetch_logs`.
+
+        Without a handler the api-logs / agent-logs persistence no-ops
+        (service-logs still write because they go through `docker logs`
+        directly, no AgentManager needed).
+        """
+        self._fetch_agent_logs_handler = handler
+
+    async def _on_persist_artifacts(self, event) -> None:
+        """Snapshot agent + service logs at the right moments:
+
+        - PHASE_CHANGE → ATTACK: DEFENSE just ended; the dev container
+          holds the defense agent's stream-json + stderr in /tmp. Fetch
+          it BEFORE the attack-phase kickoff overwrites those files.
+
+        - ROUND_STOP: ATTACK just ended; snapshot the attack agent's
+          logs (same paths) and the prod container's `docker logs`.
+        """
+        if self.artifacts is None:
+            return  # start() hasn't run yet — nothing to write into.
+
+        if event.type == EventType.PHASE_CHANGE.value and event.phase == Phase.ATTACK.value:
+            await self._persist_agent_logs("defense", event.round_id)
+        elif event.type == EventType.ROUND_STOP.value:
+            await self._persist_agent_logs("attack", event.round_id)
+            await self._persist_service_logs(event.round_id)
+
+    async def _persist_agent_logs(self, phase_label: str, round_id: int) -> None:
+        """Walk every team's dev container, fetch_logs, write to
+        api-logs/<team>/round-<N>/stream-<phase>.jsonl and
+        agent-logs/<team>/round-<N>/agent-<phase>.log.
+
+        Best-effort: any team that fails (no agent installed yet, fetch
+        raised, write raised) gets a log line and is skipped — never
+        bubbles up to crash the round.
+        """
+        if self.artifacts is None or self._fetch_agent_logs_handler is None:
+            return
+        for team in self.config.topology.teams:
+            if not team.dev:
+                continue
+            try:
+                handle = self._handle_for(team.dev)
+            except Exception:
+                # Container doesn't exist yet / was torn down — skip silently.
+                continue
+            try:
+                logs = self._fetch_agent_logs_handler(handle)
+            except Exception:
+                log.exception("artifact: fetch_logs failed for %s", team.dev)
+                continue
+            try:
+                api_p = self.artifacts.path_for(
+                    ArtifactKind.API_LOG,
+                    team_id=team.id,
+                    round_id=round_id,
+                    filename=f"stream-{phase_label}.jsonl",
+                )
+                api_p.write_text(logs.stdout or "")
+                agent_p = self.artifacts.path_for(
+                    ArtifactKind.AGENT_LOG,
+                    team_id=team.id,
+                    round_id=round_id,
+                    filename=f"agent-{phase_label}.log",
+                )
+                agent_p.write_text(
+                    f"exit_code={logs.exit_code}\n\n=== stderr ===\n{logs.stderr or ''}"
+                )
+            except Exception:
+                log.exception(
+                    "artifact: write failed for %s round=%d phase=%s",
+                    team.id, round_id, phase_label,
+                )
+
+    async def _persist_service_logs(self, round_id: int) -> None:
+        """Snapshot `docker logs <team{N}_prod>` for every team. End-of-round
+        only — captures the prod container's stdout/stderr across DEFENSE +
+        ATTACK in one file (timestamps from docker preserve sub-phase ordering).
+        """
+        if self.artifacts is None:
+            return
+        client = docker.from_env()
+        for team in self.config.topology.teams:
+            if not team.prod:
+                continue
+            try:
+                c = client.containers.get(team.prod)
+                blob = c.logs(timestamps=True).decode(errors="replace")
+            except Exception:
+                log.exception("artifact: docker logs failed for %s", team.prod)
+                continue
+            try:
+                p = self.artifacts.path_for(
+                    ArtifactKind.SERVICE_LOG,
+                    team_id=team.id,
+                    round_id=round_id,
+                    filename="docker.log",
+                )
+                p.write_text(blob)
+            except Exception:
+                log.exception(
+                    "artifact: write SERVICE_LOG failed for %s round=%d",
+                    team.id, round_id,
+                )
 
     async def stop(self) -> None:
         if self.round_loop is not None:
