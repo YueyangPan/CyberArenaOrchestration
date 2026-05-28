@@ -55,12 +55,16 @@ def test_attack_dispatch_nautilus_ico_uses_binary_protocol():
     p = build_attack_prompt(_cfg(), service_name="nautilus-ico")
     # ico fingerprints: binary opcodes, port 4265, PNG tEXt md5 leak idea.
     assert "4265" in p
-    assert "\\x10" in p  # CONNECT opcode in the protocol crib
+    assert "0x10" in p   # CONNECT opcode in the protocol crib (hex form)
     assert "tEXt" in p   # PNG chunk extraction hint
     assert "md5" in p.lower()
     # Notes commands must NOT appear.
     assert 'Send: "LIST' not in p
     assert 'Send: "GET' not in p
+    # Submission discipline must be present (the failure mode from the
+    # first live run was a stream of UNKNOWN guesses).
+    assert "UNKNOWN" in p
+    assert "HIGH confidence" in p
 
 
 def test_attack_dispatch_unknown_falls_back_to_notes():
