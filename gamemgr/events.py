@@ -42,6 +42,14 @@ class EventType(str, Enum):
     # {level, passed, detail}. Catches "hollow patch" cheese paths where
     # lower levels pass but CHECKER (the lifted upstream poller) fails.
     SERVICE_HEALTH_CHECK = "SERVICE_HEALTH_CHECK"
+    # DEFCON defense kickoff — emitted once per (team, service) on
+    # PHASE_CHANGE → DEFENSE entry. Signals that a defense agent should
+    # be spawned for that team. The actual `ClaudeAgentManager.install()`
+    # is delegated to a handler registered via
+    # `GameMgr.register_defense_kickoff_handler` so GameMgr doesn't have
+    # to own the agent supervisor (lets the API server / demo / tests
+    # wire whichever manager they need).
+    DEFENSE_KICKOFF = "DEFENSE_KICKOFF"
 
 
 @dataclass(frozen=True)

@@ -20,11 +20,12 @@ import docker
 from orchestrator.orchestrator import Orchestrator
 from orchestrator.service import ContainerHandle, Service
 
-from agents.prompts import build_attack_prompt
+from agents.prompts import build_attack_prompt, build_defense_prompt
 from challenges.notes import BuiltinNotesSource
 from challenges.registry import build as build_challenge
 from challenges.source import ChallengeSpec, HealthLevel
 from models.agent import AgentConfig
+from typing import Awaitable, Callable
 
 from .config import ChallengeConfig, GameConfig
 from .events import EventBus, EventType, FileSink, new_event, new_run_dir
@@ -61,6 +62,22 @@ class GameMgr:
         self._known_services: frozenset[str] = frozenset(
             c.name for c in config.challenges
         )
+        # DEFCON Phase 4b: registered handler invoked once per (team, service)
+        # whenever PHASE_CHANGE → DEFENSE fires. Receives the team_id and the
+        # defense-mode AgentConfig; the handler owns the actual ClaudeAgentManager
+        # call. None = no-op (the kickoff event still publishes; tests that
+        # don't need an agent run without one). Async callable.
+        self._defense_kickoff_handler: (
+            Callable[[str, AgentConfig], Awaitable[None]] | None
+        ) = None
+        # Set of (team_id, service_name) pairs we've already kicked off this
+        # phase, so a re-fire of PHASE_CHANGE for the same round doesn't
+        # spawn duplicate agents.
+        self._defense_kickoff_done: set[tuple[int, str, str]] = set()
+        # Subscribe at construction time (not start()): the subscriber has
+        # no file-sink dependency and tests routinely drive PHASE_CHANGE
+        # events directly onto the bus without invoking the round loop.
+        self.bus.subscribe(self._on_defense_kickoff)
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
@@ -141,6 +158,8 @@ class GameMgr:
         # bus.publish means this handler completes before _enter_phase
         # returns and the DEFENSE timer begins.
         self.bus.subscribe(self._on_rotation_event)
+        # NB: _on_defense_kickoff is subscribed in __init__ (it doesn't
+        # depend on file-sink state and tests need it active without start()).
 
         self.round_loop = RoundLoop(self.bus, self.orchestrator.network, self.config.rounds)
         await self.round_loop.run()
@@ -191,6 +210,90 @@ class GameMgr:
                     payload={"service": service_name},
                 )
             )
+
+    # ── DEFCON: defense kickoff on PHASE_CHANGE → DEFENSE ───────────────
+
+    def register_defense_kickoff_handler(
+        self,
+        handler: Callable[[str, AgentConfig], Awaitable[None]],
+    ) -> None:
+        """Register the callable that actually spawns a defense agent.
+
+        Signature: `async def handler(team_id: str, cfg: AgentConfig)`.
+        Called once per (team, deployable defense challenge) on every
+        DEFENSE phase entry, after flags rotate.
+
+        Kept external (rather than baked into GameMgr) so the round loop
+        is unchanged for non-defense use cases (unit tests, screenshots,
+        attack-only smoke runs) — they construct GameMgr without a handler
+        and the kickoff devolves to event emission only.
+
+        Replaces any previously-registered handler.
+        """
+        self._defense_kickoff_handler = handler
+
+    async def _on_defense_kickoff(self, event) -> None:
+        """Subscriber: on every DEFENSE entry, emit DEFENSE_KICKOFF per
+        (team, defense-capable service) and invoke the registered handler.
+
+        A challenge is "defense-capable" iff its spec carries a restart_cmd
+        in metadata (i.e. it can be rebuilt in-place). Toy challenges
+        without that — notes today — don't get a defense agent; this keeps
+        the kickoff signal honest with respect to what the framework can
+        actually defend.
+        """
+        if event.type != EventType.PHASE_CHANGE.value:
+            return
+        if event.phase != Phase.DEFENSE.value:
+            return
+
+        for chcfg in self.config.challenges:
+            # Resolve the spec for this challenge — needed for restart_cmd
+            # gating and for the prompt's port + source_dir.
+            spec = self._resolve_spec(chcfg.name)
+            if spec is None:
+                # Unknown / unresolvable spec — skip silently; misconfig is
+                # caught earlier in deploy_challenges.
+                continue
+            if not (spec.metadata or {}).get("restart_cmd"):
+                continue  # not defense-capable
+
+            for team_id in chcfg.deploy_on:
+                key = (event.round_id, team_id, chcfg.name)
+                if key in self._defense_kickoff_done:
+                    continue
+                self._defense_kickoff_done.add(key)
+
+                await self.bus.publish(
+                    new_event(
+                        EventType.DEFENSE_KICKOFF,
+                        team_id=team_id,
+                        round_id=event.round_id,
+                        phase=event.phase,
+                        payload={"service": chcfg.name},
+                    )
+                )
+
+                if self._defense_kickoff_handler is None:
+                    continue  # signal-only mode (no agent spawn wired)
+
+                try:
+                    cfg = self.defense_agent_config_for(team_id, service_name=chcfg.name)
+                except Exception as e:
+                    log.exception(
+                        "defense_agent_config_for failed for (%s, %s): %s",
+                        team_id, chcfg.name, e,
+                    )
+                    continue
+
+                try:
+                    await self._defense_kickoff_handler(team_id, cfg)
+                except Exception:
+                    # A blowing-up handler must not crash the round loop.
+                    log.exception(
+                        "defense kickoff handler raised for (%s, %s); skipping",
+                        team_id, chcfg.name,
+                    )
 
     async def stop(self) -> None:
         if self.round_loop is not None:
@@ -654,6 +757,55 @@ class GameMgr:
         )
         # Attack prompt is derived from the now-populated fields.
         return replace(cfg, system_prompt=build_attack_prompt(cfg))
+
+    def defense_agent_config_for(
+        self,
+        team_id: str,
+        *,
+        service_name: str,
+        submit_base_url: str = "http://host.docker.internal:8000",
+    ) -> AgentConfig:
+        """Build the per-team AgentConfig for DEFENSE mode (DEFCON Phase 4b).
+
+        Mirrors `agent_config_for` but swaps the prompt for the
+        edit→restart→smoke→report recipe via `build_defense_prompt`. Pulls
+        port + source_view from the resolved ChallengeSpec so the prompt
+        points the agent at the right path inside its own prod container.
+        """
+        base = self.config.agents.get(team_id)
+        if base is None:
+            raise KeyError(f"no agent config for team {team_id!r} in game.yaml")
+
+        teams_by_id = {t.id: t for t in self.config.topology.teams}
+        if team_id not in teams_by_id:
+            raise KeyError(f"unknown team_id {team_id!r}")
+        own_team = teams_by_id[team_id]
+
+        spec = self._resolve_spec(service_name)
+        if spec is None:
+            raise ValueError(f"unknown service: {service_name!r}")
+
+        from .mcp_server import canonical_endpoint_url
+
+        cfg = replace(
+            base,
+            team_id=team_id,
+            team_token=own_team.token,
+            own_prod_host=own_team.prod,
+            own_prod_container_name=own_team.prod,
+            # Defense doesn't pivot to opposing prods — leave empty.
+            opposing_prod_hosts=tuple(),
+            submit_url=f"{submit_base_url.rstrip('/')}/game/flag/submit",
+            mcp_endpoint=canonical_endpoint_url(submit_base_url),
+        )
+        return replace(
+            cfg,
+            system_prompt=build_defense_prompt(
+                cfg,
+                service_name=service_name,
+                port=spec.port,
+            ),
+        )
 
     # ── helpers ─────────────────────────────────────────────────────────
 
