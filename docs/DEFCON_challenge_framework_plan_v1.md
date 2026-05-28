@@ -300,7 +300,7 @@ v1 yaml declares: the built-in `notes` source + nautilus source with `include: [
 | 25 | `tests/test_dcf_round_loop_defense_phase.py` | Phase entry → defense kickoff fires; mocked agent records `DEPLOY_COMPLETE` |
 | 26 | `tests/test_dcf_defense_workflow.py` (live, env-gated) | Real Claude agent runs defense recipe on ico end-to-end |
 | 27 | `docs/DEFCON_challenge_framework_plan_v1.md` + `..._report_v1.md` | docs |
-| 28 | `docs/design_v1.6.md` | Update topology (per-(team, challenge) + 3-network split) + challenges (sources + specs) + agent (defense phase) |
+| 28 | `docs/design_v1.7.md` (new, supersedes v1.6 the way v1.6 superseded v1) | Written **after** implementation lands, capturing the actual post-M7 state: per-(team, challenge) topology, 3-network split with the new names, `ChallengeSource` + `ChallengeSpec` + `HealthLevel`, defense-phase flow, MCP `restart_service` tool + restart event chain, `arena_agent` non-root SSH user, artifact persistence layout (api-logs split from agent-logs). v1.6 stays in `docs/` as the prior baseline, untouched |
 
 ---
 
