@@ -348,13 +348,13 @@ class GameMgr:
         if event.phase != Phase.DEFENSE.value:
             return
 
+        # Collect handler invocations, then run them concurrently so per-team
+        # install (~15s of npm + ssh + script writes the first time) doesn't
+        # serialize across teams and waste half the DEFENSE budget.
+        pending: list[tuple[str, str, AgentConfig]] = []
         for chcfg in self.config.challenges:
-            # Resolve the spec for this challenge — needed for restart_cmd
-            # gating and for the prompt's port + source_dir.
             spec = self._resolve_spec(chcfg.name)
             if spec is None:
-                # Unknown / unresolvable spec — skip silently; misconfig is
-                # caught earlier in deploy_challenges.
                 continue
             if not (spec.metadata or {}).get("restart_cmd"):
                 continue  # not defense-capable
@@ -376,25 +376,28 @@ class GameMgr:
                 )
 
                 if self._defense_kickoff_handler is None:
-                    continue  # signal-only mode (no agent spawn wired)
-
-                try:
-                    cfg = self.defense_agent_config_for(team_id, service_name=chcfg.name)
-                except Exception as e:
-                    log.exception(
-                        "defense_agent_config_for failed for (%s, %s): %s",
-                        team_id, chcfg.name, e,
-                    )
                     continue
 
                 try:
-                    await self._defense_kickoff_handler(team_id, cfg)
+                    cfg = self.defense_agent_config_for(team_id, service_name=chcfg.name)
                 except Exception:
-                    # A blowing-up handler must not crash the round loop.
                     log.exception(
-                        "defense kickoff handler raised for (%s, %s); skipping",
+                        "defense_agent_config_for failed for (%s, %s)",
                         team_id, chcfg.name,
                     )
+                    continue
+                pending.append((team_id, chcfg.name, cfg))
+
+        if pending and self._defense_kickoff_handler is not None:
+            async def _safe(team_id: str, service_name: str, cfg: AgentConfig) -> None:
+                try:
+                    await self._defense_kickoff_handler(team_id, cfg)
+                except Exception:
+                    log.exception(
+                        "defense kickoff handler raised for (%s, %s); skipping",
+                        team_id, service_name,
+                    )
+            await asyncio.gather(*(_safe(t, s, c) for t, s, c in pending))
 
     # ── DEFCON: attack kickoff on PHASE_CHANGE → ATTACK ─────────────────
 
@@ -424,6 +427,7 @@ class GameMgr:
         if event.phase != Phase.ATTACK.value:
             return
 
+        pending: list[tuple[str, AgentConfig]] = []
         for team in self.config.topology.teams:
             key = (event.round_id, team.id)
             if key in self._attack_kickoff_done:
@@ -448,14 +452,18 @@ class GameMgr:
             except Exception:
                 log.exception("agent_config_for failed for %s; skipping attack kickoff", team.id)
                 continue
+            pending.append((team.id, cfg))
 
-            try:
-                await self._attack_kickoff_handler(team.id, cfg)
-            except Exception:
-                log.exception(
-                    "attack kickoff handler raised for %s; skipping",
-                    team.id,
-                )
+        if pending and self._attack_kickoff_handler is not None:
+            async def _safe(team_id: str, cfg: AgentConfig) -> None:
+                try:
+                    await self._attack_kickoff_handler(team_id, cfg)
+                except Exception:
+                    log.exception(
+                        "attack kickoff handler raised for %s; skipping",
+                        team_id,
+                    )
+            await asyncio.gather(*(_safe(t, c) for t, c in pending))
 
     async def stop(self) -> None:
         if self.round_loop is not None:
@@ -892,6 +900,11 @@ class GameMgr:
         Pulls the static cli/model/api_key/base_url from config.agents[team_id]
         (loaded from game.yaml) and layers on the runtime topology context
         (own prod, opposing prods, token, submit URL, attack prompt).
+
+        The attack prompt is picked per-challenge via the prompts dispatcher.
+        v1 assumes one challenge configured per game; if there's exactly one
+        in `config.challenges`, we pass its name to the dispatcher. If
+        multiple are configured, the dispatcher's notes-recipe fallback runs.
         """
         base = self.config.agents.get(team_id)
         if base is None:
@@ -917,8 +930,17 @@ class GameMgr:
             submit_url=f"{submit_base_url.rstrip('/')}/game/flag/submit",
             mcp_endpoint=canonical_endpoint_url(submit_base_url),
         )
-        # Attack prompt is derived from the now-populated fields.
-        return replace(cfg, system_prompt=build_attack_prompt(cfg))
+        # Pick a service name for the attack prompt — the single configured
+        # challenge for this team. (Multi-challenge games would need an
+        # explicit per-team mapping; deferred.)
+        attack_service: str | None = None
+        deployable = [c for c in self.config.challenges if team_id in c.deploy_on]
+        if len(deployable) == 1:
+            attack_service = deployable[0].name
+        return replace(
+            cfg,
+            system_prompt=build_attack_prompt(cfg, service_name=attack_service),
+        )
 
     def defense_agent_config_for(
         self,

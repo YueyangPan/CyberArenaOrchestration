@@ -204,8 +204,14 @@ def test_registered_defense_kickoff_handler_is_invoked_with_agent_config():
         assert "defense agent" in cfg.system_prompt.lower()
         assert "nautilus-ico" in cfg.system_prompt
         assert "restart_service" in cfg.system_prompt
-        # Should NOT have attack-mode language (opposing prod pivots, LIST/GET).
-        assert "PROTOCOL" not in cfg.system_prompt.upper() or "PROTOCOL +" in cfg.system_prompt
+        # Should NOT have attack-mode language. "PROTOCOL" alone is legitimate
+        # in defense ("don't break the legitimate protocol"); the real attack
+        # tells are "steal flags" + the LIST/GET notes commands or the ico
+        # binary-protocol opcode crib.
+        prompt = cfg.system_prompt
+        assert "steal flags" not in prompt.lower()
+        assert "Send: \"LIST" not in prompt
+        assert "Send: \"GET" not in prompt
         # No opposing_prod_hosts in defense mode.
         assert cfg.opposing_prod_hosts == tuple()
 
