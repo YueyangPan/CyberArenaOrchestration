@@ -9,7 +9,7 @@
 # The NautilusSource adapter assembles that combined context at
 # build_image() time.
 
-FROM --platform=amd64 ubuntu:24.04
+FROM --platform=linux/amd64 ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -25,11 +25,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # ── Users ─────────────────────────────────────────────────────────────
 #
+# Two distinct unprivileged users — different reasons to exist:
+#
 # `arena_agent` — non-root user the dev container SSHes in as. Owns
-# /srv/challenge/ico/. Cannot modify /arena/* (root-owned 555).
+#   /srv/challenge/ico/. Cannot modify /arena/* (root-owned 555).
+#
+# `ico` — the service runtime user. The Pascal server forks per-client
+#   and `DropPrivileges('ico')` (see service/server.pas) before handling
+#   the protocol; if this user doesn't exist, every child crashes mid-
+#   handshake (connection reset on first send). Required even though the
+#   agent never logs in as `ico`. Mirrors upstream's adduser pattern.
 #
 # sshd's host keys generated at first start (see ENTRYPOINT below).
-RUN useradd --create-home --shell /bin/bash arena_agent
+RUN useradd --create-home --shell /bin/bash arena_agent \
+    && adduser --no-create-home --disabled-password --gecos "" ico
 
 # ── Source layout ─────────────────────────────────────────────────────
 #
