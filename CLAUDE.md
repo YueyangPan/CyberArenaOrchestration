@@ -4,8 +4,9 @@
 
 All design lives in [docs/](docs/). Read the relevant doc before changing related code.
 
-- [docs/design_v1.6.md](docs/design_v1.6.md) — overall system design (current; supersedes v1)
-- [docs/design_v1.md](docs/design_v1.md) — historical v1 baseline (kept for lineage)
+- [docs/design_v1.7.md](docs/design_v1.7.md) — overall system design (current; supersedes v1.6)
+- [docs/design_v1.6.md](docs/design_v1.6.md) — prior baseline (kept for lineage)
+- [docs/design_v1.md](docs/design_v1.md) — historical v1 baseline
 - [docs/m1_topology_plan.md](docs/m1_topology_plan.md) / [docs/m1_topology_report.md](docs/m1_topology_report.md) — M1: topology
 - [docs/m2_gameloop_plan.md](docs/m2_gameloop_plan.md) / [docs/m2_gameloop_report.md](docs/m2_gameloop_report.md) — M2: game loop
 - [docs/m3_network_plan.md](docs/m3_network_plan.md) / [docs/m3_network_report.md](docs/m3_network_report.md) — M3: network switching
@@ -15,6 +16,7 @@ All design lives in [docs/](docs/). Read the relevant doc before changing relate
 - [docs/m5_6_agent_attack_plan.md](docs/m5_6_agent_attack_plan.md) / [docs/m5_6_agent_attack_report.md](docs/m5_6_agent_attack_report.md) — M5.6: agent-driven attack loop (SSH pivot)
 - [docs/m6_panel_plan.md](docs/m6_panel_plan.md) / [docs/m6_panel_report.md](docs/m6_panel_report.md) — M6: observation panel (live event stream)
 - [docs/m4_5_mcp_plan.md](docs/m4_5_mcp_plan.md) / [docs/m4_5_mcp_report.md](docs/m4_5_mcp_report.md) — M4.5: MCP agent channel (replaces deferred WS reverse channel)
+- [docs/DEFCON_challenge_framework_plan_v1.md](docs/DEFCON_challenge_framework_plan_v1.md) / [docs/DEFCON_challenge_framework_report_v1.md](docs/DEFCON_challenge_framework_report_v1.md) — DEFCON: pluggable ChallengeSource + nautilus-ico defense workflow
 
 ## Update Rule
 
