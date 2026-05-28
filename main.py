@@ -161,8 +161,27 @@ def _wire_defense_kickoff(game: GameMgr) -> None:
             except Exception:
                 log.exception("%s kickoff: cannot resolve dev handle for %s", mode, team_id)
                 return
+            # M4.5 lifecycle callbacks — fire AGENT_INSTALLED after prep
+            # (files / mcp.json / ssh pivot done) and AGENT_LAUNCHED after
+            # the supervisor pid is captured. Both run on the executor
+            # thread; bridge back to the loop with run_coroutine_threadsafe.
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, agent_mgr.install, handle, cfg)
+            def _on_installed(tid: str) -> None:
+                asyncio.run_coroutine_threadsafe(
+                    game.record_agent_installed(tid), loop
+                )
+            def _on_launched(tid: str, wrapper_pid: int) -> None:
+                asyncio.run_coroutine_threadsafe(
+                    game.record_agent_launched(tid, wrapper_pid), loop
+                )
+            await loop.run_in_executor(
+                None,
+                lambda: agent_mgr.install(
+                    handle, cfg,
+                    on_installed=_on_installed,
+                    on_launched=_on_launched,
+                ),
+            )
             log.info("%s agent installed on %s", mode, team.dev)
         return handler
 

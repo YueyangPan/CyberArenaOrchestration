@@ -161,11 +161,18 @@
     white-space: nowrap;
   }
   .chip .ts { color: var(--text-faint); margin-left: 0.4rem; font-size: 0.62rem; }
-  .chip-deploy   { color: var(--accent); }
-  .chip-agent    { color: var(--accent); }
-  .chip-plant    { color: var(--plant); }
-  .chip-accept   { color: var(--good); }
-  .chip-reject   { color: var(--bad); }
+  .chip-deploy    { color: var(--accent); }
+  .chip-agent     { color: var(--accent); }
+  .chip-kickoff   { color: var(--accent); }
+  .chip-launch    { color: var(--accent); }
+  .chip-ready     { color: var(--good); }
+  .chip-restart   { color: var(--plant); }
+  .chip-health-ok { color: var(--good); }
+  .chip-health-no { color: var(--bad); }
+  .chip-deploy-done { color: var(--good); }
+  .chip-plant     { color: var(--plant); }
+  .chip-accept    { color: var(--good); }
+  .chip-reject    { color: var(--bad); }
   .chip .mark { font-weight: 700; margin-right: 0.3rem; }
 
   /* ── footer ─────────────────────────────────────────────── */
@@ -277,13 +284,22 @@
     state.seenEventIds.add(ev.id);
 
     switch (ev.type) {
-      case 'ROUND_START':     return renderRoundStart(ev);
-      case 'ROUND_STOP':      return renderRoundStop(ev);
-      case 'PHASE_CHANGE':    return renderPhaseChange(ev);
-      case 'SERVICE_DEPLOYED':return renderServiceDeployed(ev);
-      case 'AGENT_INSTALLED': return renderAgentInstalled(ev);
-      case 'FLAG_PLANTED':    return renderFlagPlanted(ev);
-      case 'FLAG_SUBMITTED':  return renderFlagSubmitted(ev);
+      case 'ROUND_START':              return renderRoundStart(ev);
+      case 'ROUND_STOP':               return renderRoundStop(ev);
+      case 'PHASE_CHANGE':             return renderPhaseChange(ev);
+      case 'SERVICE_DEPLOYED':         return renderServiceDeployed(ev);
+      case 'AGENT_INSTALLED':          return renderAgentInstalled(ev);
+      case 'AGENT_LAUNCHED':           return renderAgentLaunched(ev);
+      case 'AGENT_READY':              return renderAgentReady(ev);
+      case 'DEFENSE_KICKOFF':          return renderKickoff(ev, 'defense');
+      case 'ATTACK_KICKOFF':           return renderKickoff(ev, 'attack');
+      case 'SERVICE_RESTART_STARTED':  return renderRestart(ev, 'started');
+      case 'SERVICE_RESTART_COMPLETED':return renderRestart(ev, 'completed');
+      case 'SERVICE_RESTART_FAILED':   return renderRestart(ev, 'failed');
+      case 'SERVICE_HEALTH_CHECK':     return renderHealthCheck(ev);
+      case 'DEPLOY_COMPLETE':          return renderDeployComplete(ev);
+      case 'FLAG_PLANTED':             return renderFlagPlanted(ev);
+      case 'FLAG_SUBMITTED':           return renderFlagSubmitted(ev);
       default: return; // unknown event types are silently ignored
     }
   }
@@ -325,6 +341,81 @@
     chip.append(
       el('span', 'mark', '◆'),
       document.createTextNode('agent installed'),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+  }
+  function renderAgentLaunched(ev) {
+    const lane = getLane(ev.team_id);
+    const pl = ev.payload || {};
+    const chip = el('span', 'chip chip-launch');
+    chip.append(
+      el('span', 'mark', '▶'),
+      document.createTextNode(`agent launched pid=${pl.wrapper_pid || '?'}`),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+  }
+  function renderAgentReady(ev) {
+    const lane = getLane(ev.team_id);
+    const chip = el('span', 'chip chip-ready');
+    chip.append(
+      el('span', 'mark', '✓'),
+      document.createTextNode('agent ready'),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+  }
+  function renderKickoff(ev, mode) {
+    const lane = getLane(ev.team_id);
+    const pl = ev.payload || {};
+    const chip = el('span', 'chip chip-kickoff');
+    const label = mode === 'defense'
+      ? `defense kickoff ${pl.service || ''}`
+      : `attack kickoff`;
+    chip.append(
+      el('span', 'mark', '⚡'),
+      document.createTextNode(label),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+  }
+  function renderRestart(ev, kind) {
+    const lane = getLane(ev.team_id);
+    const pl = ev.payload || {};
+    const cls = kind === 'failed' ? 'chip-reject' : 'chip-restart';
+    const mark = kind === 'started' ? '↻' : (kind === 'completed' ? '✓' : '✗');
+    const dur = pl.duration_ms != null ? ` ${pl.duration_ms}ms` : '';
+    const err = pl.error ? ` — ${pl.error}` : '';
+    const chip = el('span', 'chip ' + cls);
+    chip.append(
+      el('span', 'mark', mark),
+      document.createTextNode(`restart ${kind}${dur}${err}`),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+  }
+  function renderHealthCheck(ev) {
+    const lane = getLane(ev.team_id);
+    const pl = ev.payload || {};
+    const ok = pl.passed === true;
+    const cls = ok ? 'chip-health-ok' : 'chip-health-no';
+    const chip = el('span', 'chip ' + cls);
+    chip.append(
+      el('span', 'mark', ok ? '✓' : '✗'),
+      document.createTextNode(`health/${pl.level || '?'}`),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+  }
+  function renderDeployComplete(ev) {
+    const lane = getLane(ev.team_id);
+    const pl = ev.payload || {};
+    const dur = pl.duration_ms != null ? ` ${pl.duration_ms}ms` : '';
+    const chip = el('span', 'chip chip-deploy-done');
+    chip.append(
+      el('span', 'mark', '✓'),
+      document.createTextNode(`deploy_complete${dur}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
     lane.chips.appendChild(chip);
