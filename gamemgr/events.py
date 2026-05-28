@@ -31,6 +31,17 @@ class EventType(str, Enum):
     # Agent-self-reported deploy completion (M4.5; agent → MCP).
     # Distinct from SERVICE_DEPLOYED which is the host-side initial install.
     DEPLOY_COMPLETE = "DEPLOY_COMPLETE"
+    # DEFCON framework restart-job chain (orchestrator-emitted). Async by
+    # design — STARTED fires before the background task, COMPLETED/FAILED
+    # fire when the task settles. All three share a `job_id` in the payload.
+    SERVICE_RESTART_STARTED = "SERVICE_RESTART_STARTED"
+    SERVICE_RESTART_COMPLETED = "SERVICE_RESTART_COMPLETED"
+    SERVICE_RESTART_FAILED = "SERVICE_RESTART_FAILED"
+    # Per-level service health probe emitted after each restart, one event
+    # per HealthLevel (PROCESS → TCP → PROTOCOL → CHECKER). Payload carries
+    # {level, passed, detail}. Catches "hollow patch" cheese paths where
+    # lower levels pass but CHECKER (the lifted upstream poller) fails.
+    SERVICE_HEALTH_CHECK = "SERVICE_HEALTH_CHECK"
 
 
 @dataclass(frozen=True)

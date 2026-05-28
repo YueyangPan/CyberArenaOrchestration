@@ -51,11 +51,33 @@ class Service(ABC):
     @abstractmethod
     def stop(self, container: ContainerHandle) -> None: ...
 
-    def is_alive(self, container: ContainerHandle) -> bool:
-        """Default healthcheck: docker exec a Python socket connect to self.port.
+    def is_alive(self, container: ContainerHandle, level: "HealthLevel | None" = None) -> bool:
+        """Healthcheck at one of four levels (challenges/source.py:HealthLevel).
 
-        Override in adapters for protocol-level checks.
+        Default (level=None or PROTOCOL) is the legacy behavior: a
+        socket-connect probe on self.port. Higher levels (CHECKER) and
+        lower levels (PROCESS, TCP) are adapter-overridden — the base
+        implementation can only tell you "the port answers". The
+        backwards-compat default keeps M5/M5.5/M5.6 call sites working
+        without passing a level.
         """
+        # Lazy import to avoid a circular: challenges/source.py imports
+        # this module to subclass Service. Keeping the import inside the
+        # method body breaks the cycle.
+        from challenges.source import HealthLevel
+
+        if level is None:
+            level = HealthLevel.PROTOCOL
+
+        if level == HealthLevel.PROCESS:
+            # Default has no specific process to probe — adapters that know
+            # their process_pattern should override. Conservative: report
+            # True if we can't tell, since this base impl predates the
+            # framework's process-level concept.
+            return True
+
+        # TCP / PROTOCOL / CHECKER all fall back to the same simple port
+        # probe in the base class. Adapters override for richer checks.
         if self.port is None:
             return True
         probe = (

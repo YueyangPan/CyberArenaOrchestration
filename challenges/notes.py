@@ -122,16 +122,47 @@ class NotesService(Service):
         c = self._client.containers.get(container.name)
         c.exec_run(["pkill", "-f", SERVER_SCRIPT])
 
-    def is_alive(self, container: ContainerHandle) -> bool:
-        """Protocol-level check: LIST should respond with 'COUNT '."""
+    def is_alive(
+        self,
+        container: ContainerHandle,
+        level: "HealthLevel | None" = None,
+    ) -> bool:
+        """Multi-level healthcheck.
+
+        - PROCESS: server.py script process is alive (pgrep against the
+          script path).
+        - TCP: port answers a socket-connect.
+        - PROTOCOL: LIST returns 'COUNT '. (Legacy default for M5.)
+        - CHECKER: notes has no separable gameplay surface beyond
+          PROTOCOL (no vuln, no flag-retrieval path different from PUT/GET);
+          documented in the DEFCON plan. Fall through to PROTOCOL.
+        """
+        # Lazy import to avoid circular with orchestrator.service.
+        from challenges.source import HealthLevel
+
+        if level is None:
+            level = HealthLevel.PROTOCOL
+
+        c = self._client.containers.get(container.name)
+
+        if level == HealthLevel.PROCESS:
+            r = c.exec_run(["pgrep", "-f", SERVER_SCRIPT])
+            return r.exit_code == 0
+
+        if level == HealthLevel.TCP:
+            probe = (
+                f"import socket; s=socket.socket(); s.settimeout(2); "
+                f"s.connect(('127.0.0.1', {self._port})); s.close()"
+            )
+            return c.exec_run(["python3", "-c", probe]).exit_code == 0
+
+        # PROTOCOL + CHECKER both run the LIST handshake.
         probe = (
             f"import socket; s=socket.socket(); s.settimeout(2); "
             f"s.connect(('127.0.0.1', {self._port})); s.sendall(b'LIST\\n'); "
             f"print(s.recv(64).decode().strip())"
         )
-        result = self._client.containers.get(container.name).exec_run(
-            ["python3", "-c", probe]
-        )
+        result = c.exec_run(["python3", "-c", probe])
         if result.exit_code != 0:
             return False
         out = (result.output or b"").decode(errors="replace").strip()
@@ -162,3 +193,58 @@ class NotesService(Service):
             raise RuntimeError(
                 f"plant_flag failed on {container.name}: rc={result.exit_code}, out={out!r}"
             )
+
+
+# ── DEFCON framework: ChallengeSource adapter ──────────────────────────
+
+
+from challenges.source import ChallengeSource, ChallengeSpec, FlagMechanism  # noqa: E402
+
+# Notes runs in-place inside the shared prod-base image (no per-challenge
+# image build; the script is push_archive'd via NotesService.install at
+# deploy time). The image tag here just points at the fallback base.
+_NOTES_IMAGE_TAG = "cyberarena/prod-base"
+
+
+class BuiltinNotesSource(ChallengeSource):
+    """The built-in notes service as a ChallengeSource.
+
+    Exists so the DEFCON framework's contract test runs the same body
+    against `notes` and external adapters — keeping the ABC honest. The
+    actual lifecycle is still NotesService (push script, exec server,
+    plant via PUT); BuiltinNotesSource is just the discovery shell.
+
+    Defaults to port 5000 to match v1.6's `config/game.yaml` / M5 tests.
+    """
+
+    DEFAULT_PORT = 5000
+
+    def __init__(self, port: int = DEFAULT_PORT) -> None:
+        self._port = port
+
+    def list_challenges(self) -> list[ChallengeSpec]:
+        return [
+            ChallengeSpec(
+                name="notes",
+                source="notes",
+                port=self._port,
+                image_tag=_NOTES_IMAGE_TAG,
+                # Notes' plant goes through the service protocol (PUT) —
+                # there's no flag file or env var. See FlagMechanism docstring.
+                flag_mechanism=FlagMechanism.SERVICE_PROTOCOL,
+                source_view=None,  # no defense workflow for the toy challenge
+                metadata={
+                    # Maps to NotesService's runtime args.
+                    "service_class": "challenges.notes:NotesService",
+                },
+            ),
+        ]
+
+    def build_image(self, spec: ChallengeSpec) -> str:
+        """Notes ships in the prod-base image (no per-challenge build).
+
+        Returns the existing image tag without touching docker. The
+        Orchestrator is expected to already have built `cyberarena/prod-base`
+        via scripts/build_images.sh.
+        """
+        return spec.image_tag
