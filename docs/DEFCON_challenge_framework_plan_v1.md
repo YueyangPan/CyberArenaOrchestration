@@ -25,57 +25,23 @@ contract test runs the same body against both.
 
 ## Generic contract
 
-`challenges/source.py` (new):
+New module `challenges/source.py` exports:
 
-```python
-class ChallengeSource(ABC):
-    """One subclass per backing catalog (notes, nautilus, picoCTF, ...)."""
+- **`ChallengeSource` (ABC)** — one subclass per backing catalog (notes, nautilus, picoCTF, ...). Two abstract methods:
+  - `list_challenges() → list[ChallengeSpec]`
+  - `build_image(spec) → image_tag` (build the docker image, return the tag)
+- **`ChallengeSpec` (frozen dataclass)** with fields:
+  - `name` — unique in the game; `game.yaml` references this
+  - `source` — `"notes"` / `"nautilus"` / etc.
+  - `port` — service port inside the container
+  - `image_tag` — e.g. `cyberarena/chal-nautilus-ico:<sha>`
+  - `flag_mechanism` — see enum below
+  - `source_view` (optional) — subpath inside the upstream challenge dir whose contents the adapter **COPIES** into the runtime image at build time, ending up at `/srv/challenge/<name>/`. **NEVER a host bind mount** (would leak across teams + poison vendor tree).
+  - `metadata` (dict) — opaque to the rest of the system; adapter consumes
+- **`FlagMechanism` enum**: `FILE_AT_PATH` (write to e.g. `/flag` at deploy) / `ENV_VAR` / `BINARY_PATCH` (rewrite sentinel in compiled binary)
+- **`HealthLevel` enum**: `PROCESS` (pid alive) / `TCP` (port answers) / `PROTOCOL` (speaks the protocol) / `CHECKER` (gameplay-correct: vuln reachable, flag retrievable). Higher levels imply the lower ones.
 
-    @abstractmethod
-    def list_challenges(self) -> list[ChallengeSpec]: ...
-
-    @abstractmethod
-    def build_image(self, spec: ChallengeSpec) -> str:
-        """Build the docker image; return the image tag."""
-
-
-@dataclass(frozen=True)
-class ChallengeSpec:
-    name: str           # unique in the game; game.yaml refers to this
-    source: str         # "notes" | "nautilus" | ...
-    port: int
-    image_tag: str      # e.g. "cyberarena/chal-nautilus-ico:<sha>"
-    flag_mechanism: "FlagMechanism"
-    # Subpath inside the upstream challenge dir whose contents the adapter
-    # COPIES into the runtime image at build time → /srv/challenge/<name>/.
-    # NEVER a host bind mount (would leak across teams + poison vendor tree).
-    source_view: Path | None = None
-    metadata: dict = field(default_factory=dict)
-
-
-class FlagMechanism(str, Enum):
-    FILE_AT_PATH = "file_at_path"   # write to e.g. /flag at deploy
-    ENV_VAR      = "env_var"
-    BINARY_PATCH = "binary_patch"   # rewrite sentinel in compiled binary
-
-
-class HealthLevel(str, Enum):
-    PROCESS  = "process"    # pid alive
-    TCP      = "tcp"        # port answers
-    PROTOCOL = "protocol"   # speaks the protocol (current Service.is_alive)
-    CHECKER  = "checker"    # gameplay-correct: vuln reachable, flag retrievable
-
-
-class Service(ABC):
-    ...
-    @abstractmethod
-    def is_alive(self, handle: ContainerHandle,
-                 level: HealthLevel = HealthLevel.PROTOCOL) -> bool: ...
-```
-
-`Service` ABC otherwise **unchanged**. `level` defaults to `PROTOCOL`
-(backwards-compat for M5/M5.5/M5.6 callers). Higher levels imply lower
-levels — checking CHECKER means PROCESS+TCP+PROTOCOL already passed.
+`Service` ABC otherwise **unchanged**, with one signature update: `is_alive(handle, level=HealthLevel.PROTOCOL)`. The default keeps M5/M5.5/M5.6 callers backwards-compatible.
 
 ---
 
@@ -125,29 +91,17 @@ game_net     →  public_attack_net                            (rename)
 | Build | FreePascal `fpc` |
 | A/D-ready | yes (upstream README: "multiple bugs", "patch quickly") |
 
-```toml
-# challenges/nautilus/ico/spec.toml
-name = "nautilus-ico"
-source = "nautilus"
-port = 4265
-flag_mechanism = "file_at_path"
-flag_path = "/flag"
-restart_cmd = "/arena/restart.sh"
-source_view = "service"   # baked into image at /srv/challenge/ico/
+`challenges/nautilus/ico/spec.toml` carries:
 
-[health_check]
-process_pattern = "/srv/challenge/ico/ico"   # pgrep target
-checker_command = "/arena/checker.sh"         # root-owned, NOT under source_view
-```
+- Top-level: `name = "nautilus-ico"`, `source = "nautilus"`, `port = 4265`, `flag_mechanism = "file_at_path"`, `flag_path = "/flag"`, `restart_cmd = "/arena/restart.sh"`, `source_view = "service"` (the `service/` subpath baked into image at `/srv/challenge/ico/`).
+- `[health_check]` section: `process_pattern` (the `pgrep` target identifying the running `ico` binary) + `checker_command` (path to the checker script, baked root-owned and outside `source_view`).
 
-```bash
-# challenges/nautilus/ico/restart.sh
-set -e
-cd /srv/challenge/ico
-fpc -vh -Sd -Un -Cg -Cr- -Co- -O3 -Px86_64 -oico ico.pas
-pkill -f /app/ico || true
-nohup /srv/challenge/ico/ico > /var/log/ico.stdout 2>&1 &
-```
+`challenges/nautilus/ico/restart.sh` does:
+
+1. `cd` into the agent's writable source dir (`/srv/challenge/ico/`).
+2. Re-compile via `fpc` with upstream's release flags (from `ico/Makefile`).
+3. `pkill` the old binary if running.
+4. `nohup` the new binary into background; stdout/stderr redirected to `/var/log/ico.stdout`.
 
 ### Integration tax (recurs per binary challenge)
 
@@ -196,16 +150,13 @@ DEFENSE phase enters → defense agent spawns (fresh per phase) → agent runs:
 
 ### MCP `restart_service` tool (4th on the M4.5 server) — async
 
-```
-restart_service(service: str)
+Takes a single argument: the bare challenge name (string). Returns immediately with a `job_id` (12-hex). Error cases:
 
-  → {job_id: "<12-hex>"}      returns immediately
-  → InvalidParams             unknown service / already in-flight for (team, service)
-  → "Unauthorized"            bad token (silent on bus)
-```
+- Unknown service → `InvalidParams`
+- A restart already in flight for this `(team, service)` → `InvalidParams`
+- Bad / missing token → generic `Unauthorized` (silent on bus, per M4.5 oracle-hardening rule)
 
-Async because `make` / `cargo` / `npm install` can run tens of seconds.
-Validates `service` via `game.is_known_service()` (M4.5).
+Async because `make` / `cargo` / `npm install` can run tens of seconds — a synchronous tool would block the MCP HTTP request past the SDK timeout and conflate timeouts with build failures. Validates `service` via `game.is_known_service()` (M4.5).
 
 ### Events
 
@@ -217,21 +168,17 @@ Validates `service` via `game.is_known_service()` (M4.5).
 | `SERVICE_HEALTH_CHECK` | host | after COMPLETED, one per level (PROCESS→TCP→PROTOCOL→CHECKER) |
 | `DEPLOY_COMPLETE` (M4.5) | agent via `report_deploy_complete` | agent's claim |
 
-Payload `(every restart event)`:
-```json
-{ "job_id": "<12-hex>", "team_id": "team1", "service": "nautilus-ico",
-  // STARTED:    "started_at": <unix>
-  // COMPLETED:  "duration_ms": <int>
-  // FAILED:     "duration_ms": <int>, "error": "<short>" }
-```
+Restart-event payload fields (every restart event carries these):
 
-`SERVICE_HEALTH_CHECK` payload:
-```json
-{ "team_id": "team1", "service": "nautilus-ico",
-  "level": "CHECKER", "passed": false, "detail": "<short>" }
-```
+- `job_id` — 12-hex correlation id, same for STARTED/COMPLETED/FAILED of the same job
+- `team_id`, `service` — which team and which challenge
+- STARTED additionally: `started_at` (unix ts)
+- COMPLETED additionally: `duration_ms`
+- FAILED additionally: `duration_ms`, `error` (short string)
 
-In-flight tracking: `GameMgr._restart_jobs: dict[job_id → RestartJob]`.
+`SERVICE_HEALTH_CHECK` payload fields: `team_id`, `service`, `level` (one of `process` / `tcp` / `protocol` / `checker`), `passed` (bool), `detail` (short string).
+
+In-flight tracking lives on `GameMgr` as a dict keyed by `job_id`. A new restart for a `(team, service)` pair that already has a running job is rejected at the MCP layer (InvalidParams).
 
 ### Game loop hook
 
@@ -267,48 +214,29 @@ operator and future scoring see them. Pinned by
 ## Artifact persistence
 
 Reserve `/artifacts/` structure now so future exploit / pcap / replay
-work drops in without re-deciding paths.
+work drops in without re-deciding paths. Each run directory
+(`runs/<utc-ts>/`, existing from M4.5) gains an `artifacts/` subdir
+alongside `events.jsonl`. Inside it, one subdir per artifact kind, each
+laid out as `<kind>/team{N}/round-{N}/<filename>`.
 
-```
-runs/<utc-ts>/
-├── events.jsonl                   # existing (M4.5)
-└── artifacts/
-    ├── README.md                  # written at game start; documents layout
-    ├── api-logs/                  # ✅ v1: stream-json transcript per agent run
-    │                              #   (every LLM turn: prompt, assistant msg,
-    │                              #    tool_use, tool_result, usage tokens)
-    ├── agent-logs/                # ✅ v1: supervisor diagnostics (stderr, exit_code)
-    │                              #   process-level — distinct from the API trace above
-    ├── service-logs/              # ✅ v1: docker-logs snapshot per round
-    ├── source-snapshots/          # ⬜ reserved (tar of /srv/challenge/<chal>/)
-    ├── binary-diffs/              # ⬜ reserved
-    ├── pcaps/                     # ⬜ reserved
-    ├── exploits/                  # ⬜ reserved
-    └── replay-bundles/            # ⬜ reserved
-```
+Filled in v1:
 
-`gamemgr/artifacts.py` (new):
+- `api-logs/` — Claude CLI's stream-json transcript per agent run (every LLM turn: prompt, assistant message, tool_use, tool_result, usage tokens).
+- `agent-logs/` — supervisor process-level diagnostics (stderr, exit_code). Distinct from `api-logs/` so post-mortems can grep one without the other.
+- `service-logs/` — `docker logs` snapshot per `(team, challenge, round)`.
 
-```python
-class ArtifactKind(str, Enum):
-    API_LOG         = "api-logs"          # LLM stream-json transcript
-    AGENT_LOG       = "agent-logs"        # supervisor stderr / exit_code
-    SERVICE_LOG     = "service-logs"
-    SOURCE_SNAPSHOT = "source-snapshots"
-    BINARY_DIFF     = "binary-diffs"
-    PCAP            = "pcaps"
-    EXPLOIT         = "exploits"
-    REPLAY_BUNDLE   = "replay-bundles"
+Reserved (empty in v1, named so consumers don't re-decide paths later):
 
+- `source-snapshots/` — tar of `/srv/challenge/<chal>/` post-defense
+- `binary-diffs/` — diff vs build-time baseline
+- `pcaps/` — packet captures
+- `exploits/` — attacker's exploit artifact
+- `replay-bundles/` — packaged game-state snapshot for offline replay
 
-class ArtifactStore:
-    def __init__(self, run_dir: Path): ...
+New module `gamemgr/artifacts.py` exports:
 
-    def path_for(self, kind: ArtifactKind, *, team_id: str,
-                 round_id: int, filename: str) -> Path:
-        """runs/<utc-ts>/artifacts/<kind>/team{N}/round-{N}/<filename>.
-        Parents created on demand. Rejects '..' in filename."""
-```
+- **`ArtifactKind` enum** — closed set covering the 8 slots above (`API_LOG`, `AGENT_LOG`, `SERVICE_LOG`, `SOURCE_SNAPSHOT`, `BINARY_DIFF`, `PCAP`, `EXPLOIT`, `REPLAY_BUNDLE`). New artifact type = one enum value, no per-caller path negotiation.
+- **`ArtifactStore`** with `path_for(kind, *, team_id, round_id, filename) → Path`. Returns the stable path under `runs/<ts>/artifacts/<kind>/team{N}/round-{N}/<filename>`. Creates parent dirs lazily. Rejects `..` in filename (no escape outside `run_dir/artifacts/`).
 
 **v1 callers** (3; rest reserved):
 - `ClaudeAgentManager.fetch_logs()` at end of each phase → split:
@@ -332,51 +260,12 @@ strip `Authorization` / `x-api-key` headers before writing into `api-logs/`.
 
 ## Config
 
-```yaml
-# config/game.yaml
-challenge_sources:
-  - source: notes              # built-in
-  - source: nautilus
-    repo_ref: vendor/nautilus-finals-2025
-    include: [ico]             # add more here later
+`config/game.yaml` grows two sections:
 
-challenges:
-  - name: notes
-    source: notes
-    deploy_on: [team1, team2]
-  - name: nautilus-ico
-    source: nautilus
-    deploy_on: [team1, team2]
-```
+- **`challenge_sources:`** — list of source declarations. Each entry has `source:` (matches a `ChallengeSource` subclass key, e.g. `notes` or `nautilus`). Nautilus-typed entries additionally take `repo_ref:` (vendor path) and `include:` (list of upstream challenge dir names to enable; v1 → `[ico]`).
+- **`challenges:`** — list of game-level challenge declarations. Each entry has `name:` (referenced elsewhere), `source:` (must match an entry in `challenge_sources`), and `deploy_on:` (list of team ids, e.g. `[team1, team2]`).
 
----
-
-## Module map (new files)
-
-```
-challenges/
-  source.py             # ChallengeSource, ChallengeSpec, FlagMechanism, HealthLevel
-  nautilus.py           # NautilusSource + image build
-  nautilus/ico/
-    Dockerfile          # single-stage, keeps fpc in runtime
-    spec.toml
-    restart.sh
-    checker.sh          # lifts the nautilus poller; root-owned at /arena/checker.sh
-  notes.py              # refactored: implements ChallengeSource
-  registry.py           # rewired to ChallengeSource-list discovery
-
-gamemgr/
-  artifacts.py          # ArtifactStore + ArtifactKind
-
-scripts/
-  sync_nautilus.sh      # git clone + checkout pinned SHA
-
-vendor/                 # gitignored
-  nautilus-finals-2025/
-
-agents/
-  prompts.py            # adds build_defense_prompt(cfg, spec)
-```
+v1 yaml declares: the built-in `notes` source + nautilus source with `include: [ico]`; two challenges (`notes` and `nautilus-ico`), both deployed on `team1` and `team2`.
 
 ---
 
@@ -417,19 +306,12 @@ agents/
 
 ## Verification
 
-```bash
-$ pytest tests/test_dcf_source_contract.py -v            # 2 backends, same body
-$ pytest tests/test_dcf_nautilus_ico.py -v -s            # docker required
-$ pytest tests/test_dcf_restart_tool.py -v               # no docker
-$ pytest tests/test_dcf_filesystem_isolation.py -v -s    # docker required
-$ pytest tests/test_dcf_network_isolation.py -v -s       # docker required
-$ pytest tests/test_dcf_artifact_store.py -v             # no docker
-$ pytest tests/test_dcf_user_perms.py -v -s              # docker required
-$ pytest tests/test_dcf_health_levels.py -v -s           # docker required
-$ pytest tests/test_dcf_round_loop_defense_phase.py -v   # no docker
-$ pytest tests/test_dcf_defense_workflow.py -v -s        # live, env-gated
-$ pytest tests/                                          # full regression
-```
+Test files to run (per task list, grouped by infra need):
+
+- **No docker required**: `test_dcf_source_contract` (parametrized over `notes` + `nautilus-ico`), `test_dcf_restart_tool`, `test_dcf_artifact_store`, `test_dcf_round_loop_defense_phase`.
+- **Docker required**: `test_dcf_nautilus_ico`, `test_dcf_filesystem_isolation`, `test_dcf_network_isolation`, `test_dcf_user_perms`, `test_dcf_health_levels`.
+- **Live, env-gated** (needs real Claude API key): `test_dcf_defense_workflow`.
+- **Full regression**: the entire `tests/` suite — existing 60+ tests must stay green.
 
 Pass criteria (each maps to a test):
 
