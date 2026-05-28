@@ -323,11 +323,20 @@ class ClaudeAgentManager(AgentManager):
         # AND process-group leader. We capture $BASHPID (the leader's pid) and
         # use it as the killpg target later.
         cli = cfg.cli
+        # Pass cfg.model to the CLI as `--model <name>` so it doesn't
+        # silently default to a built-in version the API router may not
+        # have access to. Without this, the model the CLI requests
+        # diverges from game.yaml and surfaces as 503 server_error
+        # (model_not_found) + a long chain of api_retry events in the
+        # stream-json log. Skip when the caller already wrote --model
+        # into cfg.cli themselves.
+        if cfg.model and cfg.cli.startswith("claude") and "--model" not in cfg.cli:
+            cli = f"{cli} --model {shlex.quote(cfg.model)}"
         # M4.5: add --mcp-config only when MCP is enabled for this agent.
         # Goes on the cli command line, not as an env var, because Claude
         # Code expects this as a flag.
         if cfg.mcp_endpoint and cfg.cli.startswith("claude"):
-            cli = f"{cfg.cli} --mcp-config {MCP_CONFIG_PATH}"
+            cli = f"{cli} --mcp-config {MCP_CONFIG_PATH}"
         script = f"""
 set -e
 nohup setsid bash -c '
