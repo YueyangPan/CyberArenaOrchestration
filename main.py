@@ -9,13 +9,21 @@ import signal
 import sys
 from pathlib import Path
 
+import docker
 import uvicorn
 
+from agents.claude import ClaudeAgentManager
+from agents.transport_docker import DockerExecBackend
 from gamemgr.api import build_app
+from gamemgr.artifacts import ArtifactKind
 from gamemgr.config import load as load_game_config
+from gamemgr.events import EventType, new_event
 from gamemgr.game_mgr import GameMgr
+from models.agent import AgentConfig
 from orchestrator import topology
 from orchestrator.orchestrator import Orchestrator
+
+log = logging.getLogger("main")
 
 DEFAULT_CONFIG = Path(__file__).parent / "config" / "game.yaml"
 
@@ -35,6 +43,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.command == "setup":
+        # Build every challenge image the config references before
+        # container create — otherwise Orchestrator.setup() will try to
+        # docker-pull the unpublished local tag and fail.
+        _build_challenge_images(args.config)
         graph = topology.load(args.config)
         Orchestrator(graph=graph).setup()
         return 0
@@ -52,12 +64,21 @@ def main(argv: list[str] | None = None) -> int:
 
 async def _run_start(args) -> int:
     cfg = load_game_config(args.config)
+    # Build challenge images before Orchestrator.setup() — same reason
+    # as the `setup` subcommand path.
+    _build_challenge_images(args.config)
     orch = Orchestrator(graph=cfg.topology)
     orch.setup()
 
     game = GameMgr(config=cfg, orchestrator=orch)
     game.deploy_challenges()
     game.plant_initial_flags()
+
+    # Persistent-memory v1: install once pre-loop, run_phase per phase.
+    # Wires install + defense/attack kickoff handlers on game; the
+    # install handler runs inside game.start() (after FileSink is up)
+    # via game.install_all_agents().
+    _wire_phase_kickoffs(game)
 
     shutdown = asyncio.Event()
     app = build_app(game, shutdown)
@@ -99,6 +120,160 @@ async def _run_start(args) -> int:
     game.teardown_challenges()
     orch.teardown()
     return 0
+
+
+def _build_challenge_images(config_path: str) -> None:
+    """Build every challenge image referenced by `config_path`.
+
+    Delegates to `challenges.registry.build_all_images` — the registry
+    owns the source set, so adding a new adapter (picoCTF, custom git)
+    only needs one branch there, not here.
+
+    Idempotent: each source's `build_image` skips when the tag is already
+    present locally.
+    """
+    from challenges.registry import build_all_images
+
+    cfg = load_game_config(config_path)
+    tags = build_all_images(cfg)
+    if tags:
+        log.info("built/cached %d challenge image(s): %s", len(tags), tags)
+
+
+def _wire_phase_kickoffs(game: GameMgr) -> None:
+    """Wire ClaudeAgentManager into GameMgr for persistent-memory v1:
+
+    - install handler (called once per team by `game.install_all_agents()`
+      from inside start(), before the round loop ticks).
+    - defense + attack kickoff handlers (called per (team, phase) by the
+      round loop; each one awaits a single `run_phase` via the transport
+      and emits AGENT_PROMPT_SENT / AGENT_COMPLETED / AGENT_TIMEOUT /
+      AGENT_FAILED on the bus).
+
+    One transport, one manager — state lives in the agent container and
+    in Claude CLI's session store, not in the manager.
+    """
+    client = docker.from_env()
+    backend = DockerExecBackend(client=client)
+    agent_mgr = ClaudeAgentManager(transport=backend, client=client)
+
+    # ── install handler (pre-loop) ─────────────────────────────────────
+    async def install_handler(team_id: str, cfg: AgentConfig) -> None:
+        team = next((t for t in game.config.topology.teams if t.id == team_id), None)
+        if team is None or not team.dev:
+            log.warning("install: team %s has no dev container; skipping", team_id)
+            return
+        try:
+            handle = game._handle_for(team.dev)
+        except Exception:
+            log.exception("install: cannot resolve dev handle for %s", team_id)
+            return
+        loop = asyncio.get_running_loop()
+        def _on_installed(tid: str) -> None:
+            asyncio.run_coroutine_threadsafe(game.record_agent_installed(tid), loop)
+        def _on_launched(tid: str, wrapper_pid: int) -> None:
+            asyncio.run_coroutine_threadsafe(
+                game.record_agent_launched(tid, wrapper_pid), loop
+            )
+        await loop.run_in_executor(
+            None,
+            lambda: agent_mgr.install(
+                handle, cfg,
+                on_installed=_on_installed, on_launched=_on_launched,
+            ),
+        )
+        log.info("agent installed on %s", team.dev)
+
+    game.register_install_agent_handler(install_handler)
+
+    # ── per-phase kickoff handler ──────────────────────────────────────
+    def _make_phase_handler(timeout_secs: float):
+        async def handler(
+            team_id: str,
+            cfg: AgentConfig,
+            round_id: int,
+            phase: str,
+            is_first: bool,
+        ) -> None:
+            team = next((t for t in game.config.topology.teams if t.id == team_id), None)
+            if team is None or not team.dev:
+                log.warning("%s kickoff: team %s has no dev container; skipping", phase, team_id)
+                return
+            try:
+                handle = game._handle_for(team.dev)
+            except Exception:
+                log.exception("%s kickoff: cannot resolve dev handle for %s", phase, team_id)
+                return
+
+            prompt = cfg.system_prompt or ""
+            await game.bus.publish(new_event(
+                EventType.AGENT_PROMPT_SENT,
+                team_id=team_id, round_id=round_id, phase=phase,
+                payload={
+                    "prompt_first_line": (prompt.splitlines()[0] if prompt else ""),
+                    "is_first": is_first,
+                },
+            ))
+
+            artifact_dir = None
+            if game.artifacts is not None:
+                # path_for returns runs/<ts>/artifacts/<team>/round-<N>/<file>.
+                # run_phase writes 3 sibling files in that dir; .parent IS
+                # the dir we want.
+                artifact_dir = game.artifacts.path_for(
+                    ArtifactKind.API_LOG,
+                    team_id=team_id, round_id=round_id,
+                    filename=f"stream-{phase}.jsonl",
+                ).parent
+
+            try:
+                done = await agent_mgr.run_phase(
+                    handle, prompt,
+                    round_id=round_id, phase=phase,
+                    timeout=timeout_secs,
+                    artifact_dir=artifact_dir,
+                    model=cfg.model or None,
+                )
+            except Exception as e:
+                log.exception("%s kickoff: run_phase raised for %s", phase, team_id)
+                await game.bus.publish(new_event(
+                    EventType.AGENT_FAILED,
+                    team_id=team_id, round_id=round_id, phase=phase,
+                    payload={"error": f"{type(e).__name__}: {e}"[:200]},
+                ))
+                return
+
+            payload = {
+                "exit_code": done.exit_code,
+                "duration_ms": done.duration_ms,
+                "started_at": done.started_at,
+                "ended_at": done.ended_at,
+            }
+            if done.timed_out:
+                event_type = EventType.AGENT_TIMEOUT
+            elif done.exit_code == 0:
+                event_type = EventType.AGENT_COMPLETED
+            else:
+                event_type = EventType.AGENT_FAILED
+                payload["error_excerpt"] = f"non-zero exit {done.exit_code}"
+            await game.bus.publish(new_event(
+                event_type,
+                team_id=team_id, round_id=round_id, phase=phase,
+                payload=payload,
+            ))
+        return handler
+
+    game.register_defense_kickoff_handler(
+        _make_phase_handler(game.config.rounds.defense_secs)
+    )
+    game.register_attack_kickoff_handler(
+        _make_phase_handler(game.config.rounds.attack_secs)
+    )
+    # Service-logs (docker logs) still go through GameMgr's _persist_service_logs
+    # at ROUND_STOP. Agent stdout/stderr/exit_code now flow directly from
+    # run_phase into the artifact_dir, so we deliberately do NOT register
+    # a fetch_agent_logs_handler — that path is legacy (M4-era supervisor)
+    # and would overwrite the per-phase artifacts with empty content.
 
 
 if __name__ == "__main__":

@@ -42,6 +42,32 @@ class EventType(str, Enum):
     # {level, passed, detail}. Catches "hollow patch" cheese paths where
     # lower levels pass but CHECKER (the lifted upstream poller) fails.
     SERVICE_HEALTH_CHECK = "SERVICE_HEALTH_CHECK"
+    # DEFCON defense kickoff — emitted once per (team, service) on
+    # PHASE_CHANGE → DEFENSE entry. Signals that a defense agent should
+    # be spawned for that team. The actual `ClaudeAgentManager.install()`
+    # is delegated to a handler registered via
+    # `GameMgr.register_defense_kickoff_handler` so GameMgr doesn't have
+    # to own the agent supervisor (lets the API server / demo / tests
+    # wire whichever manager they need).
+    DEFENSE_KICKOFF = "DEFENSE_KICKOFF"
+    # Mirror of DEFENSE_KICKOFF — emitted once per team on
+    # PHASE_CHANGE → ATTACK entry. One attack agent per team per round
+    # (vs. defense's per-team-per-service) because an attack agent from
+    # M5.6 attacks every opposing team in a single run.
+    ATTACK_KICKOFF = "ATTACK_KICKOFF"
+    # Round loop terminated — fired exactly once at the end of the game,
+    # whether via natural exit (round counter == total_rounds), stop()
+    # signal, or unhandled exception. Payload carries the cause and the
+    # final round / phase the loop exited from.
+    GAME_END = "GAME_END"
+    # Persistent-memory agent (v1): per-phase invocation events fired
+    # by the kickoff handlers around each `ClaudeAgentManager.run_phase`
+    # call. AGENT_INSTALLED already exists; these cover the per-phase
+    # cycle that lives inside the round loop.
+    AGENT_PROMPT_SENT = "AGENT_PROMPT_SENT"
+    AGENT_COMPLETED = "AGENT_COMPLETED"
+    AGENT_TIMEOUT = "AGENT_TIMEOUT"
+    AGENT_FAILED = "AGENT_FAILED"
 
 
 @dataclass(frozen=True)

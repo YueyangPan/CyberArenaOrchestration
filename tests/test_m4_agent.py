@@ -128,90 +128,38 @@ def test_registry_dispatches_sleep_to_claude_manager():
     assert isinstance(mgr, ClaudeAgentManager)
 
 
+@pytest.mark.skip(
+    reason="M4 supervisor lifecycle replaced by persistent-memory v1 model "
+    "(install() no longer launches a supervisor; lifecycle is now covered "
+    "by run_phase per phase — see tests/test_dcf_run_phase.py)"
+)
 def test_install_status_kill_lifecycle(client, dev_handle):
-    mgr = ClaudeAgentManager(client=client)
-    cfg = AgentConfig(cli="sleep 60", model="x", api_key="x", base_url="x")
-
-    try:
-        mgr.install(dev_handle, cfg)
-
-        # pid + wrapper_pid recorded
-        pid = _read_int(client, dev_handle.name, PID_PATH)
-        wrapper_pid = _read_int(client, dev_handle.name, WRAPPER_PID_PATH)
-        assert pid is not None and pid > 1, f"agent.pid not recorded: {pid}"
-        assert wrapper_pid is not None and wrapper_pid > 1, f"wrapper pid not recorded: {wrapper_pid}"
-        assert _read_int(client, dev_handle.name, EXIT_CODE_PATH) is None, "exit_code present too early"
-
-        # status → RUNNING
-        s = mgr.status(dev_handle)
-        assert s.status == AgentStatus.RUNNING, f"expected RUNNING, got {s}"
-        assert s.pid == pid
-
-        # kill — verify the whole process group dies, not just the tracked child
-        mgr.kill(dev_handle)
-        # exit_code file appears once `wait` returns inside the supervisor
-        for _ in range(50):
-            if _read_int(client, dev_handle.name, EXIT_CODE_PATH) is not None:
-                break
-            time.sleep(0.1)
-        assert _read_int(client, dev_handle.name, EXIT_CODE_PATH) is not None, "exit_code never recorded"
-
-        # status → TERMINATED (SIGTERM → exit code 143) or COMPLETED if process
-        # finished cleanly between signal delivery and reaping
-        s2 = mgr.status(dev_handle)
-        assert s2.status in (AgentStatus.TERMINATED, AgentStatus.COMPLETED, AgentStatus.CRASHED), \
-            f"expected post-kill status, got {s2}"
-
-        # The tracked agent process must be gone. (We don't probe the pgid
-        # itself: the supervisor bash exits as a zombie under the container's
-        # PID-1 sleep infinity, which doesn't reap — and a zombie is still
-        # "in" its process group as far as kill -0 -<pgid> is concerned, even
-        # though no real process remains. Checking the agent pid avoids that
-        # noise.)
-        check = None
-        for _ in range(50):
-            check = client.containers.get(dev_handle.name).exec_run(
-                ["sh", "-c", f"kill -0 {pid} 2>/dev/null"]
-            )
-            if check.exit_code != 0:
-                break
-            time.sleep(0.1)
-        assert check is not None and check.exit_code != 0, \
-            f"agent pid {pid} still alive after kill"
-
-        # kill is idempotent — second call should not raise
-        mgr.kill(dev_handle)
-    finally:
-        # Belt-and-suspenders cleanup so a failure mid-test doesn't leave a
-        # background `sleep 60` running in the container.
-        try:
-            mgr.kill(dev_handle)
-        except Exception:
-            pass
+    pass
 
 
 def test_install_is_idempotent(client, dev_handle):
-    """Re-installing should clear stale state and produce a fresh pid."""
+    """Re-installing must not raise. In v1 `install()` is one-shot setup
+    (env, mcp.json, SSH pivot, workdir, npm install) — no supervisor is
+    launched, so the M4-era 'fresh pid each install' assertion is gone.
+    What we still check: install twice succeeds without error, and the
+    written agent.env / workdir / etc. are present after both calls.
+    """
+    from agents.claude import ENV_PATH, WORKDIR
+
     mgr = ClaudeAgentManager(client=client)
     cfg = AgentConfig(cli="sleep 60")
 
-    try:
-        mgr.install(dev_handle, cfg)
-        pid1 = _read_int(client, dev_handle.name, PID_PATH)
+    mgr.install(dev_handle, cfg)
+    # workdir + env file exist after first install
+    rc1, _ = client.containers.get(dev_handle.name).exec_run(["test", "-d", WORKDIR])
+    rc2, _ = client.containers.get(dev_handle.name).exec_run(["test", "-f", ENV_PATH])
+    assert rc1 == 0 and rc2 == 0
 
-        mgr.install(dev_handle, cfg)
-        pid2 = _read_int(client, dev_handle.name, PID_PATH)
-
-        assert pid1 is not None and pid2 is not None
-        assert pid1 != pid2, "second install should launch a fresh process"
-        # First wrapper's group should be gone (killed implicitly by re-install)
-        # — but we don't track wrapper1; the important check is that status is RUNNING now.
-        assert mgr.status(dev_handle).status == AgentStatus.RUNNING
-    finally:
-        try:
-            mgr.kill(dev_handle)
-        except Exception:
-            pass
+    mgr.install(dev_handle, cfg)
+    # still present after second install — idempotent setup
+    rc1, _ = client.containers.get(dev_handle.name).exec_run(["test", "-d", WORKDIR])
+    rc2, _ = client.containers.get(dev_handle.name).exec_run(["test", "-f", ENV_PATH])
+    assert rc1 == 0 and rc2 == 0
 
 
 # ── live smoke test against the real router ────────────────────────────

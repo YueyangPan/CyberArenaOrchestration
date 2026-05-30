@@ -1,17 +1,20 @@
-"""M4.5 — host-emitted AGENT_INSTALLED / AGENT_LAUNCHED ordering.
+"""M4.5 — install() callback wiring.
 
-Pins the two-phase split that makes mid-install failures observable:
-  - prep stage finishes  → on_installed(team_id)  → AGENT_INSTALLED
-  - _launch + _wait_for_pid done → on_launched(...) → AGENT_LAUNCHED
+In the persistent-memory v1 model `install()` is one-shot (no
+supervisor launches). Both callbacks fire from the end of install():
+on_installed first, then on_launched (with wrapper_pid=0, kept for
+M4.5 back-compat). The M4.5 three-event chain semantic — INSTALLED
+present, LAUNCHED absent on partial failure — no longer applies
+because there's no separate launch step.
 
-①happy path: both fire, in order, INSTALLED ts < LAUNCHED ts.
-②fault injection: _launch raises mid-flow → INSTALLED present, LAUNCHED absent.
-   This is the property that lets an operator distinguish "prep blew up"
-   from "launch blew up" without reading logs.
+What we still pin:
+  ①both callbacks fire on the happy path, in declared order.
+  ②if install raises before the callback site, neither fires.
+  ③empty team_id → callbacks skipped (defensive for non-multi-tenant tests).
 
-No docker, no real CLI — ClaudeAgentManager is exercised against a mock
-docker client that satisfies the _exec / _write_file / _read_int calls
-it makes during install().
+No docker, no real CLI — ClaudeAgentManager runs against a mock
+docker client satisfying the small subset of exec_run calls install()
+makes.
 """
 
 from __future__ import annotations
@@ -71,50 +74,50 @@ def _handle(name: str = "team1_dev") -> ContainerHandle:
 
 
 def test_install_emits_installed_then_launched_in_order():
-    """Happy path: both callbacks fire; INSTALLED strictly precedes
-    LAUNCHED in both call order and timestamps."""
+    """Happy path: both callbacks fire from install(), INSTALLED then
+    LAUNCHED. In v1 they fire from the same code path, so timestamps
+    may be very close — we only assert ordering by call sequence, not
+    by wall clock."""
     client = _make_mock_client(pid=4321, wrapper_pid=4320)
     mgr = ClaudeAgentManager(client=client)
     cfg = AgentConfig(cli="sleep 60", team_id="team1")
 
-    fired: list[tuple[str, float, tuple]] = []
+    fired: list[tuple[str, tuple]] = []
 
     def on_installed(team_id):
-        fired.append(("INSTALLED", time.time(), (team_id,)))
-        time.sleep(0.01)  # make ts ordering meaningful even on fast machines
+        fired.append(("INSTALLED", (team_id,)))
 
     def on_launched(team_id, wrapper_pid):
-        fired.append(("LAUNCHED", time.time(), (team_id, wrapper_pid)))
+        fired.append(("LAUNCHED", (team_id, wrapper_pid)))
 
     mgr.install(_handle(), cfg, on_installed=on_installed, on_launched=on_launched)
 
     assert len(fired) == 2, f"expected two callbacks, got: {fired}"
     assert fired[0][0] == "INSTALLED", f"first callback should be INSTALLED, got {fired}"
     assert fired[1][0] == "LAUNCHED", f"second callback should be LAUNCHED, got {fired}"
-    assert fired[0][1] < fired[1][1], (
-        f"INSTALLED ts must be strictly less than LAUNCHED ts; got "
-        f"{fired[0][1]} vs {fired[1][1]}"
-    )
-    assert fired[0][2] == ("team1",)
-    # wrapper_pid is whatever the mock returned for WRAPPER_PID_PATH.
-    assert fired[1][2] == ("team1", 4320)
+    assert fired[0][1] == ("team1",)
+    # v1: wrapper_pid is 0 (no supervisor exists; field preserved for back-compat).
+    assert fired[1][1] == ("team1", 0)
 
 
-def test_install_fault_injection_only_emits_installed():
-    """If _launch blows up between the two checkpoints, INSTALLED is on
-    the bus but LAUNCHED is not — this is the distinguishing signal that
-    drove the three-event design (M4.5 plan §three-event chain)."""
+def test_install_fault_injection_skips_both_callbacks():
+    """If something inside install raises before reaching the callback
+    site, neither callback fires. In v1 there's no INSTALLED-yes-LAUNCHED-
+    no intermediate state to assert anymore — both callbacks live at the
+    very end of install() so failures bail out before either runs.
+    """
     client = _make_mock_client()
     mgr = ClaudeAgentManager(client=client)
     cfg = AgentConfig(cli="sleep 60", team_id="team2")
 
-    def boom(*_args, **_kwargs):
-        raise RuntimeError("simulated launch failure")
+    # Inject failure into _build_env_file — runs before the callback site.
+    def boom(_cfg):
+        raise RuntimeError("simulated install failure")
 
-    mgr._launch = boom  # type: ignore[assignment]
+    mgr._build_env_file = boom  # type: ignore[assignment]
 
     fired: list[str] = []
-    with pytest.raises(RuntimeError, match="simulated launch failure"):
+    with pytest.raises(RuntimeError, match="simulated install failure"):
         mgr.install(
             _handle("team2_dev"),
             cfg,
@@ -122,9 +125,9 @@ def test_install_fault_injection_only_emits_installed():
             on_launched=lambda t, p: fired.append(f"LAUNCHED:{t}:{p}"),
         )
 
-    assert fired == ["INSTALLED:team2"], (
-        "fault path must emit INSTALLED but never LAUNCHED; "
-        f"got: {fired}"
+    assert fired == [], (
+        "install raised before reaching the callback site; neither "
+        f"callback should have fired. got: {fired}"
     )
 
 

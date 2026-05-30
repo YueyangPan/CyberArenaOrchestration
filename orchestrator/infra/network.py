@@ -10,15 +10,25 @@ from models.topology import Network, TopologyGraph
 log = logging.getLogger(__name__)
 
 GAME_NET = "game_net"
+# Nets that are toggled per phase (ATTACK opens / DEFENSE closes). Any
+# network whose name starts with one of these prefixes is treated as
+# cross-team. game_net carries prod ↔ prod traffic; attack_net_<team>
+# carries that team's dev → opposing prod traffic (no dev ↔ dev so
+# dev containers stay isolated from each other).
+_CROSS_TEAM_NET_PREFIXES = ("game_net", "attack_net_")
+
+
+def _is_cross_team(net_name: str) -> bool:
+    return any(net_name == p or net_name.startswith(p) for p in _CROSS_TEAM_NET_PREFIXES)
 
 
 class NetworkManager:
     """Manages docker networks for the arena.
 
-    Owns the cross-team network switch (game_net attach/detach for service
-    containers). Backend is docker network attach/detach for MVP; an
-    iptables backend (Linux optimization, no reconnect interruption) is a
-    future extension that shares this interface.
+    Owns the cross-team network switch (attach/detach for every
+    cross-team net listed below) per phase. Backend is docker network
+    attach/detach for MVP; an iptables backend (Linux optimization, no
+    reconnect interruption) is a future extension sharing this interface.
     """
 
     def __init__(
@@ -27,13 +37,16 @@ class NetworkManager:
         graph: TopologyGraph | None = None,
     ) -> None:
         self._client = client or docker.from_env()
-        # Service containers = nodes attached to game_net (prod containers).
-        # Dev containers are intentionally excluded so they never get touched
-        # by phase switching — see m3_network_plan.md.
+        # Per-network membership: cross_team net name → list of node ids
+        # that should be attached when that net is open. Built from the
+        # static topology so phase switching is purely a state-restore
+        # operation against a known target set.
+        self._cross_team_membership: dict[str, list[str]] = {}
         if graph is not None:
-            self._service_containers = [n.id for n in graph.nodes if GAME_NET in n.networks]
-        else:
-            self._service_containers = []
+            for node in graph.nodes:
+                for net_name in node.networks:
+                    if _is_cross_team(net_name):
+                        self._cross_team_membership.setdefault(net_name, []).append(node.id)
 
     def create(self, network: Network) -> str:
         """Create a docker network. Idempotent — returns existing id if present."""
@@ -66,31 +79,36 @@ class NetworkManager:
         log.info("removed network %s", name)
 
     def set_cross_team_network(self, allow: bool) -> None:
-        """Open or close cross-team game_net for all registered service containers.
+        """Open or close every cross-team network for the registered nodes.
 
-        DEFENSE (allow=False) -> disconnect each service container from game_net.
-        ATTACK  (allow=True)  -> connect each service container back to game_net.
+        DEFENSE (allow=False): disconnect every (container, cross_team_net)
+        pair so the agent can't reach anything off-team while patching.
+        ATTACK  (allow=True):  reconnect each one to its declared nets.
 
-        Idempotent: skips containers that are already in the target state. May
+        Idempotent: skips containers already in the target state. May
         reset existing TCP connections — see m3_network_plan.md.
-        """
-        try:
-            net = self._client.networks.get(GAME_NET)
-        except NotFound:
-            log.warning("set_cross_team_network: %s not found", GAME_NET)
-            return
 
-        for name in self._service_containers:
+        Iterates `_cross_team_membership` so this works for both the
+        original `game_net` (prod↔prod) and any number of per-team
+        `attack_net_<team>` networks (each team's dev → opposing prod).
+        """
+        for net_name, members in self._cross_team_membership.items():
             try:
-                container = self._client.containers.get(name)
+                net = self._client.networks.get(net_name)
             except NotFound:
-                log.warning("set_cross_team_network: container %s not found; skip", name)
+                log.warning("set_cross_team_network: %s not found", net_name)
                 continue
-            container.reload()
-            attached = GAME_NET in container.attrs["NetworkSettings"]["Networks"]
-            if allow and not attached:
-                net.connect(container)
-                log.info("connected %s to %s", name, GAME_NET)
-            elif not allow and attached:
-                net.disconnect(container)
-                log.info("disconnected %s from %s", name, GAME_NET)
+            for name in members:
+                try:
+                    container = self._client.containers.get(name)
+                except NotFound:
+                    log.warning("set_cross_team_network: container %s not found; skip", name)
+                    continue
+                container.reload()
+                attached = net_name in container.attrs["NetworkSettings"]["Networks"]
+                if allow and not attached:
+                    net.connect(container)
+                    log.info("connected %s to %s", name, net_name)
+                elif not allow and attached:
+                    net.disconnect(container)
+                    log.info("disconnected %s from %s", name, net_name)

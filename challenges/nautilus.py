@@ -15,7 +15,6 @@ game.yaml; for v1 it only includes `ico` (see plan §scope).
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import subprocess
 import tempfile
@@ -197,16 +196,36 @@ class NautilusSource(ChallengeSource):
                     shutil.copy2(entry, ctx / entry.name)
             # Copy vendor source under <ctx>/<chal_name>/ — the Dockerfile's
             # `COPY ico/service/` line is relative to the context root.
-            shutil.copytree(vendor_dir, ctx / chal_name)
+            shutil.copytree(vendor_dir, ctx / upstream_name)
 
             log.info("nautilus: building %s (context=%s)", spec.image_tag, ctx)
-            # Stream the build so failures are diagnostic in tests.
-            image, logs = client.images.build(
-                path=str(ctx),
-                tag=spec.image_tag,
-                rm=True,
-                pull=False,
-            )
-            log.info("nautilus: built %s (id=%s)", spec.image_tag, image.short_id)
+            # platform=linux/amd64 enforced because the Pascal toolchain
+            # (ppcx64) only ships an x86_64 backend on Ubuntu — arm64
+            # hosts would otherwise pull arm64 ubuntu and fail at fpc
+            # invocation. QEMU emulation handles cross-arch on the dev mac.
+            #
+            # Shell out to `docker build` instead of docker-py because the
+            # python SDK's legacy builder + platform= combination errors on
+            # post-build image lookup (BuildKit returns a manifest list and
+            # the legacy fetch picks the wrong arch). The CLI uses buildx
+            # under the hood and handles this cleanly.
+            try:
+                subprocess.run(
+                    [
+                        "docker", "build",
+                        "--platform=linux/amd64",
+                        "-t", spec.image_tag,
+                        str(ctx),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(
+                    f"docker build failed for {spec.image_tag}\n"
+                    f"stdout:\n{e.stdout}\nstderr:\n{e.stderr}"
+                ) from e
+            log.info("nautilus: built %s", spec.image_tag)
 
         return spec.image_tag

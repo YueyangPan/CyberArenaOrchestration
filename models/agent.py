@@ -65,3 +65,24 @@ class AgentState:
     pid: int | None = None
     wrapper_pid: int | None = None
     exit_code: int | None = None
+
+
+@dataclass(frozen=True)
+class DoneInfo:
+    """Returned by `ClaudeAgentManager.run_phase`. Mirrors the per-phase
+    `metadata.json` artifact one-to-one — callers can serialize this
+    directly if they want.
+
+    `timed_out=True` means the phase timer expired and the transport
+    terminated/killed the claude subprocess; `exit_code` reflects the
+    signal-exit (usually non-zero) and `stdout`/`stderr` carry whatever
+    was captured up to that point.
+    """
+
+    exit_code: int
+    timed_out: bool
+    started_at: float
+    ended_at: float
+    duration_ms: int
+    stdout_path: str
+    stderr_path: str
