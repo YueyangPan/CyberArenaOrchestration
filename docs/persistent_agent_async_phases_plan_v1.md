@@ -39,13 +39,38 @@ on D1–D6 below. Async mode deferred — design sketched in §Async mode
 
 The persistent agent runs in `claude` interactive (TUI) mode inside a
 detached tmux session living in the team's dev container. Orchestrator
-operates the session via two tmux commands:
+operates the session via tmux commands. Two distinct operations:
 
-| What the orchestrator wants to do | tmux call |
+**Send a prompt** — via paste-buffer (NOT `send-keys "<prompt>"`, which
+shell-quotes the body and corrupts quotes / backslashes / newlines /
+unicode in long prompts):
+
+```sh
+# Orchestrator writes /tmp/agent/prompt.txt inside the container
+tmux load-buffer  -t <session> /tmp/agent/prompt.txt
+tmux paste-buffer -t <session> -p             # -p preserves indentation
+tmux send-keys    -t <session> Enter
+```
+
+`send-keys` is still used for the single `Enter` keypress that submits
+the pasted prompt — that one has no quoting hazard.
+
+**Observe + transcript**:
+
+| What the orchestrator wants | tmux call |
 |---|---|
-| Type a prompt + press Enter | `tmux send-keys -t <session> "<prompt>" Enter` |
-| Read the current visible pane (for sentinel polling) | `tmux capture-pane -t <session> -p -S -<lines>` |
-| Append-only history (for the api-logs artifact) | `tmux pipe-pane -t <session> -O 'cat >> /tmp/agent/transcript.log'` |
+| Read current visible pane (for sentinel polling) | `tmux capture-pane -t <session> -p -S -<lines>` |
+| Capture full output to disk | `tmux pipe-pane -t <session> -O 'tee -a /tmp/agent/transcript.raw.log \| ansifilter >> /tmp/agent/transcript.clean.log'` |
+
+We save **both transcripts**:
+- `transcript.raw.log` — bytes exactly as the TUI emitted them, ANSI
+  + cursor + clear-screen + everything. The forensic ground truth.
+- `transcript.clean.log` — same stream after `ansifilter` (or `sed`)
+  strips ANSI escape codes. The human-readable version that panel /
+  post-mortem code can grep without losing their minds.
+
+`ansifilter` ships in Ubuntu apt; gets added to `cyberarena/dev-base`
+alongside `tmux`.
 
 tmux is chosen because:
 - It's already a battle-tested PTY supervisor — readline / cursor
@@ -60,16 +85,58 @@ tmux is chosen because:
 ┌─ team1_dev container ─────────────────────────────────────────────┐
 │  tmux server                                                      │
 │   └── session "agent"                                             │
-│         └── pane: claude (interactive, --mcp-config /tmp/agent/mcp.json)│
-│              └── PTY → /tmp/agent/transcript.log (via pipe-pane)  │
+│         └── window 0, pane %1                                     │
+│              └── claude (interactive, --mcp-config /tmp/agent/mcp.json)│
+│                   └── PTY → pipe-pane → tee + ansifilter          │
+│                                          ↓              ↓         │
+│                                  transcript.raw   transcript.clean│
 │                                                                   │
 │  /tmp/agent/                                                      │
-│    prompt.txt              ← latest phase prompt (sentinel-tagged)│
-│    transcript.log          ← full TUI output stream               │
+│    prompt.txt              ← latest phase prompt body             │
+│    handle.json             ← {tmux_server_pid, claude_pid,        │
+│                              session_name, pane_id, sentinel}     │
+│    transcript.raw.log      ← raw ANSI bytes from pipe-pane        │
+│    transcript.clean.log    ← ansifilter-cleaned, human-readable   │
 │    mcp.json                ← MCP tools (unchanged from M4.5)      │
 │    agent.env               ← API key, base url, IS_SANDBOX        │
 └───────────────────────────────────────────────────────────────────┘
 ```
+
+### `handle.json` — what we track per team agent
+
+Single source of truth for "where is this team's agent?". Written
+once at install, read by every later operation (send_prompt, kill,
+status, debug). Format:
+
+```json
+{
+  "tmux_server_pid": 1842,
+  "claude_pid":      1856,
+  "session_name":    "agent",
+  "pane_id":         "%1",
+  "sentinel":        "[[CYBERARENA_TURN_DONE_a3f7e1]]",
+  "container":       "team1_dev",
+  "started_at_ts":   1780012345.6
+}
+```
+
+Why each field:
+
+- **`tmux_server_pid`** — kill -SIGTERM on game end (cleans up all
+  sessions for this container at once).
+- **`claude_pid`** — debug visibility: which child is the actual LLM
+  process? `tmux list-panes -F` exposes this at install time. If the
+  CLI crashes mid-game, this is the pid that disappears even though
+  tmux server stays up — operators want to know.
+- **`session_name`** + **`pane_id`** — targets for all subsequent
+  tmux calls. Pane id is the stable identifier even if windows get
+  renamed; we use `-t <session>:<window>.<pane_id>` form.
+- **`sentinel`** — per-session unique fallback marker, embedded in
+  every prompt's boilerplate footer. Persisted so the polling loop
+  doesn't have to re-derive it.
+
+Without all of these, "kill the agent cleanly" or "is this team's
+agent still alive?" become guess-and-check operations.
 
 ---
 
@@ -112,9 +179,9 @@ tmux is chosen because:
 
 | Stage | Action |
 |---|---|
-| Game start (first phase entry per team) | `install()` runs ONCE: npm + SSH pivot + mcp.json + start tmux session running `claude --mcp-config ...` (interactive). PID = the tmux server's PID; tracked in `/tmp/agent/tmux.pid`. |
-| Each subsequent phase | NO install. orchestrator: write prompt file + `tmux send-keys` + poll for sentinel. |
-| Game end (GAME_END event) | `tmux kill-session -t agent` for every team. |
+| Game start (first phase entry per team) | `install()` runs ONCE: npm + SSH pivot + mcp.json + start tmux session running `claude --mcp-config ...` (interactive). Write `/tmp/agent/handle.json` with `{tmux_server_pid, claude_pid, session_name, pane_id, sentinel, container, started_at_ts}` — single source of truth read by every later op. |
+| Each subsequent phase | NO install. orchestrator: write `/tmp/agent/prompt.txt` → `tmux load-buffer` + `paste-buffer` + `send-keys Enter` → await `turn_done` MCP tool resolution (race with sentinel polling). |
+| Game end (GAME_END event) | `tmux kill-session -t <session>` for every team using the names from each team's `handle.json`. |
 
 ### What changes in code
 
@@ -301,7 +368,7 @@ them via MCP is a thin shim.
 ## Plan of attack (if approved)
 
 1. Doc this plan (← you're reading it).
-2. Add `tmux` to `cyberarena/dev-base` Dockerfile + rebuild.
+2. Add `tmux` + `ansifilter` to `cyberarena/dev-base` Dockerfile + rebuild.
 3. Land sync mode end-to-end:
    - `agents/claude.py` — TUI mode + send_prompt + await_turn_done
    - `AgentConfig.mode`
@@ -325,6 +392,6 @@ Estimate: sync mode ~150 LOC + 3 tests.
 | D1 | tmux vs raw PTY vs Claude-Agent-SDK to drive the TUI? | **tmux** — robust, inspectable, no new Python deps in the orchestrator. |
 | D2 | Turn-done detection? | **MCP tool primary + sentinel fallback** — `mcp__cyberarena__turn_done(reason)` is the deterministic signal; sentinel `[[CYBERARENA_TURN_DONE_<hex>]]` covers the case the agent forgets the tool call. Whichever fires first wins, second is deduped. (Sentinel-only was the original v1; demoted after user flagged false-positive risk.) |
 | D3 | Replace headless `-p` mode entirely, or coexist? | **Coexist** — `mode: headless` stays for tests + smoke; `mode: tui` is the new game default. |
-| D4 | What happens to per-phase `stream-{phase}.jsonl`? | **Replace** with `transcript-{phase}.log` (raw ANSI bytes captured via `tmux pipe-pane`). Optional ANSI-strip in post-processing. |
+| D4 | What happens to per-phase `stream-{phase}.jsonl`? | **Replace** with a per-game (not per-phase) dual transcript: `transcript.raw.log` (raw bytes from `tmux pipe-pane`, ground truth) + `transcript.clean.log` (same stream after `ansifilter`, grep-friendly). The artifact-persistence subscriber at end-of-phase copies the relevant slice (`transcript.clean.log` byte-range from prior cursor to now) into `runs/<ts>/artifacts/team{N}/round-{N}/transcript-{phase}.log`. Raw stays in the dev container for debug. |
 | D5 | Should the persistent agent see BOTH defense and attack prompts in one conversation, or two separate sessions per team? | **One session** — matches the "single operator" model from the `cyber-arena-orchestration/src/prompts/team.py` reference; defense knowledge informs attack and vice versa. |
 | D6 | Per-phase prompts: long-briefing first / short-task after, or always-short with a one-time setup-message at game start? | **Always-short with one-time setup at game start** — sync mode literally sends ONE setup message at agent install (operator-role briefing, topology, MCP tools, ico protocol, discipline rules), then every phase sends a 2–3 line task. Avoids special-casing "is this team's first prompt". |
