@@ -18,6 +18,26 @@ verified). Defense and attack share one conversation.
 **No tmux. No PTY. No screen scraping.** Turn completion = process
 exit.
 
+### Key architectural idea
+
+> **The persistent component is the Runner, not Claude.**
+>
+> Claude remains a short-lived process — one invocation per phase.
+> Memory persistence comes from Claude CLI's session store accessed
+> via `--continue`, not from a long-running Claude process.
+
+> **Assumption — Claude CLI session selection is cwd-scoped.**
+>
+> `--continue` resumes the most-recent session under
+> `/root/.claude/projects/<cwd-encoded>/`. We exploit this by pinning
+> every claude invocation to `/tmp/agent/workdir/` so only this arena's
+> sessions are visible.
+>
+> If a future Claude release changes this behavior, the runner will
+> need to persist and resume an explicit session id (`claude --resume
+> <id>`) instead of relying on `--continue`. The dedicated `workdir/`
+> exists for this reason — keep it.
+
 ## Non-goals
 
 - Single long-lived Claude process. Each phase is a fresh `claude -p
@@ -72,7 +92,8 @@ conversation.
 | 3 | Write `/tmp/agent/{mcp.json, agent.env, runner.py}` (runner.py is copied from `agents/runner.py` in the repo) |
 | 4 | `mkdir -p /tmp/agent/workdir` (claude's isolated cwd — `--continue` resumes only this arena's sessions) |
 | 5 | `nohup setsid python3 /tmp/agent/runner.py </dev/null >runner.stdout 2>runner.stderr &` |
-| 6 | Wait for `/tmp/agent/runner.pid` to appear; record it |
+| 6 | Wait for `/tmp/agent/runner.ready` to appear (NOT just `runner.pid` — the runner could crash between writing pid and entering the main loop). `runner.ready` is written only after signal handlers are installed, state dir is validated, and the cue-wait loop is entered. |
+| 7 | Read `runner.pid` (now guaranteed valid since `runner.ready` is past it). Emit `AGENT_LAUNCHED` with `wrapper_pid`. |
 
 ### 2. Each phase — manager does two things
 
@@ -137,15 +158,24 @@ class ClaudeAgentRunner:
         self.env_file = self.S / "agent.env"
         self.mcp      = self.S / "mcp.json"
         self.runner_pid    = self.S / "runner.pid"
+        self.runner_ready  = self.S / "runner.ready"
         self.claude_pid    = self.S / "current_claude.pid"
         self.transcript    = self.S / "transcript.log"
 
     # ── public ─────────────────────────────────────────────────────
 
     def run_forever(self) -> int:
+        # Order matters: pid → handlers → ready. If the runner crashes
+        # between any of these, the manager's `runner.ready` wait will
+        # time out instead of getting a false-positive on a stale pid.
+        self.runner_pid.write_text(str(os.getpid()))
         signal.signal(signal.SIGTERM, lambda *_: self._exit())
         signal.signal(signal.SIGINT,  lambda *_: self._exit())
-        self.runner_pid.write_text(str(os.getpid()))
+        if not self.S.exists():
+            sys.stderr.write(f"runner: state dir {self.S} missing\n")
+            return 1
+        # Heartbeat: signal handlers installed + state dir validated.
+        self.runner_ready.write_text(str(os.getpid()))
         while True:
             self._wait_for_cue()
             self._run_one_cycle()
@@ -185,6 +215,14 @@ class ClaudeAgentRunner:
         tmp.replace(path)
 
     def _run_one_cycle(self) -> None:
+        # Drop any stale `kill` left over from a prior phase. A timeout
+        # in phase A can race Claude's natural exit — manager writes
+        # `kill` just as Claude exits cleanly. The file would then sit
+        # there until the NEXT phase's cycle started, killing a fresh
+        # Claude immediately. Clearing at cycle-start makes `kill`
+        # strictly "abort the CURRENT invocation".
+        self.kill.unlink(missing_ok=True)
+
         if not self.context.exists():
             sys.stderr.write("runner: cue without phase_context.json\n")
             time.sleep(1)
@@ -212,15 +250,20 @@ class ClaudeAgentRunner:
                 stdin=inp, stdout=out, stderr=err, cwd=str(self.workdir),
             )
             self.claude_pid.write_text(str(proc.pid))
-            while proc.poll() is None:
-                if self.kill.exists():
-                    self.kill.unlink(missing_ok=True)
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                time.sleep(0.5)
+            try:
+                while proc.poll() is None:
+                    if self.kill.exists():
+                        self.kill.unlink(missing_ok=True)
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                    time.sleep(0.5)
+            finally:
+                # Stale pid file points at a dead process and confuses
+                # debug; clear it as soon as the process has gone.
+                self.claude_pid.unlink(missing_ok=True)
 
         ended = time.time()
         with open(self.transcript, "ab") as t, open(stdout_p, "rb") as src:
@@ -257,6 +300,7 @@ All inside the team's dev container, under `/tmp/agent/`.
 |---|---|---|
 | `runner.py`, `agent.env`, `mcp.json` | static | install once; gone at teardown |
 | `runner.pid` | runner → manager | written at runner boot; manager `kill -0`s for liveness |
+| `runner.ready` | runner → manager | written AFTER pid + signal handlers + state-dir validation, BEFORE entering the cue loop. Manager waits on this (not `runner.pid`) during install to avoid a race where the runner crashes mid-boot. |
 | `workdir/` | static dir | claude's isolated cwd for `--continue` session selection |
 | `prompt.txt` | manager → runner | overwritten each phase |
 | `phase_context.json` | manager → runner | overwritten each phase; `{round_id, phase}` |
@@ -264,7 +308,7 @@ All inside the team's dev container, under `/tmp/agent/`.
 | `done.round{N}.{phase}.json` | runner → manager | one per phase, atomic write; consumed by `wait_for_done` |
 | `stdout.round{N}.{phase}.log`, `stderr...` | claude → fs | per-phase, named so the next phase can't clobber |
 | `transcript.log` | runner appends | cumulative per-phase stdout for replay |
-| `kill` | manager → runner | timeout abort signal |
+| `kill` | manager → runner | timeout abort signal for the CURRENT phase. Runner clears it at the start of every cycle so a stale file (e.g. manager wrote `kill` just as Claude exited cleanly) can't kill the next phase's fresh Claude. |
 | `shutdown` | manager → runner | game-end exit signal |
 | `current_claude.pid` | runner → fs | debug only |
 
@@ -361,7 +405,9 @@ Manager                              Runner
    │  → proceed without this agent     │
 ```
 
-The kill file (if dropped) just lingers harmlessly; nobody consumes it.
+A kill file dropped against a dead runner just sits there with no
+reader. (And even against a live runner, stale kill files are
+defused — the runner clears `kill` at the start of every `_run_one_cycle`.)
 
 ### Responsibility split
 
@@ -421,6 +467,8 @@ New (per-phase):
 | `--continue` resumes wrong session | Dedicated `workdir/` cwd isolates sessions to this arena's run. |
 | `done.json` partial-read race | Atomic `tmp → mv` write inside runner. |
 | `cue` arrives mid-phase | Cannot — `wait_for_done` blocks before next `send_prompt`. |
+| Stale `kill` file racing Claude's natural exit | Runner clears `kill` at the start of every `_run_one_cycle`, so a file left over from a prior phase can't kill the next phase's fresh Claude. |
+| Runner boot races (pid written but main loop never reached) | Manager waits for `runner.ready` (written after signal handlers + state-dir validation, before the cue loop) — not just `runner.pid`. |
 | Conversation tokens grow unbounded | Deferred. Options: `--fork-session` at round boundary, compress-history MCP tool. |
 | Mid-game runner recovery | Deferred. v1 lets a dead runner sit out the rest of the game. |
 
