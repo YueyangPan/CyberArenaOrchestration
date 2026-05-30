@@ -295,15 +295,16 @@ New (per-phase):
 | File | Change |
 |---|---|
 | `agents/runner.py` (new) | `ClaudeAgentRunner` class (the in-container daemon). Copied into the container by `install()`. |
-| `agents/claude.py` | `ClaudeAgentManager.install()` becomes one-shot per team: writes runner.py + env + mcp.json + starts the daemon. New methods: `send_prompt(handle, text, round_id, phase)`, `await wait_for_done(handle, round_id, phase, timeout) → DoneInfo`. The existing `_launch` path retires for `mode=persistent`. |
-| `models/agent.py` | `AgentConfig.mode: Literal["headless", "persistent"] = "headless"`. New `DoneInfo` dataclass mirroring the `done.json` payload. |
-| `gamemgr/game_mgr.py` | Once-per-game install hook before round loop. Kickoff handlers do `send_prompt + wait_for_done`, not `install`. Track first-prompt-per-team in `_agent_briefed: set[str]` so the long briefing only goes out once. |
+| `agents/claude.py` | `ClaudeAgentManager.install()` rewritten as **one-shot per team**: writes runner.py + env + mcp.json + starts the daemon, captures `runner.pid`, fires `AGENT_INSTALLED` + `AGENT_LAUNCHED`. Existing `_launch` (one-shot CLI per call) retires. New methods: `send_prompt(handle, text, round_id, phase)`, `await wait_for_done(handle, round_id, phase, timeout) → DoneInfo`, `kill(handle)`. |
+| `models/agent.py` | New `DoneInfo` dataclass mirroring the `done.json` payload. No `AgentConfig.mode` field needed — there is only one model. |
+| `gamemgr/game_mgr.py` | New once-per-game pre-loop hook that installs every team's runner before round 1 begins (parallel via `asyncio.gather`). Kickoff handlers stop calling `install`; they do `send_prompt + wait_for_done`. Track first-prompt-per-team in `_agent_briefed: set[str]` so the long briefing only goes out once. |
 | `gamemgr/events.py` | Add `AGENT_PROMPT_SENT`, `AGENT_COMPLETED`, `AGENT_TIMEOUT`, `AGENT_RUNNER_DEAD`. |
 | `agents/prompts/*` | First-phase prompt = full briefing + first task. Subsequent prompts = 2–3 lines. |
-| `config/game_ico.yaml` | `agent.mode: persistent` per team. |
 | `panel/panel.html` | Render new event chips. |
-| `main.py` | `_wire_defense_kickoff` → `_wire_phase_kickoffs`. |
-| `tests/test_dcf_persistent_runner.py` (new) | Unit-test `ClaudeAgentRunner` helpers with mocked subprocess; one docker-gated live test running install → send_prompt → wait_for_done end-to-end. |
+| `main.py` | `_wire_defense_kickoff` → `_wire_phase_kickoffs` (no longer calls `install`; that runs once in the new pre-loop hook). |
+| `tests/test_dcf_persistent_runner.py` (new) | Unit-test `ClaudeAgentRunner` helpers with mocked `subprocess.Popen` + paths under `tmp_path`. One docker-gated live test running install → send_prompt → wait_for_done end-to-end. |
+
+**Existing tests** (`test_m4_agent.py`, `test_m4_5_install_emits.py`, `test_m5_6_agent_attack.py`) each call `install()` once in isolation, so they don't need changes — `install()`'s shape (params, callbacks, side-effects) is preserved; only its *internals* (start the runner instead of launching one-shot Claude) change. We re-run the suite to confirm; any test that turns out to assume one-shot-CLI semantics gets updated as part of the implementation PR.
 
 **Estimate**: ~150 LOC + 5 tests.
 
@@ -340,7 +341,7 @@ Constraints v1 honors so async stays reachable:
 | # | Decision | Default |
 |---|---|---|
 | D1 | Runner language? | **Python** — testable, `subprocess` is first-class for process management, `json` module for safe serialization, no quoting hazards. Python 3 already in dev-base. |
-| D2 | Headless `-p` mode coexists or removed? | **Coexist** — `mode: headless` stays for M4/M5/M5.6/M4.5 tests; `mode: persistent` is the new game default. |
+| D2 | Coexist vs replace? | **Fully replace.** `claude -p --continue` IS headless mode; "persistent" just means we install once per team and drive per-phase work via the runner's cue/done protocol instead of re-running install per phase. No mode flag — there's only one model. Existing M4/M4.5/M5.6 tests stay valid since they each call `install()` once in isolation; the kickoff handler in `main.py` is the one place that called install per-phase, and that gets replaced with `send_prompt + wait_for_done`. |
 | D3 | Per-phase artifacts copied to `runs/<ts>/artifacts/team{N}/round-{N}/`? | The per-phase `stdout.log` + `stderr.log` directly (already named per round+phase). |
 | D4 | One session per team, or separate defense/attack sessions? | **One session** — operator-role model; defense knowledge informs attack. |
 | D5 | First-phase prompt = briefing + first task, or briefing only at install + task only per phase? | **Combined in first phase** — avoids an extra empty-task call at install. |
