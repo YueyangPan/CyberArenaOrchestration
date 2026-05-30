@@ -120,7 +120,8 @@ tmux is chosen because:
 
 | File | Change |
 |---|---|
-| `agents/claude.py` | New mode: `tui` (vs the current `headless`). `install()` branches: tui → start tmux session running interactive `claude` with `--mcp-config`. New methods: `send_prompt(handle, prompt) → None`, `await_turn_done(handle, timeout_secs) → bool`. |
+| `agents/claude.py` | New mode: `tui` (vs the current `headless`). `install()` branches: tui → start tmux session running interactive `claude` with `--mcp-config`. New methods: `send_prompt(handle, prompt) → None`, `await_turn_done(handle, team_id, round_id, phase, timeout_secs) → bool`. The await races MCP-tool resolution against capture-pane sentinel polling. |
+| `gamemgr/mcp_server.py` | New tool `turn_done(reason)` resolves a per-`(team, round, phase)` future tracked on GameMgr. Idempotent — second call is a no-op. |
 | `models/agent.py` | `AgentConfig.mode: Literal["headless", "tui"] = "headless"` |
 | `config/game_ico.yaml` | `agent.mode: tui` per team |
 | `gamemgr/game_mgr.py` | Kickoff handlers call `agent_mgr.send_prompt(...)` + `await agent_mgr.await_turn_done(...)` instead of `install()`. Game start gets a new pre-loop step: install every team's tmux+claude once. |
@@ -129,33 +130,70 @@ tmux is chosen because:
 | `panel/panel.html` | Render the new events as chips. |
 | `tests/test_dcf_tui_agent.py` | New: stub tmux via shutil.which check + mocked subprocess; verify send_prompt + await_turn_done; one live test gated on docker. |
 
-### Sentinel design
+### Turn completion: MCP tool (primary), sentinel (fallback)
 
-The sentinel `[[TURN_DONE]]` is appended to every phase prompt as a
-boilerplate footer:
+#### Primary: `mcp__cyberarena__turn_done()` MCP tool
 
-> When you have completed the work for this phase (whether by success,
-> giving up, or running out of ideas), print exactly the line
-> `[[TURN_DONE]]` on its own line and stop. Do NOT print this string
-> before you actually intend to finish.
+New tool in `gamemgr/mcp_server.py`, parallel to the existing
+`report_deploy_complete`. The agent calls it once when it finishes
+the current phase's work.
 
-Polling: `tmux capture-pane -p -S -200 | grep -F "[[TURN_DONE]]"`.
+```
+Tool: mcp__cyberarena__turn_done
+Args: { reason: "completed" | "stuck" | "no_progress" }
+Returns: { ok: true }
+```
 
-False-positive risk: if the agent quotes the sentinel in its thinking,
-we'd mark turn done early. Mitigation: pick a long random-ish sentinel
-not a generic phrase. `[[CYBERARENA_TURN_DONE_a3f7e1]]` per session.
+Emits a `AGENT_TURN_DONE` event on the bus with `{team_id, round_id,
+phase, reason}`. The kickoff handler awaits a future that this event
+resolves.
 
-False-negative risk: agent never emits the sentinel; we hit the
-timeout. Same as today's "agent didn't finish in 180s" — graceful.
+Why MCP-primary:
+- **Deterministic**: explicit tool call vs. screen scraping. No
+  false-positive from the agent quoting a sentinel in its reasoning,
+  no false-negative from ANSI / pagination corrupting the screen.
+- **Already on the wire**: agents have the MCP transport open; one
+  more tool is trivial. Matches how `report_deploy_complete` already
+  signals "agent thinks defense is done".
+- **Asymmetric to its async-mode cousin**: async mode's
+  `get_round_state` is a *query* the agent pulls; `turn_done` is a
+  *push* the agent emits. Both stay additive.
 
-### Turn detection alternatives considered
+The phase prompt's boilerplate footer becomes:
+
+> When you have completed the work for this phase — success, gave up,
+> or out of ideas — call the MCP tool `mcp__cyberarena__turn_done`
+> with `reason: "completed"` (or "stuck" / "no_progress"). DO NOT
+> proceed past that tool call.
+
+#### Fallback: screen sentinel
+
+If the agent never calls `turn_done` (forgot, errored mid-thought,
+MCP transport hiccuped), we still need a way to declare the turn
+done — otherwise the round loop blocks until phase timeout. So the
+boilerplate footer ALSO includes:
+
+> If the MCP tool is unavailable, print the line
+> `[[CYBERARENA_TURN_DONE]]` on its own line to signal completion.
+
+The orchestrator polls capture-pane for this sentinel in parallel
+with the MCP wait. Whichever fires first wins. Use a long unique
+sentinel string per session (`CYBERARENA_TURN_DONE_<6-hex>`) to
+shrink false-positive risk further.
+
+Two-signal handling: both events end up emitting `AGENT_TURN_DONE`;
+the second one is dropped via the same idempotency pattern
+`_defense_kickoff_done` already uses (keyed by `(round_id, team_id,
+phase)`).
+
+#### Turn detection alternatives considered
 
 - **Quiescence** (no output for N seconds) — vulnerable to slow tool
-  calls. Rejected.
+  calls (e.g. `fpc` recompile blocks the agent). Rejected.
 - **Claude-CLI built-in markers** — no documented machine-readable
   "turn done" signal in TUI mode. Rejected.
-- **MCP heartbeat tool** — agent calls `mcp__cyberarena__turn_done()`.
-  Cleaner than parsing screen text but adds a tool. Held as fallback.
+- **Sentinel-only** — was my original v1; user flagged the false-
+  positive risk, rightly. Demoted to fallback.
 
 ---
 
@@ -285,7 +323,7 @@ Estimate: sync mode ~150 LOC + 3 tests.
 | # | Decision | Default proposed |
 |---|---|---|
 | D1 | tmux vs raw PTY vs Claude-Agent-SDK to drive the TUI? | **tmux** — robust, inspectable, no new Python deps in the orchestrator. |
-| D2 | Sentinel detection vs MCP heartbeat for turn-done? | **Sentinel** — no new tool needed; falls back to MCP later if false-positives surface. |
+| D2 | Turn-done detection? | **MCP tool primary + sentinel fallback** — `mcp__cyberarena__turn_done(reason)` is the deterministic signal; sentinel `[[CYBERARENA_TURN_DONE_<hex>]]` covers the case the agent forgets the tool call. Whichever fires first wins, second is deduped. (Sentinel-only was the original v1; demoted after user flagged false-positive risk.) |
 | D3 | Replace headless `-p` mode entirely, or coexist? | **Coexist** — `mode: headless` stays for tests + smoke; `mode: tui` is the new game default. |
 | D4 | What happens to per-phase `stream-{phase}.jsonl`? | **Replace** with `transcript-{phase}.log` (raw ANSI bytes captured via `tmux pipe-pane`). Optional ANSI-strip in post-processing. |
 | D5 | Should the persistent agent see BOTH defense and attack prompts in one conversation, or two separate sessions per team? | **One session** — matches the "single operator" model from the `cyber-arena-orchestration/src/prompts/team.py` reference; defense knowledge informs attack and vice versa. |
