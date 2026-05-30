@@ -199,25 +199,36 @@ exist in this design.
 
 ## Manager ↔ host interaction
 
-```
-ClaudeAgentManager                  agent host (container or VM)
-   │                                  │
-   │ install():                       │
-   │   transport.run_command (npm)    │
-   │   transport.write_file (env/mcp) │
-   │   emit AGENT_INSTALLED           │
-   │                                  │
-   │ ── per phase ──────────────────  │
-   │   transport.write_file (prompt)  │
-   │   emit AGENT_PROMPT_SENT         │
-   │   transport.run_command(claude ──►│ claude -p --continue
-   │     -p --continue, timeout)      │   reads + updates session.jsonl
-   │   ◄── stdout, stderr, exit_code  │ claude exits
-   │   on timed_out:                  │
-   │     transport.kill_process ─────►│ pkill claude
-   │   write artifacts on host        │
-   │   emit AGENT_COMPLETED / TIMEOUT │
-   │     / FAILED                     │
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Mgr as ClaudeAgentManager
+    participant Tx as AgentTransport<br/>(DockerExec / SSH)
+    participant Host as Agent host<br/>(container / VM)
+    participant Bus as EventBus
+
+    Note over Mgr,Host: install() — once per team at game start
+    Mgr->>Tx: run_command(npm install -g @anthropic-ai/claude-code)
+    Tx->>Host: provision CLI
+    Mgr->>Tx: write_file(agent.env, mcp.json, workdir/)
+    Tx->>Host: stage static files
+    Mgr->>Bus: AGENT_INSTALLED
+
+    Note over Mgr,Host: run_phase() — every phase
+    Mgr->>Tx: write_file(prompt.txt, phase_context.json)
+    Tx->>Host: overwrite per-phase files
+    Mgr->>Bus: AGENT_PROMPT_SENT
+    Mgr->>Tx: run_command(claude -p --continue, timeout=phase_secs)
+    Tx->>Host: spawn claude
+    Note over Host: claude reads + appends<br/>~/.claude/projects/.../*.jsonl
+    Host-->>Tx: stdout / stderr / exit_code
+    Tx-->>Mgr: CommandResult
+    alt timed_out
+        Mgr->>Tx: kill_process("claude -p")
+        Tx->>Host: pkill -KILL -f
+    end
+    Note over Mgr: persist stream / agent log / metadata
+    Mgr->>Bus: AGENT_COMPLETED · TIMEOUT · FAILED
 ```
 
 No async handoff; each `run_phase` is a blocking `await` on the
