@@ -164,7 +164,6 @@
   .chip-deploy    { color: var(--accent); }
   .chip-agent     { color: var(--accent); }
   .chip-kickoff   { color: var(--accent); }
-  .chip-launch    { color: var(--accent); }
   .chip-prompt    { color: var(--accent); }
   .chip-ready     { color: var(--good); }
   .chip-restart   { color: var(--plant); }
@@ -290,7 +289,6 @@
       case 'PHASE_CHANGE':             return renderPhaseChange(ev);
       case 'SERVICE_DEPLOYED':         return renderServiceDeployed(ev);
       case 'AGENT_INSTALLED':          return renderAgentInstalled(ev);
-      case 'AGENT_LAUNCHED':           return renderAgentLaunched(ev);
       case 'AGENT_READY':              return renderAgentReady(ev);
       case 'DEFENSE_KICKOFF':          return renderKickoff(ev, 'defense');
       case 'ATTACK_KICKOFF':           return renderKickoff(ev, 'attack');
@@ -346,17 +344,6 @@
     chip.append(
       el('span', 'mark', '◆'),
       document.createTextNode('agent installed'),
-      el('span', 'ts', fmtTs(ev.ts)),
-    );
-    lane.chips.appendChild(chip);
-  }
-  function renderAgentLaunched(ev) {
-    const lane = getLane(ev.team_id);
-    const pl = ev.payload || {};
-    const chip = el('span', 'chip chip-launch');
-    chip.append(
-      el('span', 'mark', '▶'),
-      document.createTextNode(`agent launched pid=${pl.wrapper_pid || '?'}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
     lane.chips.appendChild(chip);

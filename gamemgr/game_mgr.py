@@ -24,7 +24,7 @@ from agents.prompts import build_attack_prompt, build_defense_prompt
 from challenges.notes import BuiltinNotesSource
 from challenges.registry import build as build_challenge
 from challenges.source import ChallengeSpec, FlagMechanism, HealthLevel
-from models.agent import AgentConfig, AgentLogs
+from models.agent import AgentConfig
 import shlex
 from typing import Awaitable, Callable
 
@@ -111,17 +111,12 @@ class GameMgr:
         # prompts are 2–3 line task cues (Claude --continue has the prior
         # session in memory by then).
         self._agent_briefed: set[str] = set()
-        # Artifact persistence (api-logs / agent-logs / service-logs).
-        # ArtifactStore is built lazily in start() once run_dir is known.
-        # Until then the persistence subscriber no-ops.
+        # Artifact persistence: ArtifactStore is built lazily in start()
+        # once run_dir is known. Per-phase stream/agent/metadata files are
+        # written by ClaudeAgentManager.run_phase directly into the
+        # team×round directory; GameMgr only owns end-of-round service-log
+        # snapshots (docker logs).
         self.artifacts: ArtifactStore | None = None
-        # Sync callable that reads stdout/stderr/exit_code from a dev
-        # container. main.py supplies this (typically ClaudeAgentManager.fetch_logs)
-        # via register_fetch_agent_logs_handler; without it the agent-side
-        # artifact persistence no-ops (event-only mode for tests).
-        self._fetch_agent_logs_handler: (
-            Callable[[ContainerHandle], AgentLogs] | None
-        ) = None
         # Defense-phase early-end tracking. On every DEFENSE_KICKOFF we add
         # (team_id, service) to the set for that round; DEPLOY_COMPLETE
         # drains it; when the set is empty the round loop is signalled to
@@ -131,13 +126,13 @@ class GameMgr:
         # have no file-sink dependency and tests routinely drive
         # PHASE_CHANGE events directly onto the bus without the round loop.
         # ORDER MATTERS:
-        #   _on_persist_artifacts        — snapshot defense agent logs first
+        #   _on_persist_service_logs     — snapshot prod-container docker logs
         #   _on_defense_end_health_check — final per-team health probe
         #   _on_defense_kickoff          — only fires on DEFENSE
         #   _on_attack_kickoff           — only fires on ATTACK
         #   _on_deploy_complete          — drains _defense_pending, may
         #                                  signal RoundLoop early-end
-        self.bus.subscribe(self._on_persist_artifacts)
+        self.bus.subscribe(self._on_persist_service_logs)
         self.bus.subscribe(self._on_defense_end_health_check)
         self.bus.subscribe(self._on_defense_kickoff)
         self.bus.subscribe(self._on_attack_kickoff)
@@ -199,7 +194,7 @@ class GameMgr:
                 cname = team_to_prod.get(team_id)
                 if cname is None:
                     raise KeyError(f"challenge {chcfg.name!r}: unknown team_id {team_id!r}")
-                handle = self._handle_for(cname)
+                handle = self.handle_for(cname)
                 log.info("deploying challenge %s -> %s (port %d)", chcfg.name, cname, chcfg.port)
                 service.install(handle)
                 service.start(handle)
@@ -232,7 +227,7 @@ class GameMgr:
         # SERVICE_PROTOCOL plants (notes: PUT over its own TCP socket).
         for (team_id, service_name), service in self._service_by_owner.items():
             cname = team_to_prod[team_id]
-            handle = self._handle_for(cname)
+            handle = self.handle_for(cname)
             flag = new_flag()
             log.info("planting flag on %s/%s (round=%d, SERVICE_PROTOCOL)", team_id, service_name, round_id)
             service.plant_flag(handle, flag)
@@ -598,86 +593,22 @@ class GameMgr:
                     )
             await asyncio.gather(*(_safe(t, c, f) for t, c, f in pending))
 
-    # ── DEFCON: artifact persistence (api-logs / agent-logs / service-logs)
+    # ── DEFCON: end-of-round service-log snapshots ──────────────────────
 
-    def register_fetch_agent_logs_handler(
-        self,
-        handler: Callable[["ContainerHandle"], AgentLogs],
-    ) -> None:
-        """Register the callable that reads an agent's stdout / stderr /
-        exit_code off its dev container. Typically `ClaudeAgentManager.fetch_logs`.
+    async def _on_persist_service_logs(self, event) -> None:
+        """At ROUND_STOP, snapshot every team's prod container `docker logs`
+        to service-logs.
 
-        Without a handler the api-logs / agent-logs persistence no-ops
-        (service-logs still write because they go through `docker logs`
-        directly, no AgentManager needed).
-        """
-        self._fetch_agent_logs_handler = handler
-
-    async def _on_persist_artifacts(self, event) -> None:
-        """Snapshot agent + service logs at the right moments:
-
-        - PHASE_CHANGE → ATTACK: DEFENSE just ended; the dev container
-          holds the defense agent's stream-json + stderr in /tmp. Fetch
-          it BEFORE the attack-phase kickoff overwrites those files.
-
-        - ROUND_STOP: ATTACK just ended; snapshot the attack agent's
-          logs (same paths) and the prod container's `docker logs`.
+        Per-phase agent transcripts (stream-{phase}.jsonl / agent-{phase}.log
+        / metadata-{phase}.json) are written directly by
+        ClaudeAgentManager.run_phase into the team×round artifact dir — no
+        GameMgr subscriber needed for that path.
         """
         if self.artifacts is None:
-            return  # start() hasn't run yet — nothing to write into.
-
-        if event.type == EventType.PHASE_CHANGE.value and event.phase == Phase.ATTACK.value:
-            await self._persist_agent_logs("defense", event.round_id)
-        elif event.type == EventType.ROUND_STOP.value:
-            await self._persist_agent_logs("attack", event.round_id)
-            await self._persist_service_logs(event.round_id)
-
-    async def _persist_agent_logs(self, phase_label: str, round_id: int) -> None:
-        """Walk every team's dev container, fetch_logs, write to
-        api-logs/<team>/round-<N>/stream-<phase>.jsonl and
-        agent-logs/<team>/round-<N>/agent-<phase>.log.
-
-        Best-effort: any team that fails (no agent installed yet, fetch
-        raised, write raised) gets a log line and is skipped — never
-        bubbles up to crash the round.
-        """
-        if self.artifacts is None or self._fetch_agent_logs_handler is None:
             return
-        for team in self.config.topology.teams:
-            if not team.dev:
-                continue
-            try:
-                handle = self._handle_for(team.dev)
-            except Exception:
-                # Container doesn't exist yet / was torn down — skip silently.
-                continue
-            try:
-                logs = self._fetch_agent_logs_handler(handle)
-            except Exception:
-                log.exception("artifact: fetch_logs failed for %s", team.dev)
-                continue
-            try:
-                api_p = self.artifacts.path_for(
-                    ArtifactKind.API_LOG,
-                    team_id=team.id,
-                    round_id=round_id,
-                    filename=f"stream-{phase_label}.jsonl",
-                )
-                api_p.write_text(logs.stdout or "")
-                agent_p = self.artifacts.path_for(
-                    ArtifactKind.AGENT_LOG,
-                    team_id=team.id,
-                    round_id=round_id,
-                    filename=f"agent-{phase_label}.log",
-                )
-                agent_p.write_text(
-                    f"exit_code={logs.exit_code}\n\n=== stderr ===\n{logs.stderr or ''}"
-                )
-            except Exception:
-                log.exception(
-                    "artifact: write failed for %s round=%d phase=%s",
-                    team.id, round_id, phase_label,
-                )
+        if event.type != EventType.ROUND_STOP.value:
+            return
+        await self._persist_service_logs(event.round_id)
 
     async def _persist_service_logs(self, round_id: int) -> None:
         """Snapshot `docker logs <team{N}_prod>` for every team. End-of-round
@@ -850,16 +781,6 @@ class GameMgr:
                 EventType.AGENT_INSTALLED,
                 team_id=team_id,
                 payload={"team_id": team_id, "ts": time.time()},
-            )
-        )
-
-    async def record_agent_launched(self, team_id: str, wrapper_pid: int) -> None:
-        """Host emit: supervisor process running, wrapper pid captured."""
-        await self.bus.publish(
-            new_event(
-                EventType.AGENT_LAUNCHED,
-                team_id=team_id,
-                payload={"team_id": team_id, "wrapper_pid": wrapper_pid, "ts": time.time()},
             )
         )
 
@@ -1176,7 +1097,7 @@ class GameMgr:
         proto_ok = True
         service_obj = self._service_by_owner.get((team_id, service))
         if service_obj is not None:
-            handle = self._handle_for(container_name)
+            handle = self.handle_for(container_name)
             try:
                 proto_ok = await loop.run_in_executor(
                     None, lambda: service_obj.is_alive(handle, HealthLevel.PROTOCOL)
@@ -1319,7 +1240,7 @@ class GameMgr:
 
     # ── helpers ─────────────────────────────────────────────────────────
 
-    def _handle_for(self, container_name: str) -> ContainerHandle:
+    def handle_for(self, container_name: str) -> ContainerHandle:
         node = self.config.topology.node(container_name)
         c = self.orchestrator.containers._client.containers.get(container_name)
         return ContainerHandle(container_id=c.id, name=container_name, networks=list(node.networks))

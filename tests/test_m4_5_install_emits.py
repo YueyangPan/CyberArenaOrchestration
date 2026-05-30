@@ -1,16 +1,14 @@
 """M4.5 — install() callback wiring.
 
 In the persistent-memory v1 model `install()` is one-shot (no
-supervisor launches). Both callbacks fire from the end of install():
-on_installed first, then on_launched (with wrapper_pid=0, kept for
-M4.5 back-compat). The M4.5 three-event chain semantic — INSTALLED
-present, LAUNCHED absent on partial failure — no longer applies
-because there's no separate launch step.
+supervisor launches). The single `on_installed` callback fires at the
+end of install(). The M4.5-era `on_launched` was retired alongside the
+supervisor (there is no separate launch step to bracket).
 
-What we still pin:
-  ①both callbacks fire on the happy path, in declared order.
-  ②if install raises before the callback site, neither fires.
-  ③empty team_id → callbacks skipped (defensive for non-multi-tenant tests).
+What we pin:
+  ①on_installed fires on the happy path.
+  ②if install raises before the callback site, it does NOT fire.
+  ③empty team_id → callback skipped (defensive for non-multi-tenant tests).
 
 No docker, no real CLI — ClaudeAgentManager runs against a mock
 docker client satisfying the small subset of exec_run calls install()
@@ -73,39 +71,26 @@ def _handle(name: str = "team1_dev") -> ContainerHandle:
     return ContainerHandle(container_id="mocked-id", name=name, networks=["team1_net"])
 
 
-def test_install_emits_installed_then_launched_in_order():
-    """Happy path: both callbacks fire from install(), INSTALLED then
-    LAUNCHED. In v1 they fire from the same code path, so timestamps
-    may be very close — we only assert ordering by call sequence, not
-    by wall clock."""
+def test_install_emits_installed_on_success():
+    """Happy path: on_installed fires exactly once at the end of install()."""
     client = _make_mock_client(pid=4321, wrapper_pid=4320)
     mgr = ClaudeAgentManager(client=client)
     cfg = AgentConfig(cli="sleep 60", team_id="team1")
 
-    fired: list[tuple[str, tuple]] = []
+    fired: list[str] = []
 
     def on_installed(team_id):
-        fired.append(("INSTALLED", (team_id,)))
+        fired.append(team_id)
 
-    def on_launched(team_id, wrapper_pid):
-        fired.append(("LAUNCHED", (team_id, wrapper_pid)))
+    mgr.install(_handle(), cfg, on_installed=on_installed)
 
-    mgr.install(_handle(), cfg, on_installed=on_installed, on_launched=on_launched)
-
-    assert len(fired) == 2, f"expected two callbacks, got: {fired}"
-    assert fired[0][0] == "INSTALLED", f"first callback should be INSTALLED, got {fired}"
-    assert fired[1][0] == "LAUNCHED", f"second callback should be LAUNCHED, got {fired}"
-    assert fired[0][1] == ("team1",)
-    # v1: wrapper_pid is 0 (no supervisor exists; field preserved for back-compat).
-    assert fired[1][1] == ("team1", 0)
+    assert fired == ["team1"], f"expected one INSTALLED callback for team1; got: {fired}"
 
 
-def test_install_fault_injection_skips_both_callbacks():
+def test_install_fault_injection_skips_callback():
     """If something inside install raises before reaching the callback
-    site, neither callback fires. In v1 there's no INSTALLED-yes-LAUNCHED-
-    no intermediate state to assert anymore — both callbacks live at the
-    very end of install() so failures bail out before either runs.
-    """
+    site, on_installed does NOT fire — callers can safely treat a raised
+    install as "agent never came up"."""
     client = _make_mock_client()
     mgr = ClaudeAgentManager(client=client)
     cfg = AgentConfig(cli="sleep 60", team_id="team2")
@@ -121,19 +106,18 @@ def test_install_fault_injection_skips_both_callbacks():
         mgr.install(
             _handle("team2_dev"),
             cfg,
-            on_installed=lambda t: fired.append(f"INSTALLED:{t}"),
-            on_launched=lambda t, p: fired.append(f"LAUNCHED:{t}:{p}"),
+            on_installed=lambda t: fired.append(t),
         )
 
     assert fired == [], (
-        "install raised before reaching the callback site; neither "
-        f"callback should have fired. got: {fired}"
+        "install raised before reaching the callback site; "
+        f"on_installed should not have fired. got: {fired}"
     )
 
 
-def test_install_skips_callbacks_when_team_id_blank():
+def test_install_skips_callback_when_team_id_blank():
     """Defensive: empty team_id (legacy AgentConfig from M4 tests) means
-    the agent isn't multi-tenant — no event lands on the bus. Callbacks
+    the agent isn't multi-tenant — no event lands on the bus. on_installed
     must NOT fire with empty team_id, or downstream code that keys on
     team_id will choke."""
     client = _make_mock_client()
@@ -141,10 +125,5 @@ def test_install_skips_callbacks_when_team_id_blank():
     cfg = AgentConfig(cli="sleep 60")  # team_id="" by default
 
     fired: list[str] = []
-    mgr.install(
-        _handle(),
-        cfg,
-        on_installed=lambda t: fired.append("installed"),
-        on_launched=lambda t, p: fired.append("launched"),
-    )
-    assert fired == [], f"callbacks must be skipped when team_id=''; got: {fired}"
+    mgr.install(_handle(), cfg, on_installed=lambda t: fired.append(t))
+    assert fired == [], f"on_installed must be skipped when team_id=''; got: {fired}"

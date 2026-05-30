@@ -164,23 +164,16 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
             log.warning("install: team %s has no dev container; skipping", team_id)
             return
         try:
-            handle = game._handle_for(team.dev)
+            handle = game.handle_for(team.dev)
         except Exception:
             log.exception("install: cannot resolve dev handle for %s", team_id)
             return
         loop = asyncio.get_running_loop()
         def _on_installed(tid: str) -> None:
             asyncio.run_coroutine_threadsafe(game.record_agent_installed(tid), loop)
-        def _on_launched(tid: str, wrapper_pid: int) -> None:
-            asyncio.run_coroutine_threadsafe(
-                game.record_agent_launched(tid, wrapper_pid), loop
-            )
         await loop.run_in_executor(
             None,
-            lambda: agent_mgr.install(
-                handle, cfg,
-                on_installed=_on_installed, on_launched=_on_launched,
-            ),
+            lambda: agent_mgr.install(handle, cfg, on_installed=_on_installed),
         )
         log.info("agent installed on %s", team.dev)
 
@@ -200,7 +193,7 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
                 log.warning("%s kickoff: team %s has no dev container; skipping", phase, team_id)
                 return
             try:
-                handle = game._handle_for(team.dev)
+                handle = game.handle_for(team.dev)
             except Exception:
                 log.exception("%s kickoff: cannot resolve dev handle for %s", phase, team_id)
                 return
@@ -269,11 +262,6 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
     game.register_attack_kickoff_handler(
         _make_phase_handler(game.config.rounds.attack_secs)
     )
-    # Service-logs (docker logs) still go through GameMgr's _persist_service_logs
-    # at ROUND_STOP. Agent stdout/stderr/exit_code now flow directly from
-    # run_phase into the artifact_dir, so we deliberately do NOT register
-    # a fetch_agent_logs_handler — that path is legacy (M4-era supervisor)
-    # and would overwrite the per-phase artifacts with empty content.
 
 
 if __name__ == "__main__":

@@ -20,11 +20,13 @@ class EventType(str, Enum):
     PHASE_CHANGE = "PHASE_CHANGE"
     ROUND_STOP = "ROUND_STOP"
     SERVICE_DEPLOYED = "SERVICE_DEPLOYED"
-    # M4.5 lifecycle chain: host-emitted INSTALLED (prep done, not launched)
-    # → host-emitted LAUNCHED (supervisor pid captured) → MCP-emitted READY
-    # (LLM proved the channel works). Only the first two are load-bearing.
+    # Agent lifecycle: host-emitted INSTALLED (prep done — env / mcp.json /
+    # SSH pivot / workdir staged) → MCP-emitted READY (LLM proved the
+    # channel works by calling report_ready). Per-phase invocation events
+    # (AGENT_PROMPT_SENT / COMPLETED / TIMEOUT / FAILED) cover everything
+    # downstream of install. The M4.5-era AGENT_LAUNCHED event was retired
+    # alongside the supervisor model — there is no separate launch step.
     AGENT_INSTALLED = "AGENT_INSTALLED"
-    AGENT_LAUNCHED = "AGENT_LAUNCHED"
     AGENT_READY = "AGENT_READY"
     FLAG_PLANTED = "FLAG_PLANTED"
     FLAG_SUBMITTED = "FLAG_SUBMITTED"

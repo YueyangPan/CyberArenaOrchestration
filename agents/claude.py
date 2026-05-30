@@ -71,12 +71,11 @@ EXIT_CODE_PATH = f"{RUN_DIR}/agent.exit_code"
 STDOUT_PATH = f"{LOG_DIR}/agent.stdout"
 STDERR_PATH = f"{LOG_DIR}/agent.stderr"
 
-# install() callbacks. on_installed fires after all setup is staged
-# (env, mcp.json, ssh pivot, workdir). on_launched is preserved for
-# M4.5 back-compat; it fires alongside on_installed in this design
-# (no separate launch step exists anymore). wrapper_pid passes 0.
+# install() callback. Fires after env / mcp.json / ssh pivot / workdir
+# are staged. The persistent-memory v1 install has no separate launch
+# step (claude is spawned per-phase by run_phase), so this is the only
+# install-side lifecycle hook.
 OnInstalled = Callable[[str], None]
-OnLaunched = Callable[[str, int], None]
 
 
 class ClaudeAgentManager(AgentManager):
@@ -110,7 +109,6 @@ class ClaudeAgentManager(AgentManager):
         cfg: AgentConfig,
         *,
         on_installed: OnInstalled | None = None,
-        on_launched: OnLaunched | None = None,
     ) -> None:
         """One-shot setup per team. Idempotent (npm cache hit, SSH key
         re-push is fine, etc.) but designed to be called exactly once
@@ -122,9 +120,7 @@ class ClaudeAgentManager(AgentManager):
           3. SSH pivot if cfg.own_prod_container_name set (M5.6 mode).
           4. Write agent.env (no PROMPT_PATH here — prompts are per-phase).
           5. Write mcp.json if cfg.mcp_endpoint set.
-          6. Fire on_installed and on_launched callbacks (both fire here
-             in the new model; on_launched is preserved for M4.5 back-
-             compat and gets wrapper_pid=0).
+          6. Fire on_installed (caller bridges to AGENT_INSTALLED on the bus).
 
         NO process is launched. The first `run_phase` invocation is
         what actually starts Claude.
@@ -157,14 +153,12 @@ class ClaudeAgentManager(AgentManager):
 
         log.info("agent installed on %s (cli=%r)", container.name, cfg.cli)
 
-        # Both lifecycle callbacks fire here. There's no separate
-        # "launched" step anymore — `run_phase` is what starts Claude
-        # per-phase, and that fires its own AGENT_PROMPT_SENT /
-        # COMPLETED / TIMEOUT / FAILED events.
+        # The one install-side lifecycle hook. There's no separate
+        # "launched" step — `run_phase` is what starts Claude per-phase
+        # and emits its own AGENT_PROMPT_SENT / COMPLETED / TIMEOUT /
+        # FAILED events.
         if on_installed is not None and cfg.team_id:
             on_installed(cfg.team_id)
-        if on_launched is not None and cfg.team_id:
-            on_launched(cfg.team_id, 0)
 
     async def run_phase(
         self,
