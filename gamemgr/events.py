@@ -60,6 +60,14 @@ class EventType(str, Enum):
     # signal, or unhandled exception. Payload carries the cause and the
     # final round / phase the loop exited from.
     GAME_END = "GAME_END"
+    # Persistent-memory agent (v1): per-phase invocation events fired
+    # by the kickoff handlers around each `ClaudeAgentManager.run_phase`
+    # call. AGENT_INSTALLED already exists; these cover the per-phase
+    # cycle that lives inside the round loop.
+    AGENT_PROMPT_SENT = "AGENT_PROMPT_SENT"
+    AGENT_COMPLETED = "AGENT_COMPLETED"
+    AGENT_TIMEOUT = "AGENT_TIMEOUT"
+    AGENT_FAILED = "AGENT_FAILED"
 
 
 @dataclass(frozen=True)

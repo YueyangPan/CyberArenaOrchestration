@@ -165,6 +165,7 @@
   .chip-agent     { color: var(--accent); }
   .chip-kickoff   { color: var(--accent); }
   .chip-launch    { color: var(--accent); }
+  .chip-prompt    { color: var(--accent); }
   .chip-ready     { color: var(--good); }
   .chip-restart   { color: var(--plant); }
   .chip-health-ok { color: var(--good); }
@@ -293,6 +294,10 @@
       case 'AGENT_READY':              return renderAgentReady(ev);
       case 'DEFENSE_KICKOFF':          return renderKickoff(ev, 'defense');
       case 'ATTACK_KICKOFF':           return renderKickoff(ev, 'attack');
+      case 'AGENT_PROMPT_SENT':        return renderPromptSent(ev);
+      case 'AGENT_COMPLETED':          return renderAgentDone(ev, 'completed');
+      case 'AGENT_TIMEOUT':            return renderAgentDone(ev, 'timeout');
+      case 'AGENT_FAILED':             return renderAgentDone(ev, 'failed');
       case 'SERVICE_RESTART_STARTED':  return renderRestart(ev, 'started');
       case 'SERVICE_RESTART_COMPLETED':return renderRestart(ev, 'completed');
       case 'SERVICE_RESTART_FAILED':   return renderRestart(ev, 'failed');
@@ -376,6 +381,40 @@
     chip.append(
       el('span', 'mark', '⚡'),
       document.createTextNode(label),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+  }
+  function renderPromptSent(ev) {
+    const lane = getLane(ev.team_id);
+    const pl = ev.payload || {};
+    const chip = el('span', 'chip chip-prompt');
+    const flag = pl.is_first ? ' (first)' : '';
+    const phase = ev.phase ? `${ev.phase} ` : '';
+    chip.append(
+      el('span', 'mark', '✎'),
+      document.createTextNode(`${phase}prompt sent${flag}`),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+  }
+  function renderAgentDone(ev, kind) {
+    const lane = getLane(ev.team_id);
+    const pl = ev.payload || {};
+    const cls = kind === 'completed' ? 'chip-ready'
+              : kind === 'timeout' ? 'chip-reject'
+              : 'chip-reject';
+    const mark = kind === 'completed' ? '✓'
+               : kind === 'timeout' ? '⏱'
+               : '✗';
+    const dur = pl.duration_ms != null ? ` ${pl.duration_ms}ms` : '';
+    const err = pl.error_excerpt || pl.error;
+    const errTail = err ? ` — ${err}` : '';
+    const chip = el('span', `chip ${cls}`);
+    const phase = ev.phase ? `${ev.phase} ` : '';
+    chip.append(
+      el('span', 'mark', mark),
+      document.createTextNode(`${phase}agent ${kind}${dur}${errTail}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
     lane.chips.appendChild(chip);

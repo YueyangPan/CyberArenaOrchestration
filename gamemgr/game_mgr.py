@@ -30,6 +30,13 @@ from typing import Awaitable, Callable
 
 from .artifacts import ArtifactKind, ArtifactStore
 
+# Kickoff handler signature for persistent-memory v1. main.py registers
+# one of these per phase via register_defense_kickoff_handler /
+# register_attack_kickoff_handler; the handler awaits run_phase on
+# ClaudeAgentManager and emits AGENT_COMPLETED / TIMEOUT / FAILED.
+#   args: (team_id, cfg, round_id, phase_lower, is_first)
+PhaseKickoffHandler = Callable[[str, AgentConfig, int, str, bool], Awaitable[None]]
+
 from .config import ChallengeConfig, GameConfig
 from .events import EventBus, EventType, FileSink, new_event, new_run_dir
 from .flag import FlagStore, SubmitResult, new_flag
@@ -75,25 +82,35 @@ class GameMgr:
         self._known_services: frozenset[str] = frozenset(
             c.name for c in config.challenges
         )
-        # DEFCON Phase 4b: registered handler invoked once per (team, service)
-        # whenever PHASE_CHANGE → DEFENSE fires. Receives the team_id and the
-        # defense-mode AgentConfig; the handler owns the actual ClaudeAgentManager
-        # call. None = no-op (the kickoff event still publishes; tests that
-        # don't need an agent run without one). Async callable.
-        self._defense_kickoff_handler: (
+        # Persistent-memory v1: kickoff handlers run a phase via
+        # ClaudeAgentManager.run_phase (not install). Handler signature:
+        #   async def handler(team_id, cfg, round_id, phase, is_first)
+        # is_first is True on the very first kickoff per team (any phase)
+        # so the handler can route to the long-briefing prompt path;
+        # subsequent kickoffs get a short cue. None = no-op (the kickoff
+        # event still publishes; tests use this to verify event emission
+        # without spinning up real agents).
+        self._defense_kickoff_handler: "PhaseKickoffHandler | None" = None
+        self._attack_kickoff_handler: "PhaseKickoffHandler | None" = None
+        # Persistent-memory v1: one-shot install runs BEFORE the round
+        # loop starts. Handler signature:
+        #   async def handler(team_id, cfg) -> None
+        # main.py registers a handler that bridges ClaudeAgentManager.install
+        # (sync) into the loop via run_in_executor. None = event-only mode
+        # (tests don't install real agents).
+        self._install_agent_handler: (
             Callable[[str, AgentConfig], Awaitable[None]] | None
         ) = None
-        # Set of (round_id, team_id, service_name) tuples we've already
-        # kicked off, so a re-fire of PHASE_CHANGE for the same round
-        # doesn't spawn duplicate agents.
+        # Idempotency keys per round so a re-fire of PHASE_CHANGE doesn't
+        # spawn duplicate work.
         self._defense_kickoff_done: set[tuple[int, str, str]] = set()
-        # Attack-side parallel of the defense kickoff handler. One agent
-        # per team per round (no per-service split — the M5.6 attack
-        # prompt walks every opposing prod from one install).
-        self._attack_kickoff_handler: (
-            Callable[[str, AgentConfig], Awaitable[None]] | None
-        ) = None
         self._attack_kickoff_done: set[tuple[int, str]] = set()
+        # Tracks team_ids that have already seen at least one kickoff.
+        # Used to set the `is_first` flag on subsequent kickoffs — first
+        # prompt for a team carries the full operator briefing; later
+        # prompts are 2–3 line task cues (Claude --continue has the prior
+        # session in memory by then).
+        self._agent_briefed: set[str] = set()
         # Artifact persistence (api-logs / agent-logs / service-logs).
         # ArtifactStore is built lazily in start() once run_dir is known.
         # Until then the persistence subscriber no-ops.
@@ -280,6 +297,12 @@ class GameMgr:
 
         await self.emit_setup_events()
 
+        # Persistent-memory v1: one-shot install across all teams BEFORE
+        # the round loop ticks. Parallel via asyncio.gather so a 10s npm
+        # install doesn't serialize 2x across teams. No-op if no install
+        # handler was registered (tests / observer-only runs).
+        await self.install_all_agents()
+
         # Re-plant at each DEFENSE entry (M5.5). Sequential await in
         # bus.publish means this handler completes before _enter_phase
         # returns and the DEFENSE timer begins.
@@ -345,17 +368,72 @@ class GameMgr:
                 )
             )
 
+    # ── Persistent-memory v1: pre-loop install hook ─────────────────────
+
+    def register_install_agent_handler(
+        self,
+        handler: Callable[[str, AgentConfig], Awaitable[None]],
+    ) -> None:
+        """Register the callable that one-shot-installs the agent on a
+        team's dev container. Called once per team by `install_all_agents()`
+        BEFORE the round loop starts.
+
+        Signature: `async def handler(team_id, cfg) -> None`.
+
+        Without a handler, `install_all_agents` no-ops (event-only mode
+        for tests that drive the round loop without real agents).
+        """
+        self._install_agent_handler = handler
+
+    async def install_all_agents(self) -> None:
+        """Pre-loop one-shot install across every team in parallel.
+
+        Persistent-memory v1: install creates the workdir, runs npm install,
+        provisions SSH pivot, writes agent.env / mcp.json. No process is
+        launched — that happens per-phase via `run_phase` inside the
+        kickoff handlers.
+
+        Best-effort: a team whose install raises gets a log line and is
+        skipped — the round loop still starts and the failing team's
+        kickoff will fail with a clean AGENT_FAILED on the bus.
+        """
+        if self._install_agent_handler is None:
+            return  # event-only mode (tests)
+        handler = self._install_agent_handler
+
+        async def _one(team_id: str) -> None:
+            try:
+                cfg = self.agent_config_for(team_id, is_first=True)
+            except KeyError:
+                log.warning(
+                    "install_all_agents: no agent config for team %s; skipping",
+                    team_id,
+                )
+                return
+            try:
+                await handler(team_id, cfg)
+            except Exception:
+                log.exception("install_all_agents: install failed for %s", team_id)
+
+        await asyncio.gather(
+            *(_one(t.id) for t in self.config.topology.teams)
+        )
+
     # ── DEFCON: defense kickoff on PHASE_CHANGE → DEFENSE ───────────────
 
     def register_defense_kickoff_handler(
         self,
-        handler: Callable[[str, AgentConfig], Awaitable[None]],
+        handler: "PhaseKickoffHandler",
     ) -> None:
-        """Register the callable that actually spawns a defense agent.
+        """Register the callable that runs the per-phase defense agent.
 
-        Signature: `async def handler(team_id: str, cfg: AgentConfig)`.
+        Signature: `async def handler(team_id, cfg, round_id, phase, is_first)`.
         Called once per (team, deployable defense challenge) on every
-        DEFENSE phase entry, after flags rotate.
+        DEFENSE phase entry, after flags rotate. `is_first` is True on
+        the very first kickoff for a team (any phase) so the handler
+        can route to the long briefing prompt; subsequent kickoffs get
+        a short cue. `phase` is the lowercase string `"defense"` so the
+        handler can pick the right artifact filename.
 
         Kept external (rather than baked into GameMgr) so the round loop
         is unchanged for non-defense use cases (unit tests, screenshots,
@@ -382,9 +460,11 @@ class GameMgr:
             return
 
         # Collect handler invocations, then run them concurrently so per-team
-        # install (~15s of npm + ssh + script writes the first time) doesn't
-        # serialize across teams and waste half the DEFENSE budget.
-        pending: list[tuple[str, str, AgentConfig]] = []
+        # work doesn't serialize across teams. is_first is decided AT
+        # collection time (sync) so the prompt-builder inside
+        # defense_agent_config_for emits a short cue when the team has
+        # already been briefed earlier in the game.
+        pending: list[tuple[str, str, AgentConfig, bool]] = []
         for chcfg in self.config.challenges:
             spec = self._resolve_spec(chcfg.name)
             if spec is None:
@@ -417,38 +497,47 @@ class GameMgr:
                 if self._defense_kickoff_handler is None:
                     continue
 
+                is_first = team_id not in self._agent_briefed
+                # Add immediately so a second defense-capable service for
+                # the same team in this loop gets is_first=False.
+                self._agent_briefed.add(team_id)
+
                 try:
-                    cfg = self.defense_agent_config_for(team_id, service_name=chcfg.name)
+                    cfg = self.defense_agent_config_for(
+                        team_id, service_name=chcfg.name, is_first=is_first,
+                    )
                 except Exception:
                     log.exception(
                         "defense_agent_config_for failed for (%s, %s)",
                         team_id, chcfg.name,
                     )
                     continue
-                pending.append((team_id, chcfg.name, cfg))
+                pending.append((team_id, chcfg.name, cfg, is_first))
 
         if pending and self._defense_kickoff_handler is not None:
-            async def _safe(team_id: str, service_name: str, cfg: AgentConfig) -> None:
+            handler = self._defense_kickoff_handler
+            round_id = event.round_id
+            async def _safe(team_id: str, service_name: str, cfg: AgentConfig, is_first: bool) -> None:
                 try:
-                    await self._defense_kickoff_handler(team_id, cfg)
+                    await handler(team_id, cfg, round_id, "defense", is_first)
                 except Exception:
                     log.exception(
                         "defense kickoff handler raised for (%s, %s); skipping",
                         team_id, service_name,
                     )
-            await asyncio.gather(*(_safe(t, s, c) for t, s, c in pending))
+            await asyncio.gather(*(_safe(t, s, c, f) for t, s, c, f in pending))
 
     # ── DEFCON: attack kickoff on PHASE_CHANGE → ATTACK ─────────────────
 
     def register_attack_kickoff_handler(
         self,
-        handler: Callable[[str, AgentConfig], Awaitable[None]],
+        handler: "PhaseKickoffHandler",
     ) -> None:
-        """Register the callable that spawns an attack agent per team.
+        """Register the callable that runs the per-phase attack agent.
 
-        Signature: `async def handler(team_id: str, cfg: AgentConfig)`.
-        Called once per team on every ATTACK phase entry. Replaces any
-        previously-registered handler.
+        Signature: `async def handler(team_id, cfg, round_id, phase, is_first)`.
+        Called once per team on every ATTACK phase entry. `is_first` is
+        True on the very first kickoff for a team (any phase).
         """
         self._attack_kickoff_handler = handler
 
@@ -466,7 +555,7 @@ class GameMgr:
         if event.phase != Phase.ATTACK.value:
             return
 
-        pending: list[tuple[str, AgentConfig]] = []
+        pending: list[tuple[str, AgentConfig, bool]] = []
         for team in self.config.topology.teams:
             key = (event.round_id, team.id)
             if key in self._attack_kickoff_done:
@@ -486,23 +575,28 @@ class GameMgr:
             if self._attack_kickoff_handler is None:
                 continue
 
+            is_first = team.id not in self._agent_briefed
+            self._agent_briefed.add(team.id)
+
             try:
-                cfg = self.agent_config_for(team.id)
+                cfg = self.agent_config_for(team.id, is_first=is_first)
             except Exception:
                 log.exception("agent_config_for failed for %s; skipping attack kickoff", team.id)
                 continue
-            pending.append((team.id, cfg))
+            pending.append((team.id, cfg, is_first))
 
         if pending and self._attack_kickoff_handler is not None:
-            async def _safe(team_id: str, cfg: AgentConfig) -> None:
+            handler = self._attack_kickoff_handler
+            round_id = event.round_id
+            async def _safe(team_id: str, cfg: AgentConfig, is_first: bool) -> None:
                 try:
-                    await self._attack_kickoff_handler(team_id, cfg)
+                    await handler(team_id, cfg, round_id, "attack", is_first)
                 except Exception:
                     log.exception(
                         "attack kickoff handler raised for %s; skipping",
                         team_id,
                     )
-            await asyncio.gather(*(_safe(t, c) for t, c in pending))
+            await asyncio.gather(*(_safe(t, c, f) for t, c, f in pending))
 
     # ── DEFCON: artifact persistence (api-logs / agent-logs / service-logs)
 
@@ -1114,12 +1208,20 @@ class GameMgr:
         self,
         team_id: str,
         submit_base_url: str = "http://host.docker.internal:8000",
+        *,
+        is_first: bool = True,
     ) -> AgentConfig:
         """Build the per-team AgentConfig for attack-mode install.
 
         Pulls the static cli/model/api_key/base_url from config.agents[team_id]
         (loaded from game.yaml) and layers on the runtime topology context
         (own prod, opposing prods, token, submit URL, attack prompt).
+
+        `is_first=True` (default) emits the long briefing — used for
+        install AND for the first attack-phase kickoff. `is_first=False`
+        emits the 4-line continuation cue used on every subsequent
+        kickoff for this team (Claude's `--continue` carries the prior
+        context).
 
         The attack prompt is picked per-challenge via the prompts dispatcher.
         v1 assumes one challenge configured per game; if there's exactly one
@@ -1159,7 +1261,9 @@ class GameMgr:
             attack_service = deployable[0].name
         return replace(
             cfg,
-            system_prompt=build_attack_prompt(cfg, service_name=attack_service),
+            system_prompt=build_attack_prompt(
+                cfg, service_name=attack_service, is_first=is_first
+            ),
         )
 
     def defense_agent_config_for(
@@ -1168,6 +1272,7 @@ class GameMgr:
         *,
         service_name: str,
         submit_base_url: str = "http://host.docker.internal:8000",
+        is_first: bool = True,
     ) -> AgentConfig:
         """Build the per-team AgentConfig for DEFENSE mode (DEFCON Phase 4b).
 
@@ -1208,6 +1313,7 @@ class GameMgr:
                 cfg,
                 service_name=service_name,
                 port=spec.port,
+                is_first=is_first,
             ),
         )
 

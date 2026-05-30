@@ -120,10 +120,10 @@ def test_registered_attack_kickoff_handler_receives_attack_prompt():
     }
     game = _make_game(agents=agents)
 
-    calls: list[tuple[str, AgentConfig]] = []
+    calls: list[tuple[str, AgentConfig, int, str, bool]] = []
 
-    async def handler(team_id: str, cfg: AgentConfig) -> None:
-        calls.append((team_id, cfg))
+    async def handler(team_id: str, cfg: AgentConfig, round_id: int, phase: str, is_first: bool) -> None:
+        calls.append((team_id, cfg, round_id, phase, is_first))
 
     game.register_attack_kickoff_handler(handler)
 
@@ -133,8 +133,12 @@ def test_registered_attack_kickoff_handler_receives_attack_prompt():
     asyncio.run(run())
 
     assert len(calls) == 2
-    by_team = dict(calls)
+    by_team = {c[0]: c[1] for c in calls}
     assert set(by_team) == {"team1", "team2"}
+    # First kickoff per team → is_first=True.
+    assert all(c[4] is True for c in calls), f"first kickoff per team must be is_first=True; got {calls}"
+    # All on round 1, phase=attack.
+    assert all(c[2] == 1 and c[3] == "attack" for c in calls), calls
     for tid, cfg in by_team.items():
         # Attack prompt fingerprints: mentions attack/steal + opposing prods.
         assert "attack agent" in cfg.system_prompt.lower()
@@ -157,7 +161,7 @@ def test_handler_exception_does_not_break_subsequent_kickoffs():
 
     invoked: list[str] = []
 
-    async def handler(team_id: str, cfg: AgentConfig) -> None:
+    async def handler(team_id: str, cfg: AgentConfig, round_id: int, phase: str, is_first: bool) -> None:
         invoked.append(team_id)
         if team_id == "team1":
             raise RuntimeError("simulated handler crash")

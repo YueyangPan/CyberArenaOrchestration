@@ -1,24 +1,31 @@
-"""ClaudeAgentManager — installs and supervises a Claude Code CLI agent.
+"""ClaudeAgentManager — host-side controller for one Claude agent per team.
 
-Launch strategy (see docs/m4_agent_plan.md §"Agent install 流程"):
+Lifecycle (persistent-memory v1, see
+docs/persistent_memory_agent_plan_v1.md):
 
-  setsid bash -c '...' &           # detach from docker-exec session, new pgid
-      └── <cli> ... &              # child whose pid we record in agent.pid
-      wait $!
-      echo $? > agent.exit_code    # records exit status after child dies
+  install(handle, cfg)              # once per team at game start:
+                                    #   npm install, SSH pivot, env, mcp.json
+                                    #   No process is launched.
+  run_phase(handle, prompt,         # per phase:
+            round_id, phase,        #   write prompt, run claude -p --continue
+            timeout)                #   via the AgentTransport, collect
+                                    #   stdout/stderr/exit/timed_out, write
+                                    #   per-phase artifacts.
 
-The wrapper writes its own PID (== process-group leader, thanks to setsid)
-to agent.wrapper.pid; kill() sends SIGTERM to -<wrapper_pid> so bash + cli +
-all its descendants get the signal together. Killing only agent.pid would
-leave node helper procs reparented to init and lingering until container
-teardown.
+All side effects on the agent host go through `AgentTransport`
+(DockerExecBackend today, SSHBackend tomorrow). The manager never
+calls `docker exec` directly.
 
-If cfg.cli starts with "claude" we npm-install @anthropic-ai/claude-code first;
-any other cli (e.g. "sleep 60" used by tests) is launched as-is.
+Memory across phases carries via Claude CLI's `--continue` flag: the
+CLI's session store lives at /root/.claude/projects/<workdir-cwd>/
+inside the container; `--continue` reloads the most-recent session.
+We pin the cwd to STATE_DIR/workdir so different arenas' sessions
+stay isolated.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -26,44 +33,74 @@ import shlex
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 from typing import Callable
 
 import docker
 
-from models.agent import AgentConfig, AgentLogs, AgentState, AgentStatus
+from models.agent import AgentConfig, AgentLogs, AgentState, AgentStatus, DoneInfo
 from orchestrator.service import ContainerHandle
 
 from .manager import AgentManager
+from .transport import AgentHandle, AgentTransport, CommandResult
+from .transport_docker import DockerExecBackend
 
 log = logging.getLogger(__name__)
 
+# Layout inside the agent host. Paths kept under /var/lib + /var/run +
+# /var/log to match the M4-era convention; the WORKDIR is new for
+# `--continue` session isolation.
 STATE_DIR = "/var/lib/cyberarena"
 LOG_DIR = "/var/log/cyberarena"
 RUN_DIR = "/var/run/cyberarena"
+WORKDIR = f"{STATE_DIR}/workdir"
 
 PROMPT_PATH = f"{STATE_DIR}/prompt.txt"
+PHASE_CONTEXT_PATH = f"{STATE_DIR}/phase_context.json"
 ENV_PATH = f"{STATE_DIR}/agent.env"
 MCP_CONFIG_PATH = f"{STATE_DIR}/mcp.json"
+
+# Legacy paths from the M4 / M4.5 model — kept so fetch_logs / status
+# remain meaningful for any code path that still reads them, even
+# though the persistent-memory v1 model doesn't write them. New code
+# should look at the per-phase stream-{phase}.jsonl / agent-{phase}.log
+# artifacts in the host's run directory instead.
 PID_PATH = f"{RUN_DIR}/agent.pid"
 WRAPPER_PID_PATH = f"{RUN_DIR}/agent.wrapper.pid"
 EXIT_CODE_PATH = f"{RUN_DIR}/agent.exit_code"
 STDOUT_PATH = f"{LOG_DIR}/agent.stdout"
 STDERR_PATH = f"{LOG_DIR}/agent.stderr"
 
-# M4.5 callback shapes: optional, may be None for non-MCP tests (M4
-# hello-world etc. that don't run with a GameMgr). Sync — the install()
-# itself is sync and called from non-async contexts; if the caller needs
-# to dispatch into async code (e.g. EventBus.publish on a uvicorn loop),
-# it wraps with asyncio.run_coroutine_threadsafe.
+# install() callbacks. on_installed fires after all setup is staged
+# (env, mcp.json, ssh pivot, workdir). on_launched is preserved for
+# M4.5 back-compat; it fires alongside on_installed in this design
+# (no separate launch step exists anymore). wrapper_pid passes 0.
 OnInstalled = Callable[[str], None]
 OnLaunched = Callable[[str, int], None]
 
-DEFAULT_PROMPT = "You are an A/D CTF agent. Wait for instructions."
-
 
 class ClaudeAgentManager(AgentManager):
-    def __init__(self, client: docker.DockerClient | None = None) -> None:
-        self._client = client or docker.from_env()
+    """Host-side controller. One instance handles every team; each
+    method takes a ContainerHandle for the team's dev container.
+
+    The transport is injected (DockerExecBackend by default). Tests
+    can pass a FakeTransport that records calls in-memory.
+    """
+
+    def __init__(
+        self,
+        *,
+        transport: AgentTransport | None = None,
+        client: docker.DockerClient | None = None,
+    ) -> None:
+        # Back-compat: existing tests construct `ClaudeAgentManager(client=mock)`.
+        # If only client is given, synthesize a DockerExecBackend from it.
+        if transport is not None:
+            self._transport = transport
+            self._client = client  # may be None; some legacy methods need it
+        else:
+            self._client = client or docker.from_env()
+            self._transport = DockerExecBackend(client=self._client)
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -75,77 +112,223 @@ class ClaudeAgentManager(AgentManager):
         on_installed: OnInstalled | None = None,
         on_launched: OnLaunched | None = None,
     ) -> None:
-        """Install + launch the supervisor.
+        """One-shot setup per team. Idempotent (npm cache hit, SSH key
+        re-push is fine, etc.) but designed to be called exactly once
+        per game by the orchestrator.
 
-        M4.5 split: the callable runs in two phases with optional callbacks
-        at the boundary — `on_installed` fires after the prep stage (files /
-        env / ssh / mcp.json / npm install all done) and *before* the
-        supervisor starts; `on_launched` fires after `_wait_for_pid`
-        confirms the supervisor pid was captured. Both callbacks are
-        sync — wrap with `asyncio.run_coroutine_threadsafe` if you need
-        to dispatch into async (e.g. an EventBus on the uvicorn loop).
+        Steps:
+          1. Make STATE_DIR / LOG_DIR / RUN_DIR / WORKDIR.
+          2. npm install -g @anthropic-ai/claude-code (if cli starts with "claude").
+          3. SSH pivot if cfg.own_prod_container_name set (M5.6 mode).
+          4. Write agent.env (no PROMPT_PATH here — prompts are per-phase).
+          5. Write mcp.json if cfg.mcp_endpoint set.
+          6. Fire on_installed and on_launched callbacks (both fire here
+             in the new model; on_launched is preserved for M4.5 back-
+             compat and gets wrapper_pid=0).
+
+        NO process is launched. The first `run_phase` invocation is
+        what actually starts Claude.
         """
-        # ── prep stage ─────────────────────────────────────────────────
-        self._exec(container, ["mkdir", "-p", STATE_DIR, LOG_DIR, RUN_DIR], check=True)
+        # All dirs the per-phase flow expects to exist.
+        self._exec_sync(container, ["mkdir", "-p", STATE_DIR, LOG_DIR, RUN_DIR, WORKDIR], check=True)
 
-        # Re-install must replace any running supervisor, not race with it.
-        # kill() is a no-op if nothing was installed before. The prior
-        # supervisor's bash will exit as a zombie under the container's PID-1
-        # (which doesn't reap), but that's harmless: the new supervisor gets
-        # a fresh pid + pgid via setsid.
-        self.kill(container)
-
-        # Clear stale supervisor state from a prior run, so wait_for_pid does
-        # not see an old agent.pid and report success before launch happens.
-        self._exec(
+        # Clear stale state from any prior run (legacy paths) so status()
+        # doesn't report a ghost agent from before re-install.
+        self._exec_sync(
             container,
             ["sh", "-c", f"rm -f {PID_PATH} {WRAPPER_PID_PATH} {EXIT_CODE_PATH}"],
             check=True,
         )
 
         if cfg.cli.startswith("claude"):
-            self._exec(
+            self._exec_sync(
                 container,
                 ["npm", "install", "-g", "@anthropic-ai/claude-code"],
                 check=True,
             )
 
-        # Set up SSH pivot into own prod if requested (M5.6). Generates a key
-        # per install() invocation — keys never persist across runs.
         if cfg.own_prod_container_name:
             self._provision_ssh_pivot(container, cfg)
 
-        prompt = cfg.system_prompt or DEFAULT_PROMPT
-        self._write_file(container, PROMPT_PATH, prompt.rstrip() + "\n")
-        self._write_file(container, ENV_PATH, self._build_env_file(cfg))
+        self._transport.write_file(container, ENV_PATH, self._build_env_file(cfg).encode())
 
-        # M4.5 MCP config (only when mcp_endpoint is populated; empty keeps
-        # the non-MCP path intact for older tests).
         if cfg.mcp_endpoint:
             self._write_mcp_config(container, cfg)
 
-        # Prep done. Fire on_installed BEFORE launch so it stays diagnostic
-        # of "files ready, about to launch" — if _launch then crashes, the
-        # absence of AGENT_LAUNCHED tells the operator exactly where to look.
-        if on_installed is not None and cfg.team_id:
-            on_installed(cfg.team_id)
-
-        # ── launch stage ──────────────────────────────────────────────
-        self._launch(container, cfg)
-        self._wait_for_pid(container, timeout_s=5.0)
         log.info("agent installed on %s (cli=%r)", container.name, cfg.cli)
 
+        # Both lifecycle callbacks fire here. There's no separate
+        # "launched" step anymore — `run_phase` is what starts Claude
+        # per-phase, and that fires its own AGENT_PROMPT_SENT /
+        # COMPLETED / TIMEOUT / FAILED events.
+        if on_installed is not None and cfg.team_id:
+            on_installed(cfg.team_id)
         if on_launched is not None and cfg.team_id:
-            wrapper_pid = self._read_int(container, WRAPPER_PID_PATH) or 0
-            on_launched(cfg.team_id, wrapper_pid)
+            on_launched(cfg.team_id, 0)
+
+    async def run_phase(
+        self,
+        container: ContainerHandle,
+        prompt: str,
+        *,
+        round_id: int,
+        phase: str,
+        timeout: float,
+        artifact_dir: Path | None = None,
+        model: str | None = None,
+    ) -> DoneInfo:
+        """Run one phase: drop the prompt, invoke `claude -p --continue`
+        through the transport, capture artifacts, return DoneInfo.
+
+        `timeout` is the phase timer in seconds. On expiry the transport
+        terminates the subprocess (SIGTERM → SIGKILL) and we issue a
+        belt-and-suspenders `pkill -KILL -f 'claude -p'` inside the
+        container in case docker-exec signal propagation lost the signal.
+
+        `artifact_dir`, if provided, gets `stream-{phase}.jsonl`,
+        `agent-{phase}.log`, and `metadata-{phase}.json` written into it.
+        If None, only the DoneInfo return value is populated and the
+        caller handles persistence.
+
+        `model` overrides `$CLAUDE_MODEL` (sourced from agent.env in the
+        container) for this invocation. Useful for tests; production
+        flows leave it None.
+        """
+        ctx = json.dumps({"round_id": round_id, "phase": phase})
+        self._transport.write_file(container, PROMPT_PATH, prompt.encode())
+        self._transport.write_file(container, PHASE_CONTEXT_PATH, ctx.encode())
+
+        model_arg = (
+            f"--model {shlex.quote(model)} "
+            if model
+            else '--model "$CLAUDE_MODEL" '
+        )
+
+        # The whole claude invocation is wrapped in a shell so we can:
+        #   - cd into WORKDIR (claude --continue picks the cwd-scoped session)
+        #   - source agent.env to get ANTHROPIC_API_KEY / BASE_URL / CLAUDE_MODEL
+        #   - redirect stdin from PROMPT_PATH (Claude reads the prompt from stdin
+        #     in -p mode)
+        # The transport handles the timeout escalation; we just await.
+        started_at = time.time()
+        result: CommandResult = await self._transport.run_command(
+            container,
+            [
+                "bash", "-c",
+                f"cd {shlex.quote(WORKDIR)} && "
+                f"set -a && . {shlex.quote(ENV_PATH)} && set +a && "
+                "claude -p --continue "
+                "--output-format stream-json --verbose "
+                "--dangerously-skip-permissions "
+                + model_arg
+                + f"--mcp-config {shlex.quote(MCP_CONFIG_PATH)} "
+                f"< {shlex.quote(PROMPT_PATH)}"
+            ],
+            timeout=timeout,
+        )
+        ended_at = time.time()
+        duration_ms = int((ended_at - started_at) * 1000)
+
+        if result.timed_out:
+            # docker exec may not propagate SIGTERM cleanly to the
+            # in-container claude child; pkill as a safety net.
+            self._transport.kill_process(container, "claude -p")
+
+        # Per-phase artifact files. Path naming matches the existing
+        # DEFCON artifact store layout from
+        # docs/DEFCON_challenge_framework_report_v1.md.
+        stdout_path = ""
+        stderr_path = ""
+        if artifact_dir is not None:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            stream_p = artifact_dir / f"stream-{phase}.jsonl"
+            agent_p = artifact_dir / f"agent-{phase}.log"
+            meta_p = artifact_dir / f"metadata-{phase}.json"
+            stream_p.write_bytes(result.stdout)
+            agent_p.write_bytes(result.stderr)
+            meta_p.write_text(json.dumps({
+                "round_id": round_id,
+                "phase": phase,
+                "exit_code": result.exit_code,
+                "timed_out": result.timed_out,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "duration_ms": duration_ms,
+                "prompt_first_line": (prompt.splitlines()[0] if prompt else ""),
+            }))
+            stdout_path = str(stream_p)
+            stderr_path = str(agent_p)
+
+        return DoneInfo(
+            exit_code=result.exit_code,
+            timed_out=result.timed_out,
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_ms=duration_ms,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+
+    def status(self, container: ContainerHandle) -> AgentState:
+        """Legacy M4/M4.5 status read against the supervisor pid files.
+        These files are no longer written by the persistent-memory v1
+        install (no supervisor exists), so `status()` will normally
+        return NOT_INSTALLED. Kept for M4 test back-compat.
+        """
+        wrapper_pid = self._read_int_legacy(container, WRAPPER_PID_PATH)
+        pid = self._read_int_legacy(container, PID_PATH)
+        exit_code = self._read_int_legacy(container, EXIT_CODE_PATH)
+
+        if pid is None:
+            return AgentState(status=AgentStatus.NOT_INSTALLED)
+
+        if exit_code is not None:
+            if exit_code == 0:
+                status = AgentStatus.COMPLETED
+            elif exit_code in (130, 143):
+                status = AgentStatus.TERMINATED
+            else:
+                status = AgentStatus.CRASHED
+            return AgentState(status=status, pid=pid, wrapper_pid=wrapper_pid, exit_code=exit_code)
+
+        rc, _ = self._exec_sync(container, ["kill", "-0", str(pid)])
+        if rc == 0:
+            return AgentState(status=AgentStatus.RUNNING, pid=pid, wrapper_pid=wrapper_pid)
+        return AgentState(status=AgentStatus.CRASHED, pid=pid, wrapper_pid=wrapper_pid)
+
+    def kill(self, container: ContainerHandle) -> None:
+        """Legacy kill — sends SIGTERM to any process matching `claude -p`
+        inside the container. In the v1 model the per-phase claude is
+        typically already dead by the time kill() is called from
+        teardown; this is a safety net.
+        """
+        # Best-effort cleanup of legacy supervisor pid first.
+        wrapper_pid = self._read_int_legacy(container, WRAPPER_PID_PATH)
+        if wrapper_pid is not None:
+            self._exec_sync(
+                container,
+                ["sh", "-c", f"kill -TERM -- -{wrapper_pid} 2>/dev/null || true"],
+            )
+        # Then anything still matching claude.
+        self._transport.kill_process(container, "claude -p")
+
+    def fetch_logs(self, container: ContainerHandle) -> AgentLogs:
+        """Read the legacy stdout/stderr/exit_code paths. Returns empty
+        strings under the v1 model (those paths aren't written anymore).
+        New code should consume per-phase artifacts written by
+        `run_phase` (stream-{phase}.jsonl / agent-{phase}.log /
+        metadata-{phase}.json).
+        """
+        stdout = self._read_text(container, STDOUT_PATH)
+        stderr = self._read_text(container, STDERR_PATH)
+        exit_code = self._read_int_legacy(container, EXIT_CODE_PATH)
+        return AgentLogs(stdout=stdout, stderr=stderr, exit_code=exit_code)
+
+    # ── internals (legacy + helpers) ────────────────────────────────────
 
     def _write_mcp_config(self, container: ContainerHandle, cfg: AgentConfig) -> None:
-        """Drop mcp.json with the team token in headers, chmod 600.
-
-        token-in-headers, never as a tool argument — keeps the LLM from
-        ever seeing the string (defends against accidental complete /
-        echo in stream-json transcripts).
-        """
+        """Drop mcp.json with the team token in headers (M4.5 convention).
+        Mode 600 so it's not world-readable inside the container."""
         payload = {
             "mcpServers": {
                 "cyberarena": {
@@ -155,18 +338,23 @@ class ClaudeAgentManager(AgentManager):
                 }
             }
         }
-        self._write_file(container, MCP_CONFIG_PATH, json.dumps(payload, indent=2) + "\n")
-        self._exec(container, ["chmod", "600", MCP_CONFIG_PATH], check=True)
+        self._transport.write_file(
+            container, MCP_CONFIG_PATH, (json.dumps(payload, indent=2) + "\n").encode()
+        )
+        self._exec_sync(container, ["chmod", "600", MCP_CONFIG_PATH], check=True)
 
     def _build_env_file(self, cfg: AgentConfig) -> str:
-        """Render the agent.env file. Anthropic + IS_SANDBOX always present;
-        M5.6 attack-mode fields included when populated; cfg.extra_env merged
-        last so it can override anything."""
+        """agent.env contents: API key + base URL + IS_SANDBOX, plus all
+        the M5.6 attack-mode fields when populated. CLAUDE_MODEL is now
+        also exported so the per-phase claude invocation can pick it up
+        without needing --model on the command line."""
         lines = [
             f"export ANTHROPIC_API_KEY={shlex.quote(cfg.api_key)}",
             f"export ANTHROPIC_BASE_URL={shlex.quote(cfg.base_url)}",
             "export IS_SANDBOX=1",
         ]
+        if cfg.model:
+            lines.append(f"export CLAUDE_MODEL={shlex.quote(cfg.model)}")
         if cfg.team_id:
             lines.append(f"export CYBERARENA_TEAM_ID={shlex.quote(cfg.team_id)}")
         if cfg.team_token:
@@ -185,16 +373,14 @@ class ClaudeAgentManager(AgentManager):
         return "\n".join(lines) + "\n"
 
     def _provision_ssh_pivot(self, dev_container: ContainerHandle, cfg: AgentConfig) -> None:
-        """Generate an ed25519 keypair on host, inject pubkey + start sshd on
-        own prod, drop privkey + ssh config into dev. Keys are ephemeral
-        (host tmpdir scoped to this install() call).
+        """Generate an ed25519 keypair on the host, push the pubkey to
+        own_prod's authorized_keys, drop the privkey + ssh config into
+        dev. Ephemeral key per install() — never persisted.
 
-        SSH user selection: if the target prod image has an `arena_agent`
-        non-root user (DEFCON framework image, e.g. cyberarena/chal-nautilus-ico),
-        the key lands in `/home/arena_agent/.ssh/` and ssh config uses
-        `User arena_agent`. Otherwise (legacy cyberarena/prod-base used by
-        notes/M5/M5.6 tests), falls back to root. Detected at runtime by
-        probing the target container for the user.
+        Detects the prod-side SSH user at runtime: `arena_agent` if the
+        target image carries that non-root user (DEFCON framework image,
+        e.g. cyberarena/chal-nautilus-ico), else falls back to root
+        (legacy cyberarena/prod-base used by notes / M5 / M5.6 tests).
         """
         prod_name = cfg.own_prod_container_name
         log.info("provisioning ssh pivot %s -> %s", dev_container.name, prod_name)
@@ -213,9 +399,8 @@ class ClaudeAgentManager(AgentManager):
             with open(pub) as f:
                 pubkey = f.read()
 
-        # Probe for the arena_agent user; pick the SSH target user accordingly.
         prod_container = ContainerHandle(container_id="", name=prod_name, networks=[])
-        rc, _ = self._exec(prod_container, ["id", "arena_agent"])
+        rc, _ = self._exec_sync(prod_container, ["id", "arena_agent"])
         if rc == 0:
             ssh_user = "arena_agent"
             ssh_home = "/home/arena_agent"
@@ -224,28 +409,22 @@ class ClaudeAgentManager(AgentManager):
             ssh_home = "/root"
         log.info("ssh pivot target user on %s: %s", prod_name, ssh_user)
 
-        # Pubkey + sshd on prod (write into the chosen user's home).
         ssh_dir = f"{ssh_home}/.ssh"
-        self._exec(prod_container, ["mkdir", "-p", ssh_dir], check=True)
-        self._exec(prod_container, ["chmod", "700", ssh_dir], check=True)
-        self._write_file(prod_container, f"{ssh_dir}/authorized_keys", pubkey)
-        self._exec(prod_container, ["chmod", "600", f"{ssh_dir}/authorized_keys"], check=True)
+        self._exec_sync(prod_container, ["mkdir", "-p", ssh_dir], check=True)
+        self._exec_sync(prod_container, ["chmod", "700", ssh_dir], check=True)
+        self._transport.write_file(prod_container, f"{ssh_dir}/authorized_keys", pubkey.encode())
+        self._exec_sync(prod_container, ["chmod", "600", f"{ssh_dir}/authorized_keys"], check=True)
         if ssh_user != "root":
-            self._exec(prod_container, ["chown", "-R", f"{ssh_user}:{ssh_user}", ssh_dir], check=True)
+            self._exec_sync(prod_container, ["chown", "-R", f"{ssh_user}:{ssh_user}", ssh_dir], check=True)
 
-        # Host keys + sshd. sshd's config in the framework image already sets
-        # PermitRootLogin no; legacy prod-base inherits Ubuntu default
-        # (prohibit-password — root login still works via key, which is what M5.6 used).
-        self._exec(prod_container, ["mkdir", "-p", "/run/sshd"], check=True)
-        self._exec(prod_container, ["ssh-keygen", "-A"], check=True)
-        self._exec(prod_container, ["/usr/sbin/sshd"], check=True)
+        self._exec_sync(prod_container, ["mkdir", "-p", "/run/sshd"], check=True)
+        self._exec_sync(prod_container, ["ssh-keygen", "-A"], check=True)
+        self._exec_sync(prod_container, ["/usr/sbin/sshd"], check=True)
 
-        # Privkey + ssh config on dev (always under dev's /root/.ssh since
-        # the dev container runs the agent CLI as root).
-        self._exec(dev_container, ["mkdir", "-p", "/root/.ssh"], check=True)
-        self._exec(dev_container, ["chmod", "700", "/root/.ssh"], check=True)
-        self._write_file(dev_container, "/root/.ssh/id_ed25519", privkey)
-        self._exec(dev_container, ["chmod", "600", "/root/.ssh/id_ed25519"], check=True)
+        self._exec_sync(dev_container, ["mkdir", "-p", "/root/.ssh"], check=True)
+        self._exec_sync(dev_container, ["chmod", "700", "/root/.ssh"], check=True)
+        self._transport.write_file(dev_container, "/root/.ssh/id_ed25519", privkey.encode())
+        self._exec_sync(dev_container, ["chmod", "600", "/root/.ssh/id_ed25519"], check=True)
         ssh_config = (
             f"Host {cfg.own_prod_host}\n"
             f"    User {ssh_user}\n"
@@ -254,144 +433,50 @@ class ClaudeAgentManager(AgentManager):
             f"    UserKnownHostsFile /dev/null\n"
             f"    LogLevel ERROR\n"
         )
-        self._write_file(dev_container, "/root/.ssh/config", ssh_config)
-        self._exec(dev_container, ["chmod", "600", "/root/.ssh/config"], check=True)
+        self._transport.write_file(dev_container, "/root/.ssh/config", ssh_config.encode())
+        self._exec_sync(dev_container, ["chmod", "600", "/root/.ssh/config"], check=True)
 
-    def status(self, container: ContainerHandle) -> AgentState:
-        wrapper_pid = self._read_int(container, WRAPPER_PID_PATH)
-        pid = self._read_int(container, PID_PATH)
-        exit_code = self._read_int(container, EXIT_CODE_PATH)
+    # ── sync exec helpers (docker-py based, used by install + legacy paths) ─
 
-        if pid is None:
-            return AgentState(status=AgentStatus.NOT_INSTALLED)
-
-        if exit_code is not None:
-            if exit_code == 0:
-                status = AgentStatus.COMPLETED
-            elif exit_code in (130, 143):  # 128+SIGINT, 128+SIGTERM
-                status = AgentStatus.TERMINATED
-            else:
-                status = AgentStatus.CRASHED
-            return AgentState(status=status, pid=pid, wrapper_pid=wrapper_pid, exit_code=exit_code)
-
-        # No exit_code file yet → child is presumed running. Confirm with kill -0.
-        rc, _ = self._exec(container, ["kill", "-0", str(pid)])
-        if rc == 0:
-            return AgentState(status=AgentStatus.RUNNING, pid=pid, wrapper_pid=wrapper_pid)
-        # pid file present but process gone and no exit_code yet — race during
-        # supervisor teardown. Report CRASHED conservatively.
-        return AgentState(status=AgentStatus.CRASHED, pid=pid, wrapper_pid=wrapper_pid)
-
-    def kill(self, container: ContainerHandle) -> None:
-        wrapper_pid = self._read_int(container, WRAPPER_PID_PATH)
-        pid = self._read_int(container, PID_PATH)
-        if pid is None and wrapper_pid is None:
-            return  # never installed, or already cleaned up
-
-        # Step 1: signal the tracked child only. This lets the supervisor bash
-        # observe `wait` returning and record exit_code before we kill it too.
-        if pid is not None:
-            self._exec(
-                container,
-                ["sh", "-c", f"kill -TERM {pid} 2>/dev/null || true"],
-            )
-            # Give the supervisor a moment to wake from wait + write exit_code.
-            for _ in range(40):  # up to ~2s
-                if self._read_int(container, EXIT_CODE_PATH) is not None:
-                    break
-                time.sleep(0.05)
-
-        # Step 2: nuke the entire process group. For `sleep 60` this is a no-op
-        # (supervisor already exited cleanly); for real CLIs it sweeps up any
-        # node helper procs that were reparented away from the tracked pid.
-        if wrapper_pid is not None:
-            self._exec(
-                container,
-                ["sh", "-c", f"kill -TERM -- -{wrapper_pid} 2>/dev/null || true"],
-            )
-
-    def fetch_logs(self, container: ContainerHandle) -> AgentLogs:
-        stdout = self._read_text(container, STDOUT_PATH)
-        stderr = self._read_text(container, STDERR_PATH)
-        exit_code = self._read_int(container, EXIT_CODE_PATH)
-        return AgentLogs(stdout=stdout, stderr=stderr, exit_code=exit_code)
-
-    # ── internals ───────────────────────────────────────────────────────
-
-    def _launch(self, container: ContainerHandle, cfg: AgentConfig) -> None:
-        # The supervisor bash runs inside `setsid` so it becomes a new session
-        # AND process-group leader. We capture $BASHPID (the leader's pid) and
-        # use it as the killpg target later.
-        cli = cfg.cli
-        # Pass cfg.model to the CLI as `--model <name>` so it doesn't
-        # silently default to a built-in version the API router may not
-        # have access to. Without this, the model the CLI requests
-        # diverges from game.yaml and surfaces as 503 server_error
-        # (model_not_found) + a long chain of api_retry events in the
-        # stream-json log. Skip when the caller already wrote --model
-        # into cfg.cli themselves.
-        if cfg.model and cfg.cli.startswith("claude") and "--model" not in cfg.cli:
-            cli = f"{cli} --model {shlex.quote(cfg.model)}"
-        # M4.5: add --mcp-config only when MCP is enabled for this agent.
-        # Goes on the cli command line, not as an env var, because Claude
-        # Code expects this as a flag.
-        if cfg.mcp_endpoint and cfg.cli.startswith("claude"):
-            cli = f"{cli} --mcp-config {MCP_CONFIG_PATH}"
-        script = f"""
-set -e
-nohup setsid bash -c '
-  echo $BASHPID > {WRAPPER_PID_PATH}
-  set -a; . {ENV_PATH}; set +a
-  {cli} < {PROMPT_PATH} > {STDOUT_PATH} 2> {STDERR_PATH} &
-  CHILD_PID=$!
-  echo $CHILD_PID > {PID_PATH}
-  wait $CHILD_PID
-  echo $? > {EXIT_CODE_PATH}
-' </dev/null >/dev/null 2>&1 &
-"""
-        rc, out = self._exec(container, ["bash", "-c", script])
-        if rc != 0:
-            raise RuntimeError(f"agent launch failed on {container.name}: rc={rc}, out={out!r}")
-
-    def _wait_for_pid(self, container: ContainerHandle, timeout_s: float) -> None:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            if self._read_int(container, PID_PATH) is not None:
-                return
-            time.sleep(0.1)
-        raise TimeoutError(
-            f"agent pid file {PID_PATH} not created within {timeout_s}s on {container.name}"
-        )
-
-    # ── exec helpers ────────────────────────────────────────────────────
-
-    def _exec(
+    def _exec_sync(
         self,
         container: ContainerHandle,
         cmd: list[str] | str,
         *,
         check: bool = False,
     ) -> tuple[int, str]:
+        """Synchronous exec via docker-py. Used during install where we
+        don't need async + timeout semantics. The transport's
+        run_command is the async path for per-phase work.
+        """
+        if self._client is None:
+            # Transport-only injection (tests). Fall back to a synchronous
+            # transport invocation via asyncio.run — install paths in
+            # tests typically pass a docker client; this branch is mostly
+            # defensive.
+            result = asyncio.run(self._transport.run_command(container, cmd))
+            out = (result.stdout + result.stderr).decode(errors="replace")
+            if check and result.exit_code != 0:
+                raise RuntimeError(
+                    f"exec failed ({cmd!r}) on {container.name}: rc={result.exit_code}, out={out!r}"
+                )
+            return result.exit_code, out
+
         c = self._client.containers.get(container.name)
         result = c.exec_run(cmd, demux=False)
         out = result.output.decode(errors="replace") if result.output else ""
         if check and result.exit_code != 0:
-            raise RuntimeError(f"exec failed ({cmd!r}) on {container.name}: rc={result.exit_code}, out={out!r}")
+            raise RuntimeError(
+                f"exec failed ({cmd!r}) on {container.name}: rc={result.exit_code}, out={out!r}"
+            )
         return result.exit_code, out
 
-    def _write_file(self, container: ContainerHandle, path: str, content: str) -> None:
-        # Use a here-doc with a randomish sentinel-free delimiter; content is
-        # passed verbatim, no shell interpolation, no leading whitespace strip.
-        sentinel = "CYBERARENA_EOF_8d4a"
-        script = f"cat > {path} <<'{sentinel}'\n{content}{sentinel}\n"
-        self._exec(container, ["sh", "-c", script], check=True)
-
     def _read_text(self, container: ContainerHandle, path: str) -> str:
-        rc, out = self._exec(container, ["sh", "-c", f"cat {path} 2>/dev/null || true"])
+        rc, out = self._exec_sync(container, ["sh", "-c", f"cat {path} 2>/dev/null || true"])
         return out
 
-    def _read_int(self, container: ContainerHandle, path: str) -> int | None:
-        rc, out = self._exec(container, ["sh", "-c", f"cat {path} 2>/dev/null || true"])
+    def _read_int_legacy(self, container: ContainerHandle, path: str) -> int | None:
+        rc, out = self._exec_sync(container, ["sh", "-c", f"cat {path} 2>/dev/null || true"])
         out = out.strip()
         if not out:
             return None

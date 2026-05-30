@@ -184,10 +184,10 @@ def test_registered_defense_kickoff_handler_is_invoked_with_agent_config():
         agents=agents,
     )
 
-    calls: list[tuple[str, AgentConfig]] = []
+    calls: list[tuple[str, AgentConfig, int, str, bool]] = []
 
-    async def handler(team_id: str, cfg: AgentConfig) -> None:
-        calls.append((team_id, cfg))
+    async def handler(team_id: str, cfg: AgentConfig, round_id: int, phase: str, is_first: bool) -> None:
+        calls.append((team_id, cfg, round_id, phase, is_first))
 
     game.register_defense_kickoff_handler(handler)
 
@@ -197,8 +197,13 @@ def test_registered_defense_kickoff_handler_is_invoked_with_agent_config():
     asyncio.run(run())
 
     assert len(calls) == 2, calls
-    by_team = {tid: cfg for tid, cfg in calls}
+    by_team = {c[0]: c[1] for c in calls}
     assert set(by_team) == {"team1", "team2"}
+    # Both teams see is_first=True since this is round 1 and the first
+    # time either team's agent has been kicked off.
+    assert all(c[4] is True for c in calls), f"first kickoff per team must be is_first=True; got {calls}"
+    # All on round 1, all phase=defense.
+    assert all(c[2] == 1 and c[3] == "defense" for c in calls), calls
     for tid, cfg in by_team.items():
         # Defense prompt fingerprints: mentions the service name + restart_service.
         assert "defense agent" in cfg.system_prompt.lower()
@@ -240,7 +245,7 @@ def test_handler_exception_does_not_break_subsequent_handlers():
 
     invoked: list[str] = []
 
-    async def handler(team_id: str, cfg: AgentConfig) -> None:
+    async def handler(team_id: str, cfg: AgentConfig, round_id: int, phase: str, is_first: bool) -> None:
         invoked.append(team_id)
         if team_id == "team1":
             raise RuntimeError("simulated handler crash for team1")

@@ -13,9 +13,13 @@ import docker
 import uvicorn
 
 from agents.claude import ClaudeAgentManager
+from agents.transport_docker import DockerExecBackend
 from gamemgr.api import build_app
+from gamemgr.artifacts import ArtifactKind
 from gamemgr.config import load as load_game_config
+from gamemgr.events import EventType, new_event
 from gamemgr.game_mgr import GameMgr
+from models.agent import AgentConfig
 from orchestrator import topology
 from orchestrator.orchestrator import Orchestrator
 
@@ -70,10 +74,11 @@ async def _run_start(args) -> int:
     game.deploy_challenges()
     game.plant_initial_flags()
 
-    # DEFCON Phase 4b: spawn a defense agent on each team's dev container
-    # when the round loop enters DEFENSE. Handler is sync (ClaudeAgentManager.install
-    # is sync) → run in the default thread pool to avoid blocking the loop.
-    _wire_defense_kickoff(game)
+    # Persistent-memory v1: install once pre-loop, run_phase per phase.
+    # Wires install + defense/attack kickoff handlers on game; the
+    # install handler runs inside game.start() (after FileSink is up)
+    # via game.install_all_agents().
+    _wire_phase_kickoffs(game)
 
     shutdown = asyncio.Event()
     app = build_app(game, shutdown)
@@ -135,63 +140,140 @@ def _build_challenge_images(config_path: str) -> None:
         log.info("built/cached %d challenge image(s): %s", len(tags), tags)
 
 
-def _wire_defense_kickoff(game: GameMgr) -> None:
-    """Register defense + attack kickoff handlers that install a Claude
-    agent on the team's dev container on every DEFENSE / ATTACK entry.
+def _wire_phase_kickoffs(game: GameMgr) -> None:
+    """Wire ClaudeAgentManager into GameMgr for persistent-memory v1:
 
-    Both phases share one ClaudeAgentManager (state is per-container, not
-    per-handler) so subsequent installs on the same dev container reuse
-    SSH keys / npm-installed CLI / etc.
+    - install handler (called once per team by `game.install_all_agents()`
+      from inside start(), before the round loop ticks).
+    - defense + attack kickoff handlers (called per (team, phase) by the
+      round loop; each one awaits a single `run_phase` via the transport
+      and emits AGENT_PROMPT_SENT / AGENT_COMPLETED / AGENT_TIMEOUT /
+      AGENT_FAILED on the bus).
 
-    Sync `install()` is bridged into the async loop via run_in_executor.
-    The kickoff event also publishes regardless — observers (panel) see
-    the signal even if the install raises.
+    One transport, one manager — state lives in the agent container and
+    in Claude CLI's session store, not in the manager.
     """
     client = docker.from_env()
-    agent_mgr = ClaudeAgentManager(client=client)
+    backend = DockerExecBackend(client=client)
+    agent_mgr = ClaudeAgentManager(transport=backend, client=client)
 
-    def _make_handler(mode: str):
-        async def handler(team_id: str, cfg) -> None:
+    # ── install handler (pre-loop) ─────────────────────────────────────
+    async def install_handler(team_id: str, cfg: AgentConfig) -> None:
+        team = next((t for t in game.config.topology.teams if t.id == team_id), None)
+        if team is None or not team.dev:
+            log.warning("install: team %s has no dev container; skipping", team_id)
+            return
+        try:
+            handle = game._handle_for(team.dev)
+        except Exception:
+            log.exception("install: cannot resolve dev handle for %s", team_id)
+            return
+        loop = asyncio.get_running_loop()
+        def _on_installed(tid: str) -> None:
+            asyncio.run_coroutine_threadsafe(game.record_agent_installed(tid), loop)
+        def _on_launched(tid: str, wrapper_pid: int) -> None:
+            asyncio.run_coroutine_threadsafe(
+                game.record_agent_launched(tid, wrapper_pid), loop
+            )
+        await loop.run_in_executor(
+            None,
+            lambda: agent_mgr.install(
+                handle, cfg,
+                on_installed=_on_installed, on_launched=_on_launched,
+            ),
+        )
+        log.info("agent installed on %s", team.dev)
+
+    game.register_install_agent_handler(install_handler)
+
+    # ── per-phase kickoff handler ──────────────────────────────────────
+    def _make_phase_handler(timeout_secs: float):
+        async def handler(
+            team_id: str,
+            cfg: AgentConfig,
+            round_id: int,
+            phase: str,
+            is_first: bool,
+        ) -> None:
             team = next((t for t in game.config.topology.teams if t.id == team_id), None)
             if team is None or not team.dev:
-                log.warning("%s kickoff: team %s has no dev container; skipping", mode, team_id)
+                log.warning("%s kickoff: team %s has no dev container; skipping", phase, team_id)
                 return
             try:
                 handle = game._handle_for(team.dev)
             except Exception:
-                log.exception("%s kickoff: cannot resolve dev handle for %s", mode, team_id)
+                log.exception("%s kickoff: cannot resolve dev handle for %s", phase, team_id)
                 return
-            # M4.5 lifecycle callbacks — fire AGENT_INSTALLED after prep
-            # (files / mcp.json / ssh pivot done) and AGENT_LAUNCHED after
-            # the supervisor pid is captured. Both run on the executor
-            # thread; bridge back to the loop with run_coroutine_threadsafe.
-            loop = asyncio.get_running_loop()
-            def _on_installed(tid: str) -> None:
-                asyncio.run_coroutine_threadsafe(
-                    game.record_agent_installed(tid), loop
+
+            prompt = cfg.system_prompt or ""
+            await game.bus.publish(new_event(
+                EventType.AGENT_PROMPT_SENT,
+                team_id=team_id, round_id=round_id, phase=phase,
+                payload={
+                    "prompt_first_line": (prompt.splitlines()[0] if prompt else ""),
+                    "is_first": is_first,
+                },
+            ))
+
+            artifact_dir = None
+            if game.artifacts is not None:
+                # path_for returns runs/<ts>/artifacts/<team>/round-<N>/<file>.
+                # run_phase writes 3 sibling files in that dir; .parent IS
+                # the dir we want.
+                artifact_dir = game.artifacts.path_for(
+                    ArtifactKind.API_LOG,
+                    team_id=team_id, round_id=round_id,
+                    filename=f"stream-{phase}.jsonl",
+                ).parent
+
+            try:
+                done = await agent_mgr.run_phase(
+                    handle, prompt,
+                    round_id=round_id, phase=phase,
+                    timeout=timeout_secs,
+                    artifact_dir=artifact_dir,
+                    model=cfg.model or None,
                 )
-            def _on_launched(tid: str, wrapper_pid: int) -> None:
-                asyncio.run_coroutine_threadsafe(
-                    game.record_agent_launched(tid, wrapper_pid), loop
-                )
-            await loop.run_in_executor(
-                None,
-                lambda: agent_mgr.install(
-                    handle, cfg,
-                    on_installed=_on_installed,
-                    on_launched=_on_launched,
-                ),
-            )
-            log.info("%s agent installed on %s", mode, team.dev)
+            except Exception as e:
+                log.exception("%s kickoff: run_phase raised for %s", phase, team_id)
+                await game.bus.publish(new_event(
+                    EventType.AGENT_FAILED,
+                    team_id=team_id, round_id=round_id, phase=phase,
+                    payload={"error": f"{type(e).__name__}: {e}"[:200]},
+                ))
+                return
+
+            payload = {
+                "exit_code": done.exit_code,
+                "duration_ms": done.duration_ms,
+                "started_at": done.started_at,
+                "ended_at": done.ended_at,
+            }
+            if done.timed_out:
+                event_type = EventType.AGENT_TIMEOUT
+            elif done.exit_code == 0:
+                event_type = EventType.AGENT_COMPLETED
+            else:
+                event_type = EventType.AGENT_FAILED
+                payload["error_excerpt"] = f"non-zero exit {done.exit_code}"
+            await game.bus.publish(new_event(
+                event_type,
+                team_id=team_id, round_id=round_id, phase=phase,
+                payload=payload,
+            ))
         return handler
 
-    game.register_defense_kickoff_handler(_make_handler("defense"))
-    game.register_attack_kickoff_handler(_make_handler("attack"))
-    # Artifact persistence — same agent_mgr reads stdout/stderr/exit_code
-    # off the dev container so the run_dir gets api-logs/ + agent-logs/.
-    # docker logs → service-logs/ are owned by GameMgr directly (no
-    # AgentManager needed for that path).
-    game.register_fetch_agent_logs_handler(agent_mgr.fetch_logs)
+    game.register_defense_kickoff_handler(
+        _make_phase_handler(game.config.rounds.defense_secs)
+    )
+    game.register_attack_kickoff_handler(
+        _make_phase_handler(game.config.rounds.attack_secs)
+    )
+    # Service-logs (docker logs) still go through GameMgr's _persist_service_logs
+    # at ROUND_STOP. Agent stdout/stderr/exit_code now flow directly from
+    # run_phase into the artifact_dir, so we deliberately do NOT register
+    # a fetch_agent_logs_handler — that path is legacy (M4-era supervisor)
+    # and would overwrite the per-phase artifacts with empty content.
 
 
 if __name__ == "__main__":

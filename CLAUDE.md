@@ -17,6 +17,7 @@ All design lives in [docs/](docs/). Read the relevant doc before changing relate
 - [docs/m6_panel_plan.md](docs/m6_panel_plan.md) / [docs/m6_panel_report.md](docs/m6_panel_report.md) — M6: observation panel (live event stream)
 - [docs/m4_5_mcp_plan.md](docs/m4_5_mcp_plan.md) / [docs/m4_5_mcp_report.md](docs/m4_5_mcp_report.md) — M4.5: MCP agent channel (replaces deferred WS reverse channel)
 - [docs/DEFCON_challenge_framework_plan_v1.md](docs/DEFCON_challenge_framework_plan_v1.md) / [docs/DEFCON_challenge_framework_report_v1.md](docs/DEFCON_challenge_framework_report_v1.md) — DEFCON: pluggable ChallengeSource + nautilus-ico defense workflow
+- [docs/persistent_memory_agent_plan_v1.md](docs/persistent_memory_agent_plan_v1.md) — Persistent-memory agent v1: install once, `claude -p --continue` per phase via `AgentTransport` (replaces the M4-era per-phase install + supervisor model)
 
 ## Update Rule
 

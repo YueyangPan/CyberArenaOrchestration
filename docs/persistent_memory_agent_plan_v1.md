@@ -70,48 +70,42 @@ decide. Drop permanently.
 
 ---
 
-## Transport abstraction
+## Two abstractions: AgentManager × AgentTransport
 
-`ClaudeAgentManager` never touches `docker exec` directly. All host
-side effects go through `AgentTransport`, so swapping local Docker
-for remote SSH is a backend change, not a manager change.
+The agent layer has two orthogonal interfaces. Keeping them separate
+means we can swap CLIs (Claude → codex/other) without touching the
+host transport, and swap host transports (docker → SSH) without
+touching CLI-specific install + invocation logic.
 
-```python
-@dataclass(frozen=True)
-class CommandResult:
-    exit_code: int
-    stdout: bytes
-    stderr: bytes
-    timed_out: bool
+### `AgentManager` (ABC)
 
+CLI-flavor-specific. One concrete manager per agent CLI. The contract:
 
-class AgentTransport(Protocol):
-    async def connect(self, handle: AgentHandle) -> None:
-        """One-time transport setup. No-op for docker; opens a control
-        master / persistent connection for ssh."""
+| Method | Phase | Purpose |
+|---|---|---|
+| `install(container, cfg)` | game start, once per team | npm install / SSH pivot / env / mcp.json / workdir. No process launched. |
+| `run_phase(container, prompt, *, round_id, phase, timeout, artifact_dir, model) → DoneInfo` | every phase | deliver `prompt`, invoke the CLI on the host through the transport, capture artifacts, return DoneInfo |
+| `status(container)` / `kill(container)` / `fetch_logs(container)` | observability | M4-era hooks; best-effort no-ops under v1 |
 
-    async def run_command(
-        self, handle: AgentHandle, cmd: list[str] | str,
-        *, stdin: bytes | None = None, timeout: float | None = None,
-        cwd: str | None = None, env: dict[str, str] | None = None,
-    ) -> CommandResult:
-        """Run cmd. Returns exit/stdout/stderr/timed_out. Backend
-        handles its own SIGTERM → SIGKILL escalation on timeout."""
+`ClaudeAgentManager` (the v1 concrete class) implements both methods
+on top of `AgentTransport` — it never calls `docker exec` itself.
 
-    def write_file(self, handle, remote_path: str, content: bytes) -> None: ...
-    def read_file(self, handle, remote_path: str) -> bytes: ...
+### `AgentTransport` (Protocol)
 
-    def kill_process(self, handle, pattern: str) -> None:
-        """Belt-and-suspenders after a run_command timeout — used when
-        SIGTERM doesn't propagate cleanly (e.g. through `docker exec`)."""
-```
+Host-flavor-specific. One concrete backend per host kind:
 
-`AgentHandle` is opaque to the manager. Each backend interprets it:
+| Backend | Status | Handle |
+|---|---|---|
+| `DockerExecBackend` | v1 | container name |
+| `SSHBackend` | deferred | host / user / key |
 
-| Backend | handle carries | `run_command` | `write_file` | `kill_process` |
-|---|---|---|---|---|
-| `DockerExecBackend` (v1) | `container_name` | `docker exec -i ...` | `docker exec ... tee` | `docker exec ... pkill -KILL -f ...` |
-| `SSHBackend` (deferred) | `host`, `user`, `key` | `ssh ...` | `ssh ... 'cat > path'` | `ssh ... pkill -KILL -f ...` |
+Surface: `connect`, `run_command` (async; SIGTERM → SIGKILL on timeout),
+`write_file`, `read_file`, `kill_process`. `AgentHandle` is opaque to
+the manager; the transport interprets it.
+
+The split means adding a new CLI (e.g. codex) is one new `AgentManager`
+subclass; adding a new host (e.g. remote VM) is one new
+`AgentTransport`. Neither change touches the other axis.
 
 ---
 
@@ -128,16 +122,19 @@ class AgentTransport(Protocol):
 No process launches here. The next phase's `run_phase` is what first
 starts Claude.
 
-### 2. Each phase — `run_phase(handle, prompt, *, round_id, phase, timeout) → DoneInfo`
+### 2. Each phase — `run_phase(...) → DoneInfo`
 
-See full code below. In short:
+The kickoff subscriber awaits one `run_phase` per (team, phase):
 
-1. `transport.write_file` → `prompt.txt` + `phase_context.json`
-2. Emit `AGENT_PROMPT_SENT`
-3. `await transport.run_command([... claude -p --continue ...], timeout=phase_secs)`
-4. On `timed_out`: `transport.kill_process(handle, "claude -p")` belt-and-suspenders
-5. Write `stream-{phase}.jsonl`, `agent-{phase}.log`, `metadata-{phase}.json` to the host artifact dir
-6. Emit `AGENT_COMPLETED` / `AGENT_TIMEOUT` / `AGENT_FAILED`
+1. Stage `prompt.txt` + `phase_context.json` via the transport.
+2. Emit `AGENT_PROMPT_SENT`.
+3. Run `claude -p --continue` on the agent host through the transport,
+   bounded by the phase timer.
+4. On timeout: belt-and-suspenders `pkill` inside the agent host
+   (defends against `docker exec` swallowing the SIGTERM).
+5. Persist `stream-{phase}.jsonl` / `agent-{phase}.log` /
+   `metadata-{phase}.json` to the host artifact dir.
+6. Emit `AGENT_COMPLETED` / `AGENT_TIMEOUT` / `AGENT_FAILED`.
 
 ### 3. Game end
 
@@ -146,71 +143,30 @@ reaps the dev containers as today; the session store dies with them.
 
 ---
 
-## `ClaudeAgentManager.run_phase` (~30 LOC)
+## `DoneInfo` — `run_phase` return shape
 
-```python
-@dataclass(frozen=True)
-class DoneInfo:
-    exit_code: int
-    timed_out: bool
-    started_at: float
-    ended_at: float
-    duration_ms: int
-    stdout_path: str
-    stderr_path: str
+| Field | Meaning |
+|---|---|
+| `exit_code` | CLI process exit (signal-exits non-zero on timeout) |
+| `timed_out` | `true` iff the transport had to escalate SIGTERM → SIGKILL |
+| `started_at`, `ended_at`, `duration_ms` | wall-clock bookends |
+| `stdout_path`, `stderr_path` | paths to the persisted stream / log files (empty when `artifact_dir=None`) |
 
+This is the same shape as the per-phase `metadata-{phase}.json`
+artifact, so callers can serialize it directly.
 
-class ClaudeAgentManager:
-    def __init__(self, transport: AgentTransport, ...) -> None:
-        self.transport = transport
-
-    async def run_phase(
-        self, handle: AgentHandle, prompt: str,
-        *, round_id: int, phase: str, timeout: float,
-    ) -> DoneInfo:
-        ctx = json.dumps({"round_id": round_id, "phase": phase})
-        self.transport.write_file(handle, "/tmp/agent/prompt.txt", prompt.encode())
-        self.transport.write_file(handle, "/tmp/agent/phase_context.json", ctx.encode())
-
-        started_at = time.time()
-        result = await self.transport.run_command(
-            handle,
-            ["bash", "-c",
-             "cd /tmp/agent/workdir && "
-             "set -a && . /tmp/agent/agent.env && set +a && "
-             "claude -p --continue "
-             "--output-format stream-json --verbose "
-             "--dangerously-skip-permissions "
-             "--model \"$CLAUDE_MODEL\" --mcp-config /tmp/agent/mcp.json "
-             "< /tmp/agent/prompt.txt"],
-            timeout=timeout,
-        )
-        if result.timed_out:
-            self.transport.kill_process(handle, "claude -p")
-        ended_at = time.time()
-
-        d = self._artifact_dir(handle, round_id, phase)
-        (d / f"stream-{phase}.jsonl").write_bytes(result.stdout)
-        (d / f"agent-{phase}.log").write_bytes(result.stderr)
-        (d / f"metadata-{phase}.json").write_text(json.dumps({
-            "round_id": round_id, "phase": phase,
-            "exit_code": result.exit_code, "timed_out": result.timed_out,
-            "started_at": started_at, "ended_at": ended_at,
-            "duration_ms": int((ended_at - started_at) * 1000),
-            "prompt_first_line": prompt.splitlines()[0] if prompt else "",
-        }))
-
-        return DoneInfo(
-            exit_code=result.exit_code, timed_out=result.timed_out,
-            started_at=started_at, ended_at=ended_at,
-            duration_ms=int((ended_at - started_at) * 1000),
-            stdout_path=str(d / f"stream-{phase}.jsonl"),
-            stderr_path=str(d / f"agent-{phase}.log"),
-        )
-```
+Implementations must:
+- Honor `timeout` and escalate SIGTERM → SIGKILL on expiry; set
+  `timed_out=True` in DoneInfo.
+- When `artifact_dir` is provided, write the three sibling files
+  (`stream-{phase}.jsonl`, `agent-{phase}.log`, `metadata-{phase}.json`)
+  into it. When `None`, return DoneInfo with empty path fields and let
+  the caller persist.
+- Never raise on agent-side failures — surface them via `exit_code` /
+  `stderr` so the round loop keeps ticking.
 
 Subprocess management, signal escalation, and transport-specific
-quirks are entirely behind `AgentTransport`. Unit-test `run_phase`
+quirks live entirely behind `AgentTransport`. Unit-test `run_phase`
 against an in-memory `FakeTransport`.
 
 ---
@@ -289,10 +245,11 @@ anymore; decide during implementation).
 
 | File | Change |
 |---|---|
+| `agents/manager.py` | `AgentManager` ABC gains abstract `run_phase(...) → DoneInfo` alongside `install`. Status/kill/fetch_logs remain for M4-era observability. |
 | `agents/transport.py` (new) | `AgentTransport` Protocol + `CommandResult` + `AgentHandle`. Pure interface. |
 | `agents/transport_docker.py` (new) | `DockerExecBackend` — `asyncio.create_subprocess_exec("docker", "exec", ...)` under the hood. |
 | `agents/transport_ssh.py` (deferred) | `SSHBackend` sibling for remote VMs. Out of scope for v1. |
-| `agents/claude.py` | `ClaudeAgentManager(transport=...)`. `install()` becomes one-shot setup via transport primitives. New async `run_phase(...) → DoneInfo`. `_launch` retires. |
+| `agents/claude.py` | `ClaudeAgentManager(transport=...)`. `install()` becomes one-shot setup via transport primitives. New async `run_phase(...) → DoneInfo` (the ABC implementation). `_launch` retires. |
 | `models/agent.py` | New `DoneInfo` frozen dataclass. |
 | `gamemgr/game_mgr.py` | Pre-loop install hook (parallel via `asyncio.gather`). Kickoff handlers call `run_phase` instead of `install`. `_agent_briefed: set[str]` so the long briefing only goes out once. |
 | `gamemgr/events.py` | Add `AGENT_PROMPT_SENT`, `AGENT_COMPLETED`, `AGENT_TIMEOUT`, `AGENT_FAILED`. |
