@@ -26,25 +26,38 @@ spawned once per phase.
 
 ## Architecture
 
-```
-Host orchestrator (ClaudeAgentManager)
-    │ all side effects via AgentTransport (pluggable backend)
-    │   DockerExecBackend (v1) │ SSHBackend (deferred)
-    ▼
-agent host  (today: docker container; tomorrow: remote VM)
-    /tmp/agent/{agent.env, mcp.json, workdir/}   ← static; install once
-    /root/.claude/projects/<workdir-cwd>/        ← Claude session store
-        └── <id>.jsonl   ← grows turn-by-turn; --continue resumes it
+```mermaid
+graph TD
+  subgraph ORCH["Host orchestrator"]
+    Mgr(["ClaudeAgentManager"])
+    subgraph TX["AgentTransport · pluggable"]
+      Docker["DockerExecBackend<br/>(v1)"]:::active
+      SSH["SSHBackend<br/>(deferred)"]:::stub
+    end
+    Mgr --> TX
+  end
+
+  subgraph HOST["Agent host · container today · VM tomorrow"]
+    direction TB
+    Static["/tmp/agent/<br/>agent.env · mcp.json · workdir/<br/><i>static · install once</i>"]
+    Phase["/tmp/agent/<br/>prompt.txt · phase_context.json<br/><i>overwritten per phase</i>"]
+    Session["~/.claude/projects/&lt;workdir-cwd&gt;/&lt;id&gt;.jsonl<br/><i>Claude session store · grows turn-by-turn</i>"]
+  end
+
+  TX -->|run_command · write_file · kill_process| HOST
+
+classDef stub stroke-dasharray:4 4,opacity:0.5
+classDef active stroke-width:2px
 ```
 
-Per round, sync mode:
+**Per round, sync mode** — each phase is one `run_phase` invocation:
 
-```
-R1 DEFENSE  → write prompt → run_command(claude -p --continue) → artifacts
-R1 ATTACK   → same
-R2 DEFENSE  → same
-…
-```
+| Phase | Action |
+|---|---|
+| R1 DEFENSE | stage prompt → `claude -p --continue` → artifacts |
+| R1 ATTACK | same |
+| R2 DEFENSE | same |
+| … | … |
 
 Each invocation is a fresh process; `--continue` makes it one logical
 conversation.
