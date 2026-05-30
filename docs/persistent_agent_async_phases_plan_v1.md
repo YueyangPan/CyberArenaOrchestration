@@ -273,6 +273,23 @@ All inside the team's dev container, under `/tmp/agent/`.
 - One cue at a time — `wait_for_done` blocks before next `send_prompt`.
 - Runner refuses cycles without `phase_context.json`.
 
+### Per-phase artifact handoff
+
+After each `wait_for_done` returns, `ClaudeAgentManager` copies the
+three per-phase outputs into the run's artifact dir
+(`runs/<ts>/artifacts/team{N}/round-{N}/`):
+
+| File in container | Copied artifact name | What it is |
+|---|---|---|
+| `/tmp/agent/stdout.round{N}.{phase}.log` | `stream-{phase}.jsonl` | LLM stream-json transcript for the phase |
+| `/tmp/agent/stderr.round{N}.{phase}.log` | `agent-{phase}.log` | stderr + supervisor diagnostics |
+| (constructed at copy time) | `metadata-{phase}.json` | `{round_id, phase, exit_code, duration_ms, claude_pid, started_at, ended_at, prompt_first_line}` — enriched from `done.json` so post-mortem readers don't have to scan stream-json for basic facts |
+
+Naming aligns with the artifact-store layout from
+[`docs/DEFCON_challenge_framework_report_v1.md`](DEFCON_challenge_framework_report_v1.md);
+`stream-{phase}.jsonl` and `agent-{phase}.log` exist there already and
+just get sourced differently in the new model.
+
 ---
 
 ## Events
@@ -336,12 +353,12 @@ Constraints v1 honors so async stays reachable:
 
 ---
 
-## Open decisions
+## Decisions (resolved)
 
-| # | Decision | Default |
+| # | Decision | Choice |
 |---|---|---|
-| D1 | Runner language? | **Python** — testable, `subprocess` is first-class for process management, `json` module for safe serialization, no quoting hazards. Python 3 already in dev-base. |
-| D2 | Coexist vs replace? | **Fully replace.** `claude -p --continue` IS headless mode; "persistent" just means we install once per team and drive per-phase work via the runner's cue/done protocol instead of re-running install per phase. No mode flag — there's only one model. Existing M4/M4.5/M5.6 tests stay valid since they each call `install()` once in isolation; the kickoff handler in `main.py` is the one place that called install per-phase, and that gets replaced with `send_prompt + wait_for_done`. |
-| D3 | Per-phase artifacts copied to `runs/<ts>/artifacts/team{N}/round-{N}/`? | The per-phase `stdout.log` + `stderr.log` directly (already named per round+phase). |
-| D4 | One session per team, or separate defense/attack sessions? | **One session** — operator-role model; defense knowledge informs attack. |
-| D5 | First-phase prompt = briefing + first task, or briefing only at install + task only per phase? | **Combined in first phase** — avoids an extra empty-task call at install. |
+| D1 | Runner language? | **Python** — testable; `subprocess` is first-class for process management, `json` module for safe serialization, no quoting hazards. Python 3 already in dev-base. |
+| D2 | Coexist vs replace? | **Fully replace.** `claude -p --continue` IS headless mode; "persistent" just means we install once per team and drive per-phase work via the runner's cue/done protocol instead of re-running install per phase. No mode flag. Existing M4/M4.5/M5.6 tests stay valid since they each call `install()` once in isolation. |
+| D3 | Per-phase artifacts copied to `runs/<ts>/artifacts/team{N}/round-{N}/`? | **stdout + stderr + metadata.json.** Both log files are already named per round+phase by the runner; just copy them. `metadata.json` carries `{round_id, phase, exit_code, duration_ms, claude_pid, started_at, ended_at, prompt_first_line}` — a post-processed enrichment of `done.json` (which only the wait_for_done code reads) so post-mortem readers don't need to load the streaming logs. |
+| D4 | One session per team, or separate defense/attack sessions? | **One session.** Operator-role model — defense and attack share memory. Defense knowledge informs attack and vice versa. |
+| D5 | First-phase prompt = briefing + first task, or briefing only at install + task only per phase? | **Combined first prompt:** the first cue carries the long briefing + the first phase's task. Subsequent cues are short 2–3 line task cues only. Avoids an empty-task install call. |
