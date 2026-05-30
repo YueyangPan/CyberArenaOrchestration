@@ -1,4 +1,4 @@
-# Persistent-Memory Agent — Plan v1
+# Agent Runner & Persistent Memory — Plan v1
 
 ## What we're building
 
@@ -289,6 +289,91 @@ Naming aligns with the artifact-store layout from
 [`docs/DEFCON_challenge_framework_report_v1.md`](DEFCON_challenge_framework_report_v1.md);
 `stream-{phase}.jsonl` and `agent-{phase}.log` exist there already and
 just get sourced differently in the new model.
+
+---
+
+## Manager ↔ Runner interaction
+
+Manager and Runner live in **different processes** (host Python vs.
+in-container Python). They never import each other, never share memory,
+never call each other. Their entire interaction surface is the
+`/tmp/agent/` directory written/read through `docker exec`.
+
+### Direction matrix
+
+| Who writes | What | When |
+|---|---|---|
+| **Manager → Runner** | `runner.py`, `agent.env`, `mcp.json`, `workdir/` | install (once per team) |
+| **Manager → Runner** | `prompt.txt`, `phase_context.json`, `cue` | every `send_prompt` |
+| **Manager → Runner** | `kill` | `wait_for_done` timeout |
+| **Manager → Runner** | `shutdown` | game end |
+| **Runner → Manager** | `runner.pid` | runner boot |
+| **Runner → Manager** | `done.round{N}.{phase}.json` | per-phase, after Claude exits |
+| **Runner → fs only** | `stdout.round{N}.{phase}.log`, `stderr...`, `transcript.log`, `current_claude.pid` | per-phase; manager reads as artifacts/debug |
+
+### Sequence — successful phase
+
+```
+Manager                              Runner (loop)
+   │                                   │  (waiting for cue file)
+   │  write prompt.txt                 │
+   │  write phase_context.json         │
+   │  touch cue ────────────────────►  │
+   │                                   │  rm cue
+   │  emit AGENT_PROMPT_SENT           │  read phase_context.json
+   │  await wait_for_done(timeout)     │  spawn claude (PID 102)
+   │                                   │
+   │      …polling done.json…          │  wait for Claude to exit
+   │                                   │
+   │                                   │  Claude exits → atomic-write done.json
+   │  ◄─────── done.round1.defense.json
+   │  read done.json                   │  loop back to wait
+   │  copy stdout/stderr/metadata.json │
+   │  emit AGENT_COMPLETED             │
+   │  → proceed to next phase          │
+```
+
+### Sequence — phase timeout
+
+```
+Manager                              Runner
+   │  (phase timer expires while       │
+   │   still polling done.json)        │
+   │  touch kill ───────────────────►  │  rm kill
+   │                                   │  SIGTERM to Claude
+   │                                   │  wait → SIGKILL if still alive
+   │  ◄─────── done.json (exit_code != 0)
+   │  emit AGENT_TIMEOUT               │  loop back to wait
+```
+
+### Sequence — runner died between phases
+
+Pre-`send_prompt` liveness check fails:
+
+```
+Manager                              Runner
+   │  docker exec kill -0              │  (dead — no response)
+   │   $(cat runner.pid)               │
+   │                                   │
+   │  exit code != 0                   │
+   │  emit AGENT_RUNNER_DEAD           │
+   │  skip phase for this team         │
+   │  → proceed without this agent     │
+```
+
+The kill file (if dropped) just lingers harmlessly; nobody consumes it.
+
+### Responsibility split
+
+- **Manager** owns: *when* work happens, *whether* it's done in time,
+  *what* gets written to artifacts. It's the policy layer.
+- **Runner** owns: *actually running* Claude, *reporting* the exit
+  cleanly, *not* knowing what round/phase semantics mean beyond the
+  filename suffix the manager hands it.
+
+This split keeps the runner trivially testable (mock subprocess + drive
+files under `tmp_path`) and the manager free to evolve phase semantics
+without touching what's inside the container.
 
 ---
 
