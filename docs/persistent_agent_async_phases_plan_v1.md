@@ -75,8 +75,13 @@ processes managed by one persistent bash supervisor.
 3. Write `/tmp/agent/mcp.json` (per M4.5).
 4. Write `/tmp/agent/agent.env` (`ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `CLAUDE_MODEL`, etc.).
 5. Write `/tmp/agent/wrapper.sh`.
-6. `nohup setsid /tmp/agent/wrapper.sh </dev/null >wrapper.stdout 2>wrapper.stderr &`.
-7. Wait for `/tmp/agent/wrapper.pid` to appear; record it.
+6. **`mkdir -p /tmp/agent/workdir`** — dedicated cwd so the wrapper's
+   `claude --continue` only ever sees this arena's sessions, never
+   anything left over from a manual `claude` run elsewhere in the
+   container's filesystem. Wrapper always `cd`s into this workdir
+   before invoking claude.
+7. `nohup setsid /tmp/agent/wrapper.sh </dev/null >wrapper.stdout 2>wrapper.stderr &`.
+8. Wait for `/tmp/agent/wrapper.pid` to appear; record it.
 
 Subsequent phases never re-run install.
 
@@ -95,9 +100,15 @@ result = await mgr.wait_for_done(handle, round_id=N, phase="DEFENSE",
 ```
 
 `send_prompt`:
-1. write `/tmp/agent/prompt.txt`
-2. write `/tmp/agent/phase_context.json` with `{round_id, phase}`
-3. create `/tmp/agent/cue`
+1. **Liveness check** — `kill -0 $(cat /tmp/agent/wrapper.pid)`
+   inside the dev container. If the wrapper PID is gone, emit
+   `AGENT_WRAPPER_DEAD` and return without dropping a cue. This
+   prevents the orchestrator from wasting a full phase timer on a
+   wrapper that already crashed; the round loop moves on with that
+   team's agent absent.
+2. write `/tmp/agent/prompt.txt`
+3. write `/tmp/agent/phase_context.json` with `{round_id, phase}`
+4. create `/tmp/agent/cue`
 
 The wrapper consumes the cue, reads `phase_context.json` to compute
 its output-file suffix (`round{N}.{phase}`), and runs Claude. Output
@@ -166,6 +177,10 @@ while true; do
   STARTED_AT=$(date +%s.%N)
   set -a; . "$S/agent.env"; set +a
 
+  # Run claude from the isolated arena workdir so --continue only
+  # ever picks up sessions belonging to THIS team's arena run, never
+  # a leftover from a manually-run claude elsewhere in the container.
+  cd "$S/workdir"
   claude -p --continue \
     --output-format stream-json --verbose \
     --dangerously-skip-permissions \
@@ -240,7 +255,8 @@ All paths inside the team's dev container.
 | File | Direction | Created by | Removed by | Purpose |
 |---|---|---|---|---|
 | `wrapper.sh` | static | `install()` | game-end teardown | the daemon |
-| `wrapper.pid` | wrapper → orch | wrapper at boot | (stays for the game) | track persistent PID |
+| `wrapper.pid` | wrapper → orch | wrapper at boot | (stays for the game) | track persistent PID; `send_prompt` `kill -0`s this for liveness |
+| `workdir/` | static dir | `install()` | game-end teardown | dedicated cwd for claude invocations so `--continue` sees only this arena's sessions |
 | `agent.env`, `mcp.json` | static | `install()` | teardown | unchanged from M4.5 |
 | `prompt.txt` | orch → wrapper | `send_prompt` (overwrite each phase) | (stays) | phase prompt body |
 | `phase_context.json` | orch → wrapper | `send_prompt` (overwrite each phase) | (stays) | `{round_id, phase}` — wrapper reads this to suffix output files |
@@ -283,6 +299,12 @@ New (per-phase):
   Payload: `{exit_code, duration_ms, claude_pid, phase, round_id}`.
 - `AGENT_TIMEOUT` — phase timer fired before `done.json`; `kill` was
   dropped; the work didn't finish in time.
+- `AGENT_WRAPPER_DEAD` — pre-send-prompt liveness check failed
+  (`kill -0 $(cat wrapper.pid)` returns non-zero). Payload:
+  `{team_id, wrapper_pid, phase, round_id}`. Orchestrator skips the
+  phase for this team (no `cue` is dropped) and the round loop moves
+  on without this team's agent participating. Recovery (restart the
+  wrapper mid-game) is deferred to a future milestone.
 
 Phase early-end (existing) stays: `DEPLOY_COMPLETE` from MCP drains
 `_defense_pending` and can short-circuit DEFENSE. `AGENT_COMPLETED`
@@ -361,7 +383,9 @@ Estimate: ~150 LOC + ~5 tests.
 
 | Risk | Mitigation |
 |---|---|
-| Wrapper crashes mid-phase | `AGENT_LAUNCHED` carries `wrapper_pid`; a watchdog subscriber can `kill -0` to detect. Recovery (restart wrapper) deferred — for v1 we just emit `AGENT_TIMEOUT` and move on. |
+| Wrapper crashes between phases | Pre-`send_prompt` liveness check via `kill -0 $(cat wrapper.pid)`. On failure, emit `AGENT_WRAPPER_DEAD` and skip the team for the phase. Avoids burning a full phase timer waiting for a dead wrapper. Mid-game restart deferred. |
+| Wrapper crashes DURING a phase | `wait_for_done` polls for the suffixed `done.round{N}.{phase}.json`; if it never lands within the phase timer, the existing `AGENT_TIMEOUT` path fires (orch drops `kill`, but there's no wrapper to consume it; that's fine, kill file just lingers harmlessly). Next phase's `send_prompt` will see the dead wrapper and emit `AGENT_WRAPPER_DEAD`. |
+| `--continue` picks up a leftover session | Mitigated by running every claude invocation from the dedicated `/tmp/agent/workdir`. Claude's session selection is per-cwd. |
 | `done.json` partial-read race | Atomic `tmp → mv` write inside wrapper. |
 | `cue` arrives mid-phase | Cannot — `wait_for_done` blocks before next `send_prompt`. Protocol is strictly one-cue-at-a-time. |
 | Conversation tokens grow | Deferred. Options: `--fork-session` at round boundary, compress-history MCP tool. |
