@@ -28,15 +28,19 @@ short-lived process spawned once per phase.
 > will need to persist an explicit session id (`claude --resume <id>`)
 > instead. The dedicated `workdir/` exists for this reason.
 
-## Why no in-container runner
+## Why no in-container daemon controlling the agent
 
 An earlier draft put a Python daemon (`ClaudeAgentRunner`) inside the
-dev container, fed by file IPC (`cue`, `kill`, `shutdown`, `done.json`).
-With sync-mode semantics — orchestrator drives every phase — the
-daemon's responsibilities collapse into a single host-side
+dev container, fed by file IPC (`cue`, `kill`, `shutdown`, `done.json`),
+to invoke Claude per phase. The daemon is unnecessary in **both**
+modes we care about:
+
+**Sync mode (what this plan builds).** The orchestrator drives every
+phase. The daemon's job — invoke Claude, watch for exit, capture
+output, escalate on timeout — collapses to a single host-side
 `asyncio.create_subprocess_exec` call:
 
-| Runner feature | Host-driven equivalent |
+| Daemon feature | Host-driven equivalent |
 |---|---|
 | Stable PID across phases | `handle.name` (container) IS the stable identity |
 | File IPC for cue / done | `subprocess.communicate()` returns directly |
@@ -45,9 +49,19 @@ daemon's responsibilities collapse into a single host-side
 | Transcript append | host writes artifacts directly |
 | `--continue` session memory | works identically regardless of who invokes claude |
 
-A runner would earn its keep only when the agent is **autonomous** —
-looping in the background, querying MCP for round state, deciding
-what to do. That's async mode, which is deferred.
+**Async mode (deferred).** The agent itself becomes the autonomous
+loop — it calls MCP tools to query round state, decides whether to
+defend or attack, and acts on its own clock. A daemon between
+orchestrator and agent would have nothing to decide; both sides
+already talk through MCP. The agent runs as either (a) one
+long-running `claude -p` invocation that processes the whole game in
+a single conversation, or (b) periodic short `claude -p --continue`
+re-invokes driven by the orchestrator. Neither needs a daemon
+mediating.
+
+So the in-container daemon stays dropped permanently, not just
+deferred. The persistent artifact across phases is Claude CLI's
+session store on disk, not any process.
 
 ---
 
@@ -374,21 +388,26 @@ the runner design).
 
 ## Async mode (deferred, NOT in scope)
 
-When we want autonomous agents (decide what to do and when, defend +
-attack in parallel, query round state via MCP), this is where an
-in-container runner would come back. The agent would need a
-persistent process to drive its own work without host-driven phase
-prompts.
+When we want autonomous agents — decide what to do and when, defend
+and attack in parallel — the agent itself becomes the driver. The
+orchestrator stops sending per-phase prompts; the agent queries round
+state via new MCP tools and acts on its own clock.
+
+**No in-container daemon comes back here either.** The agent calls
+MCP directly through the existing FastMCP transport; a daemon
+mediating between the agent and the orchestrator would just be a
+relay with nothing to decide.
 
 Sketch:
-- Add MCP tools: `get_round_state`, `list_opposing_prods`, `list_active_flags`.
-- Replace `run_phase`-per-phase with a single `start_agent` at game
-  start that drops a runner inside the container.
-- Runner loops on its own clock, calls MCP for state, runs claude
-  per internal cue.
+- Add MCP tools: `get_round_state`, `list_opposing_prods`,
+  `list_active_flags`.
+- Replace `run_phase`-per-phase with a single `start_agent_session` at
+  game start: one `docker exec ... claude -p --continue` invocation
+  carrying a "you drive the loop yourself" prompt.
+- Agent runs internally: polls MCP for state, calls action tools,
+  decides when its work is done.
 
-For now, keep host-driven sync simple. Two constraints to honor so
-async stays reachable:
+Two constraints v1 honors so async stays reachable:
 - ❌ Don't bake phase-time-budgets into per-challenge prompts (so
   async-mode prompts can omit them).
 - ✅ Keep MCP tools additive — never change existing tool shapes.
@@ -399,7 +418,7 @@ async stays reachable:
 
 | # | Decision | Choice |
 |---|---|---|
-| D1 | Runner inside container vs host-driven? | **Host-driven.** A persistent runner only earns its keep when the agent is autonomous (async mode). For sync mode the orchestrator is the controller — `asyncio.create_subprocess_exec` of `docker exec ... claude` covers process lifecycle, timeout escalation, output collection in one call. |
+| D1 | In-container daemon to control claude, or host-driven? | **Host-driven, permanently.** A controller daemon is redundant in sync mode (orchestrator does the controlling via `docker exec`) AND in async mode (agent self-controls via MCP). See "Why no in-container daemon" above. |
 | D2 | Coexist with the old `install + _launch` model? | **Fully replace** for the game flow. `install()` keeps its public shape (params, callbacks) but no longer launches a supervisor; it just stages files. M4 / M4.5 / M5.6 tests stay valid since they exercise `install()` in isolation. |
 | D3 | Per-phase artifacts? | **stdout + stderr + metadata.json** in `runs/<ts>/artifacts/team{N}/round-{N}/`. Written directly by the host from the subprocess result; no round-trip through the container. |
 | D4 | One session per team, or separate defense/attack sessions? | **One session.** Operator-role model — defense knowledge informs attack and vice versa. |
