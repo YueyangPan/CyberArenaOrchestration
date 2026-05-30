@@ -85,19 +85,29 @@ Subsequent phases never re-run install.
 Kickoff handler replaces the current "install each phase" pattern:
 
 ```python
-mgr.send_prompt(handle, phase_prompt_text)
+mgr.send_prompt(handle, phase_prompt_text, round_id=N, phase="DEFENSE")
 # → emits AGENT_PROMPT_SENT
-result = await mgr.wait_for_done(handle, timeout=phase_secs)
-# → emits AGENT_COMPLETED   (on done.json arrival)
+result = await mgr.wait_for_done(handle, round_id=N, phase="DEFENSE",
+                                  timeout=phase_secs)
+# → emits AGENT_COMPLETED   (on done.round{N}.{phase}.json arrival)
 # → emits AGENT_TIMEOUT     (if timer fires first; orchestrator
 #                            drops `kill` and waits a grace period)
 ```
 
-`send_prompt`: write `/tmp/agent/prompt.txt`, then create
-`/tmp/agent/cue`. `wait_for_done`: poll for
-`/tmp/agent/done.json` up to `timeout`; on timeout, drop
-`/tmp/agent/kill` and wait a short grace window for the wrapper to
-surface a forced-exit `done.json`.
+`send_prompt`:
+1. write `/tmp/agent/prompt.txt`
+2. write `/tmp/agent/phase_context.json` with `{round_id, phase}`
+3. create `/tmp/agent/cue`
+
+The wrapper consumes the cue, reads `phase_context.json` to compute
+its output-file suffix (`round{N}.{phase}`), and runs Claude. Output
+files (`stdout.round{N}.{phase}.log`, `stderr...`, `done...`) are
+named so a missed orchestrator copy can't be overwritten by the next
+phase.
+
+`wait_for_done`: poll for the EXPECTED `done.round{N}.{phase}.json`
+file up to `timeout`. On timeout, drop `/tmp/agent/kill` and wait a
+short grace window for the wrapper to surface a forced-exit done file.
 
 ### Game end
 
@@ -108,7 +118,7 @@ Belt-and-suspenders: `kill -TERM <wrapper_pid>` afterward.
 
 ## Wrapper script (`/tmp/agent/wrapper.sh`)
 
-Bash, ~50 lines. Written by `install()`, not baked into the image.
+Bash, ~60 lines. Written by `install()`, not baked into the image.
 
 ```bash
 #!/usr/bin/env bash
@@ -116,26 +126,42 @@ set -euo pipefail
 
 S=/tmp/agent
 PROMPT=$S/prompt.txt
+CONTEXT=$S/phase_context.json   # orchestrator writes {round_id, phase} before cue
 CUE=$S/cue
-DONE=$S/done.json
 KILL=$S/kill
 SHUTDOWN=$S/shutdown
-STDOUT=$S/stdout.log
-STDERR=$S/stderr.log
 TRANSCRIPT=$S/transcript.log
 CLAUDE_PID_FILE=$S/current_claude.pid
 
 echo $$ > "$S/wrapper.pid"
 
-cleanup() { rm -f "$CUE" "$DONE" "$KILL"; exit 0; }
+cleanup() { rm -f "$CUE" "$KILL"; exit 0; }
 trap cleanup TERM INT
 
 while true; do
+  # Wait for a cue (or shutdown signal)
   while [ ! -f "$CUE" ]; do
     [ -f "$SHUTDOWN" ] && cleanup
     sleep 0.5
   done
-  rm -f "$CUE" "$DONE"
+  rm -f "$CUE"
+
+  # Read round_id + phase from phase_context.json so per-phase artifacts
+  # don't overwrite each other. Refuse to run if missing — the
+  # orchestrator must always pair a cue with a context.
+  if [ ! -f "$CONTEXT" ]; then
+    echo "wrapper: cue received without phase_context.json; aborting cycle" >&2
+    sleep 1
+    continue
+  fi
+  ROUND_ID=$(jq -r .round_id "$CONTEXT")
+  PHASE=$(jq -r .phase    "$CONTEXT" | tr '[:upper:]' '[:lower:]')
+  SUFFIX="round${ROUND_ID}.${PHASE}"
+
+  STDOUT="$S/stdout.${SUFFIX}.log"
+  STDERR="$S/stderr.${SUFFIX}.log"
+  DONE="$S/done.${SUFFIX}.json"
+  rm -f "$DONE"
 
   STARTED_AT=$(date +%s.%N)
   set -a; . "$S/agent.env"; set +a
@@ -158,28 +184,52 @@ while true; do
     fi
     sleep 0.5
   done
-  wait "$CLAUDE_PID" 2>/dev/null || true
+
+  # Capture wait's exit code without `|| true` swallowing it (the
+  # set -e at top of the script means a raw `wait` on a non-zero exit
+  # aborts the loop — use set +e around it instead).
+  set +e
+  wait "$CLAUDE_PID" 2>/dev/null
   EXIT_CODE=$?
+  set -e
   ENDED_AT=$(date +%s.%N)
 
+  # Append per-phase stdout to the cumulative transcript for replay
   cat "$STDOUT" >> "$TRANSCRIPT"
 
-  # Atomic write via tmp + rename so the orchestrator never reads a partial done.json
+  # Atomic write via tmp + rename so the orchestrator never reads a
+  # partial done JSON.
   cat > "$DONE.tmp" <<EOF
 {
-  "exit_code": $EXIT_CODE,
-  "started_at": $STARTED_AT,
-  "ended_at": $ENDED_AT,
-  "claude_pid": $CLAUDE_PID,
-  "stdout_bytes": $(wc -c < "$STDOUT")
+  "round_id":     $ROUND_ID,
+  "phase":        "$PHASE",
+  "exit_code":    $EXIT_CODE,
+  "started_at":   $STARTED_AT,
+  "ended_at":     $ENDED_AT,
+  "claude_pid":   $CLAUDE_PID,
+  "stdout_bytes": $(wc -c < "$STDOUT"),
+  "stdout_path":  "$STDOUT",
+  "stderr_path":  "$STDERR"
 }
 EOF
   mv "$DONE.tmp" "$DONE"
 done
 ```
 
+Two robustness details worth noting:
+
+- **`wait` exit-code capture** uses `set +e / set -e` to bracket the
+  call. `wait "$PID" 2>/dev/null || true` would silently mask any
+  non-zero exit because `|| true` resets `$?` to 0 before we can read
+  it; `set +e` keeps the exit code accessible.
+- **Per-phase output filenames** carry `roundN.phaseX` so a missed
+  artifact copy on the orchestrator side doesn't get clobbered by the
+  next phase. The orchestrator must write `phase_context.json` before
+  every `cue` — the wrapper refuses to run a cycle without it.
+
 Why bash and not python: already in the base image; no dependency
-added; ~50 lines is tractable.
+added; ~60 lines is tractable. `jq` is also already in dev-base via
+the existing toolchain.
 
 ---
 
@@ -193,12 +243,13 @@ All paths inside the team's dev container.
 | `wrapper.pid` | wrapper → orch | wrapper at boot | (stays for the game) | track persistent PID |
 | `agent.env`, `mcp.json` | static | `install()` | teardown | unchanged from M4.5 |
 | `prompt.txt` | orch → wrapper | `send_prompt` (overwrite each phase) | (stays) | phase prompt body |
+| `phase_context.json` | orch → wrapper | `send_prompt` (overwrite each phase) | (stays) | `{round_id, phase}` — wrapper reads this to suffix output files |
 | `cue` | orch → wrapper | `send_prompt` | wrapper at consume | "new prompt ready" sentinel |
-| `done.json` | wrapper → orch | wrapper at claude-exit (atomic) | `wait_for_done` after read | `{exit_code, started_at, ended_at, claude_pid, stdout_bytes}` |
+| `done.round{N}.{phase}.json` | wrapper → orch | wrapper at claude-exit (atomic) | `wait_for_done` after read | `{round_id, phase, exit_code, started_at, ended_at, claude_pid, stdout_bytes, stdout_path, stderr_path}` — one per phase, named so a missed copy doesn't get clobbered |
+| `stdout.round{N}.{phase}.log` | claude → fs | wrapper per invocation | game-end teardown | per-phase stream-json. **Named** per round+phase so the next phase doesn't overwrite — orchestrator copies into the per-round artifact dir at leisure. |
+| `stderr.round{N}.{phase}.log` | claude → fs | wrapper per invocation | game-end teardown | per-phase stderr, same naming |
 | `kill` | orch → wrapper | `wait_for_done` on timeout | wrapper at consume | abort current claude |
 | `shutdown` | orch → wrapper | game-end teardown | (wrapper exits) | exit daemon loop |
-| `stdout.log` | claude → fs | wrapper per invocation (overwrite) | (stays until next phase) | per-phase stream-json |
-| `stderr.log` | claude → fs | wrapper per invocation | (stays) | per-phase stderr |
 | `transcript.log` | wrapper appends | wrapper per phase | teardown | cumulative stream-json across the game (artifact source) |
 | `current_claude.pid` | wrapper → fs | wrapper per invocation | (overwritten) | debug — which Claude is running now |
 
