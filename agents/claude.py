@@ -137,11 +137,7 @@ class ClaudeAgentManager(AgentManager):
         )
 
         if cfg.cli.startswith("claude"):
-            self._exec_sync(
-                container,
-                ["npm", "install", "-g", "@anthropic-ai/claude-code"],
-                check=True,
-            )
+            self._npm_install_with_retry(container)
 
         if cfg.own_prod_container_name:
             self._provision_ssh_pivot(container, cfg)
@@ -319,6 +315,35 @@ class ClaudeAgentManager(AgentManager):
         return AgentLogs(stdout=stdout, stderr=stderr, exit_code=exit_code)
 
     # ── internals (legacy + helpers) ────────────────────────────────────
+
+    # npm install hits the registry over the internet — `ECONNRESET` blips
+    # are common enough to be worth a short retry. Backs off 2s → 4s → 8s.
+    _NPM_RETRY_ATTEMPTS = 3
+    _NPM_RETRY_BASE_SECS = 2
+
+    def _npm_install_with_retry(self, container: ContainerHandle) -> None:
+        """`npm install -g @anthropic-ai/claude-code` with exponential
+        backoff on transient registry errors. Raises only after the final
+        attempt — exhaustion bubbles up as a normal install failure."""
+        cmd = ["npm", "install", "-g", "@anthropic-ai/claude-code"]
+        for attempt in range(1, self._NPM_RETRY_ATTEMPTS + 1):
+            rc, out = self._exec_sync(container, cmd)
+            if rc == 0:
+                if attempt > 1:
+                    log.info("npm install succeeded on %s (attempt %d/%d)",
+                             container.name, attempt, self._NPM_RETRY_ATTEMPTS)
+                return
+            if attempt == self._NPM_RETRY_ATTEMPTS:
+                raise RuntimeError(
+                    f"npm install failed on {container.name} after "
+                    f"{self._NPM_RETRY_ATTEMPTS} attempts: rc={rc}, out={out[-300:]!r}"
+                )
+            backoff = self._NPM_RETRY_BASE_SECS * (2 ** (attempt - 1))
+            log.warning(
+                "npm install failed on %s (attempt %d/%d, rc=%d); retrying in %ds. tail=%r",
+                container.name, attempt, self._NPM_RETRY_ATTEMPTS, rc, backoff, out[-200:],
+            )
+            time.sleep(backoff)
 
     def _write_mcp_config(self, container: ContainerHandle, cfg: AgentConfig) -> None:
         """Drop mcp.json with the team token in headers (M4.5 convention).
