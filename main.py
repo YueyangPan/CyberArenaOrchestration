@@ -132,6 +132,17 @@ async def _run_start(args) -> int:
 
     await game.stop()
 
+    # Snapshot the live panel to runs/<ts>/panel.html so the run is
+    # readable offline (open the file in any browser, get the full
+    # event timeline rendered as it was on the live panel). Best-
+    # effort: a write failure here doesn't block teardown.
+    if game.run_dir is not None:
+        try:
+            from gamemgr.panel_snapshot import write_snapshot
+            write_snapshot(game.run_dir)
+        except Exception:
+            log.exception("failed to write panel snapshot")
+
     # Tell uvicorn to wind down. `should_exit` triggers graceful shutdown
     # (drains in-flight requests + closes idle keep-alives), but it can
     # hang indefinitely on long-lived streams — panel WebSockets and the

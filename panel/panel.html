@@ -563,7 +563,19 @@
 
   // ── boot ────────────────────────────────────────────────
   ensureTeamsOrdered(['team1', 'team2']);
-  backfill().then(connect);
+  if (Array.isArray(window.INITIAL_EVENTS)) {
+    // Snapshot mode: events were embedded at build time by
+    // gamemgr/panel_snapshot.py. No live connection, no /game/status
+    // backfill — just replay the events and stop.
+    const conn = $('conn');
+    conn.dataset.state = 'snapshot';
+    conn.querySelector('.text').textContent = 'snapshot';
+    for (const ev of window.INITIAL_EVENTS) {
+      try { render(ev); } catch (e) { /* keep going on bad event */ }
+    }
+  } else {
+    backfill().then(connect);
+  }
 </script>
 </body>
 </html>
