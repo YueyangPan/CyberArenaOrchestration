@@ -134,6 +134,84 @@ def test_defense_kickoff_does_not_fire_outside_defense_phase():
     assert kickoffs == []
 
 
+def test_flag_planted_fires_before_defense_kickoff_in_same_phase_change():
+    """REGRESSION: PHASE_CHANGE → DEFENSE must trigger FLAG_PLANTED *before*
+    DEFENSE_KICKOFF (and before any kickoff handler awaits a long task).
+
+    Symptom of the prior bug: _on_rotation_event was subscribed AFTER
+    _on_defense_kickoff. Bus.publish awaits each subscriber sequentially,
+    so kickoff's `await asyncio.gather(handlers)` blocked the bus for the
+    whole DEFENSE phase — rotation only fired at the END. /flag in prod
+    was stale for the duration of DEFENSE.
+
+    Fix: subscribe rotation in __init__ before kickoff. This test pins
+    that ordering: kickoff handler must observe (a) FLAG_PLANTED already
+    in history, and (b) the SAME-team /flag has been re-planted in
+    FlagStore (planted[team]) before it runs.
+    """
+    game = _make_game(
+        challenges=[
+            ChallengeConfig(
+                name="nautilus-ico", type="nautilus-ico",
+                port=4265, deploy_on=["team1", "team2"],
+            ),
+        ],
+        agents={
+            tid: AgentConfig(
+                cli="claude --print", model="claude-sonnet-4-5",
+                api_key="test", base_url="https://api.anthropic.com",
+            )
+            for tid in ("team1", "team2")
+        },
+    )
+    # Pre-plant for round 0 so rotation has a baseline to replace.
+    game._service_by_owner.clear()
+    game._spec_by_owner.clear()
+    # Inject a FILE_AT_PATH spec so plant_flags writes via _plant_file_at_path
+    # — stub that out so the test doesn't touch docker.
+    from challenges.source import ChallengeSpec, FlagMechanism
+    spec = ChallengeSpec(
+        name="nautilus-ico", source="nautilus", port=4265,
+        image_tag="x", flag_mechanism=FlagMechanism.FILE_AT_PATH,
+        metadata={"flag_path": "/flag", "restart_cmd": "echo"},
+    )
+    game._spec_by_owner[("team1", "nautilus-ico")] = spec
+    game._spec_by_owner[("team2", "nautilus-ico")] = spec
+    game._plant_file_at_path = lambda *a, **kw: None  # no docker
+
+    seen_history_snapshots: dict[str, list[str]] = {}
+    seen_planted: dict[str, dict] = {}
+
+    async def handler(team_id, cfg, round_id, phase, is_first):
+        # Snapshot what's already on the bus when this handler runs.
+        seen_history_snapshots[team_id] = [
+            e.type for e in game.bus.history()
+        ]
+        # And what FlagStore has for this team at this moment.
+        seen_planted[team_id] = dict(game.flags.planted)
+
+    game.register_defense_kickoff_handler(handler)
+
+    async def run():
+        await game.bus.publish(_phase_change(Phase.DEFENSE, round_id=1))
+
+    asyncio.run(run())
+
+    # Each team's handler must have seen FLAG_PLANTED already in history.
+    for team_id in ("team1", "team2"):
+        history = seen_history_snapshots[team_id]
+        assert "FLAG_PLANTED" in history, (
+            f"{team_id} kickoff ran before any FLAG_PLANTED event — "
+            f"rotation order regression. history at that point: {history}"
+        )
+        # And the FlagStore must have an entry for *this* team's prod.
+        planted = seen_planted[team_id]
+        assert (team_id, "nautilus-ico") in planted, (
+            f"{team_id} kickoff ran before its own /flag was rotated; "
+            f"FlagStore had {list(planted.keys())}"
+        )
+
+
 def test_defense_kickoff_is_idempotent_within_a_single_round():
     """A re-fire of PHASE_CHANGE → DEFENSE for the same round must NOT
     spawn duplicates (defensive: a downstream might emit twice)."""

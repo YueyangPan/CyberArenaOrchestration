@@ -83,27 +83,43 @@ decide. Drop permanently.
 
 ---
 
-## Two abstractions: AgentManager × AgentTransport
+## Two abstractions × one runner
 
-The agent layer has two orthogonal interfaces. Keeping them separate
-means we can swap CLIs (Claude → codex/other) without touching the
-host transport, and swap host transports (docker → SSH) without
-touching CLI-specific install + invocation logic.
+The agent layer has two orthogonal interfaces plus a tiny free
+function that composes them. Keeping them separate means we can swap
+CLIs (Claude / Codex / Gemini / …) without touching the host
+transport, and swap host transports (docker → SSH) without touching
+CLI-specific install + invocation logic.
 
-### `AgentManager` (ABC)
+### `AgentManager` (ABC) — data-only CLI recipe
 
-CLI-flavor-specific. One concrete manager per agent CLI. The contract:
+CLI-flavor-specific. One concrete manager per agent CLI. The contract
+is intentionally minimal — just **what the CLI is + how to invoke it**:
 
-| Method | Phase | Purpose |
+| Member | Kind | Purpose |
 |---|---|---|
-| `install(container, cfg)` | game start, once per team | npm install / SSH pivot / env / mcp.json / workdir. No process launched. |
-| `run_phase(container, prompt, *, round_id, phase, timeout, artifact_dir, model) → DoneInfo` | every phase | deliver `prompt`, invoke the CLI on the host through the transport, capture artifacts, return DoneInfo |
-| `status(container)` / `kill(container)` / `fetch_logs(container)` | observability | M4-era hooks; best-effort no-ops under v1 |
+| `PROMPT_PATH` | class constant | where the per-phase prompt is staged on the agent host |
+| `PHASE_KILL_PATTERN` | class constant | `pkill -f <pattern>` used after a `run_command` timeout |
+| `install(container, cfg, *, on_installed=None)` | method | one-shot CLI install + SSH pivot + env / mcp.json. No process launched. |
+| `phase_command(*, model=None) → list[str]` | method | shell argv that invokes the CLI for one phase, reading prompt from `PROMPT_PATH`, resuming the prior session via the CLI's own `--continue` / `--resume` flag |
 
-`ClaudeAgentManager` (the v1 concrete class) implements both methods
-on top of `AgentTransport` — it never calls `docker exec` itself.
+Adding a new CLI = subclass with these two methods + two constants,
+~50–80 LOC. `status` / `kill` / `fetch_logs` from the M4-era
+observability surface are NOT on the ABC — concrete subclasses can
+keep them for legacy live-smoke tests, but new CLIs need not implement.
 
-### `AgentTransport` (Protocol)
+### `agents.runner.run_phase_via_transport` — the 3-line dance
+
+One async helper that composes a manager + a transport: write prompt,
+run the CLI with timeout, pkill on timeout. Returns the raw
+`CommandResult`. **Caller** persists artifacts and emits events
+(`GameMgr.record_phase_done` is the canonical caller).
+
+This is a free function, not a method — splitting it out keeps
+`AgentManager` data-only and prevents the "method that does five
+different things" smell.
+
+### `AgentTransport` (Protocol) — host execution
 
 Host-flavor-specific. One concrete backend per host kind:
 
@@ -116,9 +132,17 @@ Surface: `connect`, `run_command` (async; SIGTERM → SIGKILL on timeout),
 `write_file`, `read_file`, `kill_process`. `AgentHandle` is opaque to
 the manager; the transport interprets it.
 
-The split means adding a new CLI (e.g. codex) is one new `AgentManager`
-subclass; adding a new host (e.g. remote VM) is one new
-`AgentTransport`. Neither change touches the other axis.
+The split means adding a new CLI = one new `AgentManager` subclass;
+adding a new host = one new `AgentTransport`. Neither change touches
+the other axis.
+
+### Provider dispatch
+
+`AgentConfig.provider` (from `game.yaml`'s `agent.provider:`) picks
+the right `AgentManager` subclass via `agents.registry.build(cfg)`.
+Falls back to the first token of `cfg.cli` when `provider` is unset
+(M4-era yaml back-compat). Future CLIs (codex / gemini / openai_compat)
+register by adding one line to `agents.registry.REGISTRY`.
 
 ---
 
@@ -156,30 +180,33 @@ reaps the dev containers as today; the session store dies with them.
 
 ---
 
-## `DoneInfo` — `run_phase` return shape
+## What `run_phase_via_transport` returns
+
+The runner returns `AgentTransport.CommandResult` verbatim — no
+wrapping dataclass. Caller reads:
 
 | Field | Meaning |
 |---|---|
 | `exit_code` | CLI process exit (signal-exits non-zero on timeout) |
 | `timed_out` | `true` iff the transport had to escalate SIGTERM → SIGKILL |
-| `started_at`, `ended_at`, `duration_ms` | wall-clock bookends |
-| `stdout_path`, `stderr_path` | paths to the persisted stream / log files (empty when `artifact_dir=None`) |
+| `stdout`, `stderr` | raw bytes captured from the CLI process |
 
-This is the same shape as the per-phase `metadata-{phase}.json`
-artifact, so callers can serialize it directly.
+`GameMgr.record_phase_done(team_id, round_id, phase, prompt, result,
+started_at, ended_at)` reads these, writes the three sibling artifact
+files (`stream-{phase}.jsonl` / `agent-{phase}.log` /
+`metadata-{phase}.json`), and emits one of `AGENT_COMPLETED` /
+`AGENT_TIMEOUT` / `AGENT_FAILED` based on `result.timed_out` +
+`result.exit_code`.
 
-Implementations must:
-- Honor `timeout` and escalate SIGTERM → SIGKILL on expiry; set
-  `timed_out=True` in DoneInfo.
-- When `artifact_dir` is provided, write the three sibling files
-  (`stream-{phase}.jsonl`, `agent-{phase}.log`, `metadata-{phase}.json`)
-  into it. When `None`, return DoneInfo with empty path fields and let
-  the caller persist.
-- Never raise on agent-side failures — surface them via `exit_code` /
-  `stderr` so the round loop keeps ticking.
+Behavior the runner guarantees:
+- Honors `timeout` and escalates SIGTERM → SIGKILL on expiry; sets
+  `timed_out=True`.
+- Captures stdout/stderr bytes even on timeout (drain-into-buffer
+  tasks complete only when proc EOFs).
+- Never raises on agent-side failures — surfaces them via the result.
 
 Subprocess management, signal escalation, and transport-specific
-quirks live entirely behind `AgentTransport`. Unit-test `run_phase`
+quirks live entirely behind `AgentTransport`. Unit-test the runner
 against an in-memory `FakeTransport`.
 
 ---
@@ -210,43 +237,49 @@ exist in this design.
 
 ---
 
-## Manager ↔ host interaction
+## End-to-end interaction
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Mgr as ClaudeAgentManager
+    participant Game as GameMgr
+    participant Run as runner<br/>(run_phase_via_transport)
+    participant Mgr as AgentManager<br/>(Claude / Codex / …)
     participant Tx as AgentTransport<br/>(DockerExec / SSH)
     participant Host as Agent host<br/>(container / VM)
     participant Bus as EventBus
 
-    Note over Mgr,Host: install() — once per team at game start
-    Mgr->>Tx: run_command(npm install -g @anthropic-ai/claude-code)
+    Note over Game,Host: install() — once per team at game start
+    Game->>Mgr: install(handle, cfg, on_installed)
+    Mgr->>Tx: run_command(npm/pip install …)
     Tx->>Host: provision CLI
-    Mgr->>Tx: write_file(agent.env, mcp.json, workdir/)
+    Mgr->>Tx: write_file(agent.env, mcp config, workdir/)
     Tx->>Host: stage static files
-    Mgr->>Bus: AGENT_INSTALLED
+    Mgr-->>Game: on_installed(team_id)
+    Game->>Bus: AGENT_INSTALLED
 
-    Note over Mgr,Host: run_phase() — every phase
-    Mgr->>Tx: write_file(prompt.txt, phase_context.json)
-    Tx->>Host: overwrite per-phase files
-    Mgr->>Bus: AGENT_PROMPT_SENT
-    Mgr->>Tx: run_command(claude -p --continue, timeout=phase_secs)
-    Tx->>Host: spawn claude
-    Note over Host: claude reads + appends<br/>~/.claude/projects/.../*.jsonl
+    Note over Game,Host: per phase
+    Game->>Bus: AGENT_PROMPT_SENT (record_phase_started)
+    Game->>Run: run_phase_via_transport(mgr, transport, handle, prompt, timeout)
+    Run->>Tx: write_file(mgr.PROMPT_PATH)
+    Tx->>Host: drop prompt.txt
+    Run->>Tx: run_command(mgr.phase_command(), timeout)
+    Tx->>Host: spawn CLI
+    Note over Host: CLI reads + appends<br/>session store on disk (--continue / --resume)
     Host-->>Tx: stdout / stderr / exit_code
-    Tx-->>Mgr: CommandResult
+    Tx-->>Run: CommandResult
     alt timed_out
-        Mgr->>Tx: kill_process("claude -p")
+        Run->>Tx: kill_process(mgr.PHASE_KILL_PATTERN)
         Tx->>Host: pkill -KILL -f
     end
-    Note over Mgr: persist stream / agent log / metadata
-    Mgr->>Bus: AGENT_COMPLETED · TIMEOUT · FAILED
+    Run-->>Game: CommandResult
+    Note over Game: persist 3 artifacts (record_phase_done)
+    Game->>Bus: AGENT_COMPLETED · TIMEOUT · FAILED
 ```
 
-No async handoff; each `run_phase` is a blocking `await` on the
-orchestrator. The agent's MCP tool calls flow back over the existing
-FastMCP transport — they're independent of the subprocess.
+No async handoff; the kickoff subscriber awaits the runner inline.
+The agent's MCP tool calls flow back over the existing FastMCP
+transport — they're independent of the subprocess.
 
 ---
 
@@ -269,25 +302,26 @@ anymore; decide during implementation).
 
 | File | Change |
 |---|---|
-| `agents/manager.py` | `AgentManager` ABC gains abstract `run_phase(...) → DoneInfo` alongside `install`. Status/kill/fetch_logs remain for M4-era observability. |
+| `agents/manager.py` | `AgentManager` ABC: `install` + `phase_command` + `PROMPT_PATH` + `PHASE_KILL_PATTERN`. Nothing else abstract. |
+| `agents/runner.py` (new) | Free function `run_phase_via_transport(mgr, transport, handle, prompt, *, timeout, model)` — the 3-line dance. |
 | `agents/transport.py` (new) | `AgentTransport` Protocol + `CommandResult` + `AgentHandle`. Pure interface. |
-| `agents/transport_docker.py` (new) | `DockerExecBackend` — `asyncio.create_subprocess_exec("docker", "exec", ...)` under the hood. |
+| `agents/transport_docker.py` (new) | `DockerExecBackend` — `asyncio.create_subprocess_exec("docker", "exec", ...)`. |
 | `agents/transport_ssh.py` (deferred) | `SSHBackend` sibling for remote VMs. Out of scope for v1. |
-| `agents/claude.py` | `ClaudeAgentManager(transport=...)`. `install()` becomes one-shot setup via transport primitives. New async `run_phase(...) → DoneInfo` (the ABC implementation). `_launch` retires. |
-| `models/agent.py` | New `DoneInfo` frozen dataclass. |
-| `gamemgr/game_mgr.py` | Pre-loop install hook (parallel via `asyncio.gather`). Kickoff handlers call `run_phase` instead of `install`. `_agent_briefed: set[str]` so the long briefing only goes out once. |
+| `agents/claude.py` | `ClaudeAgentManager`: `install` (one-shot), `phase_command` returning shell argv, `PROMPT_PATH` / `PHASE_KILL_PATTERN`. `status/kill/fetch_logs` kept concrete-only for legacy live smoke tests. |
+| `agents/registry.py` | `build(cfg)` dispatches on `cfg.provider` (falls back to first cli token for M4-era yaml back-compat). |
+| `models/agent.py` | `AgentConfig.provider: str = "claude"`. |
+| `gamemgr/game_mgr.py` | Pre-loop install hook (parallel via `asyncio.gather`). Kickoff handlers call runner instead of running CLI directly. `record_phase_started` + `record_phase_done` own AGENT_* event emission + 3-file artifact persistence. `_agent_briefed: set[str]` so the long briefing only goes out once. |
 | `gamemgr/events.py` | Add `AGENT_PROMPT_SENT`, `AGENT_COMPLETED`, `AGENT_TIMEOUT`, `AGENT_FAILED`. |
+| `gamemgr/config.py` | Parse `agent.provider:` from yaml. |
 | `agents/prompts/*` | First phase = full briefing + first task. Subsequent = 2–3 lines. |
 | `panel/panel.html` | Render new event chips. |
-| `main.py` | Construct `DockerExecBackend()` + inject. `_wire_defense_kickoff` → `_wire_phase_kickoffs`. |
+| `main.py` | Use `agents.registry.build` per-team + `runner.run_phase_via_transport`. Kickoff handler shrinks to ~10 lines. |
 | `tests/test_dcf_transport_docker.py` (new) | Mock `asyncio.create_subprocess_exec`; verify timeout escalation, write/read/kill paths. |
-| `tests/test_dcf_run_phase.py` (new) | Manager logic against an in-memory `FakeTransport`; one docker-gated live test runs 2 phases and verifies `--continue` memory carries. |
+| `tests/test_dcf_phase_invocation.py` (new) | Three layers: `phase_command` argv, runner dance against `FakeTransport`, `record_phase_done` artifacts + events. |
 
 **Existing tests** (M4 / M4.5 / M5.6) each call `install()` once in
 isolation. `install()`'s public shape is preserved; only internals
-change. No behavioral changes expected; re-run the suite to confirm.
-
-**Estimate**: ~120 LOC + 4 tests.
+change.
 
 ---
 
@@ -303,6 +337,35 @@ change. No behavioral changes expected; re-run the suite to confirm.
 | Stale session store from a prior run | Container is recreated by `Orchestrator.setup` each game |
 
 ---
+
+## Multi-provider parking lot
+
+Target CLIs beyond Claude Code, in rough priority:
+
+| CLI | Persistent memory | Install | Status |
+|---|---|---|---|
+| Claude Code | `--continue` (cwd-scoped session.jsonl) | `npm i -g @anthropic-ai/claude-code` | ✅ v1 |
+| Codex CLI (OpenAI) | `--resume <id>` + `~/.codex/sessions/` | `npm i -g @openai/codex` | subclass; not yet written |
+| Gemini CLI (Google) | session resume + `.gemini/` | `npm i -g @google/gemini-cli` | subclass; not yet written |
+| Kimi (Moonshot) | no native agentic CLI | route via litellm/openrouter to codex-or-claude OR use an OpenAI-compat harness | needs provider+wrapper decision |
+| Qwen Coder (Alibaba) | same | same | same |
+
+Each first-class CLI = one new `AgentManager` subclass (~50–80 LOC):
+implement `install` + `phase_command` + the two class constants.
+Register one line in `agents/registry.py`. No copy-pasting host
+plumbing — `AgentTransport` + `agents/runner.py` handle that.
+
+Kimi / Qwen don't have native agentic CLIs. Two viable paths:
+1. **Route via OpenAI-compat proxy** (litellm / openrouter) so the
+   model surfaces as if it were an OpenAI / Anthropic endpoint; reuse
+   `CodexAgentManager` or `ClaudeAgentManager` pointing `OPENAI_BASE_URL`
+   / `ANTHROPIC_BASE_URL` at the proxy. Lowest effort. Agent behavior
+   keeps the wrapping CLI's tool surface.
+2. **Pick a multi-provider agentic harness** (opencode, aider) and
+   write a `OpenAICompatAgentManager` for it. More work, more native
+   model behavior. Patch the harness for MCP if needed.
+
+Pick when we're ready to actually run these — not v1 scope.
 
 ## Async mode (parking lot)
 
@@ -330,3 +393,5 @@ v1 constraints to keep async reachable:
 | D4 | One session per team, or separate defense/attack sessions? | **One session.** Operator-role model; defense knowledge informs attack. |
 | D5 | First-phase prompt = briefing + first task, or briefing-only at install + tasks later? | **Combined first prompt.** Subsequent prompts are 2–3 line task cues. |
 | D6 | Manager talks to host directly, or through a transport interface? | **Transport interface.** `AgentTransport` Protocol; `DockerExecBackend` v1; `SSHBackend` deferred. Manager unchanged when backend swaps. |
+| D7 | `AgentManager` ABC contract — fat method `run_phase` or data-only recipe? | **Data-only recipe.** ABC = `install` + `phase_command` + `PROMPT_PATH` + `PHASE_KILL_PATTERN`. The 3-line dance moves to `agents/runner.py`; artifact persistence + AGENT_* event emission move to `GameMgr.record_phase_done`. Adding a new CLI = 50–80 LOC subclass, no host plumbing copy-paste. |
+| D8 | How does GameMgr pick which AgentManager subclass per team? | **`AgentConfig.provider`** (from `game.yaml`'s `agent.provider:`). `agents.registry.build(cfg)` dispatches. Falls back to first cli token for M4-era yaml back-compat. |

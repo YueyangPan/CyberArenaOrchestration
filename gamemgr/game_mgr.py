@@ -9,6 +9,7 @@ Lifecycle:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import secrets
 import time
@@ -24,7 +25,7 @@ from agents.prompts import build_attack_prompt, build_defense_prompt
 from challenges.notes import BuiltinNotesSource
 from challenges.registry import build as build_challenge
 from challenges.source import ChallengeSpec, FlagMechanism, HealthLevel
-from models.agent import AgentConfig, AgentLogs
+from models.agent import AgentConfig
 import shlex
 from typing import Awaitable, Callable
 
@@ -101,6 +102,15 @@ class GameMgr:
         self._install_agent_handler: (
             Callable[[str, AgentConfig], Awaitable[None]] | None
         ) = None
+        # Pre-R1 dry-run readiness probe. Handler runs one short claude
+        # invocation with a prompt asking the agent to call
+        # `mcp__cyberarena__report_ready`. GameMgr watches the bus for
+        # AGENT_READY per team within `dry_run_all_agents`. Signature:
+        #   async def handler(team_id) -> None
+        # None = event-only mode (tests).
+        self._dry_run_handler: (
+            Callable[[str], Awaitable[None]] | None
+        ) = None
         # Idempotency keys per round so a re-fire of PHASE_CHANGE doesn't
         # spawn duplicate work.
         self._defense_kickoff_done: set[tuple[int, str, str]] = set()
@@ -111,17 +121,12 @@ class GameMgr:
         # prompts are 2–3 line task cues (Claude --continue has the prior
         # session in memory by then).
         self._agent_briefed: set[str] = set()
-        # Artifact persistence (api-logs / agent-logs / service-logs).
-        # ArtifactStore is built lazily in start() once run_dir is known.
-        # Until then the persistence subscriber no-ops.
+        # Artifact persistence: ArtifactStore is built lazily in start()
+        # once run_dir is known. Per-phase stream/agent/metadata files are
+        # written by ClaudeAgentManager.run_phase directly into the
+        # team×round directory; GameMgr only owns end-of-round service-log
+        # snapshots (docker logs).
         self.artifacts: ArtifactStore | None = None
-        # Sync callable that reads stdout/stderr/exit_code from a dev
-        # container. main.py supplies this (typically ClaudeAgentManager.fetch_logs)
-        # via register_fetch_agent_logs_handler; without it the agent-side
-        # artifact persistence no-ops (event-only mode for tests).
-        self._fetch_agent_logs_handler: (
-            Callable[[ContainerHandle], AgentLogs] | None
-        ) = None
         # Defense-phase early-end tracking. On every DEFENSE_KICKOFF we add
         # (team_id, service) to the set for that round; DEPLOY_COMPLETE
         # drains it; when the set is empty the round loop is signalled to
@@ -130,15 +135,21 @@ class GameMgr:
         # Subscribe at construction time (not start()): the subscribers
         # have no file-sink dependency and tests routinely drive
         # PHASE_CHANGE events directly onto the bus without the round loop.
-        # ORDER MATTERS:
-        #   _on_persist_artifacts        — snapshot defense agent logs first
-        #   _on_defense_end_health_check — final per-team health probe
-        #   _on_defense_kickoff          — only fires on DEFENSE
-        #   _on_attack_kickoff           — only fires on ATTACK
+        # ORDER MATTERS — `bus.publish` awaits each subscriber sequentially,
+        # so anything subscribed *after* `_on_defense_kickoff` gets blocked
+        # for the entire DEFENSE phase (the kickoff awaits asyncio.gather
+        # over all team handlers, which awaits run_phase). Keep rotation
+        # FIRST so /flag flips at DEFENSE entry, not at DEFENSE exit.
+        #   _on_persist_service_logs     — ROUND_STOP only; phase-independent
+        #   _on_defense_end_health_check — fires on PHASE_CHANGE → ATTACK
+        #   _on_rotation_event           — rotate /flag at DEFENSE entry (MUST be before kickoff)
+        #   _on_defense_kickoff          — long-running; only on DEFENSE
+        #   _on_attack_kickoff           — long-running; only on ATTACK
         #   _on_deploy_complete          — drains _defense_pending, may
         #                                  signal RoundLoop early-end
-        self.bus.subscribe(self._on_persist_artifacts)
+        self.bus.subscribe(self._on_persist_service_logs)
         self.bus.subscribe(self._on_defense_end_health_check)
+        self.bus.subscribe(self._on_rotation_event)
         self.bus.subscribe(self._on_defense_kickoff)
         self.bus.subscribe(self._on_attack_kickoff)
         self.bus.subscribe(self._on_deploy_complete)
@@ -199,7 +210,7 @@ class GameMgr:
                 cname = team_to_prod.get(team_id)
                 if cname is None:
                     raise KeyError(f"challenge {chcfg.name!r}: unknown team_id {team_id!r}")
-                handle = self._handle_for(cname)
+                handle = self.handle_for(cname)
                 log.info("deploying challenge %s -> %s (port %d)", chcfg.name, cname, chcfg.port)
                 service.install(handle)
                 service.start(handle)
@@ -232,7 +243,7 @@ class GameMgr:
         # SERVICE_PROTOCOL plants (notes: PUT over its own TCP socket).
         for (team_id, service_name), service in self._service_by_owner.items():
             cname = team_to_prod[team_id]
-            handle = self._handle_for(cname)
+            handle = self.handle_for(cname)
             flag = new_flag()
             log.info("planting flag on %s/%s (round=%d, SERVICE_PROTOCOL)", team_id, service_name, round_id)
             service.plant_flag(handle, flag)
@@ -303,12 +314,15 @@ class GameMgr:
         # handler was registered (tests / observer-only runs).
         await self.install_all_agents()
 
-        # Re-plant at each DEFENSE entry (M5.5). Sequential await in
-        # bus.publish means this handler completes before _enter_phase
-        # returns and the DEFENSE timer begins.
-        self.bus.subscribe(self._on_rotation_event)
-        # NB: _on_defense_kickoff is subscribed in __init__ (it doesn't
-        # depend on file-sink state and tests need it active without start()).
+        # Pre-R1 dry-run readiness probe: spawn a tiny agent run per
+        # team asking it to call `report_ready` via MCP. Watch the bus
+        # for AGENT_READY; emit DRY_RUN_OK or DRY_RUN_FAILED per team.
+        # Best-effort — failures don't halt the round loop.
+        await self.dry_run_all_agents()
+
+        # NB: _on_rotation_event, _on_defense_kickoff and friends are all
+        # subscribed in __init__ — rotation BEFORE kickoff so /flag flips
+        # at DEFENSE entry, not at DEFENSE exit.
 
         self.round_loop = RoundLoop(self.bus, self.orchestrator.network, self.config.rounds)
         await self.round_loop.run()
@@ -418,6 +432,99 @@ class GameMgr:
         await asyncio.gather(
             *(_one(t.id) for t in self.config.topology.teams)
         )
+
+    # ── Persistent-memory v1: pre-R1 dry-run readiness probe ────────────
+
+    def register_dry_run_handler(
+        self,
+        handler: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """Register the per-team dry-run handler.
+
+        Signature: `async def handler(team_id) -> None`. Handler is
+        expected to spawn one short claude invocation whose prompt
+        asks the agent to call `mcp__cyberarena__report_ready`.
+        GameMgr coordinates the per-team timeout + bus watch.
+
+        Without a handler `dry_run_all_agents` no-ops (test mode).
+        """
+        self._dry_run_handler = handler
+
+    async def dry_run_all_agents(
+        self,
+        *,
+        timeout_secs: float = 195.0,
+    ) -> None:
+        """Pre-R1 readiness probe across every team in parallel.
+
+        For each team: emit DRY_RUN_START, invoke the registered handler
+        (which runs a tiny claude phase asking the agent to call
+        `mcp__cyberarena__report_ready`), then watch the bus for an
+        AGENT_READY event for that team. If AGENT_READY arrives within
+        `timeout_secs`, emit DRY_RUN_OK; otherwise (timeout / handler
+        raised / agent process crashed) emit DRY_RUN_FAILED with a brief
+        reason in the payload.
+
+        Best-effort: a team that fails dry run still gets to try R1
+        (its kickoff will likely also fail with a cleaner AGENT_FAILED).
+        We don't halt — we just surface the failure on the bus so the
+        operator sees it on the panel before the round loop ticks.
+
+        `timeout_secs` default is the coordinator-side wait; it should
+        be slightly larger than main.py's `DRY_RUN_AGENT_TIMEOUT_SECS`
+        (the transport-level kill deadline) so the transport always
+        wins the race and claude is pkilled cleanly inside the
+        container. 195s = 180s transport + 15s slack.
+        """
+        if self._dry_run_handler is None:
+            return  # event-only mode (tests)
+
+        handler = self._dry_run_handler
+        teams = list(self.config.topology.teams)
+
+        # Per-team AGENT_READY watcher.
+        ready_events: dict[str, asyncio.Event] = {t.id: asyncio.Event() for t in teams}
+
+        async def _watch(event):
+            if event.type == EventType.AGENT_READY.value:
+                tid = event.team_id
+                if tid in ready_events:
+                    ready_events[tid].set()
+
+        self.bus.subscribe(_watch)
+        try:
+            async def _one(team_id: str) -> None:
+                await self.bus.publish(new_event(
+                    EventType.DRY_RUN_START,
+                    team_id=team_id,
+                    payload={"team_id": team_id, "ts": time.time()},
+                ))
+                handler_error: str | None = None
+                try:
+                    await asyncio.wait_for(handler(team_id), timeout=timeout_secs)
+                except asyncio.TimeoutError:
+                    handler_error = f"handler exceeded {timeout_secs}s"
+                except Exception as e:
+                    log.exception("dry_run: handler raised for %s", team_id)
+                    handler_error = f"{type(e).__name__}: {e}"[:200]
+
+                if ready_events[team_id].is_set():
+                    await self.bus.publish(new_event(
+                        EventType.DRY_RUN_OK,
+                        team_id=team_id,
+                        payload={"team_id": team_id, "ts": time.time()},
+                    ))
+                else:
+                    reason = handler_error or "AGENT_READY not received"
+                    await self.bus.publish(new_event(
+                        EventType.DRY_RUN_FAILED,
+                        team_id=team_id,
+                        payload={"team_id": team_id, "error": reason, "ts": time.time()},
+                    ))
+
+            await asyncio.gather(*(_one(t.id) for t in teams))
+        finally:
+            self.bus.unsubscribe(_watch)
 
     # ── DEFCON: defense kickoff on PHASE_CHANGE → DEFENSE ───────────────
 
@@ -598,86 +705,22 @@ class GameMgr:
                     )
             await asyncio.gather(*(_safe(t, c, f) for t, c, f in pending))
 
-    # ── DEFCON: artifact persistence (api-logs / agent-logs / service-logs)
+    # ── DEFCON: end-of-round service-log snapshots ──────────────────────
 
-    def register_fetch_agent_logs_handler(
-        self,
-        handler: Callable[["ContainerHandle"], AgentLogs],
-    ) -> None:
-        """Register the callable that reads an agent's stdout / stderr /
-        exit_code off its dev container. Typically `ClaudeAgentManager.fetch_logs`.
+    async def _on_persist_service_logs(self, event) -> None:
+        """At ROUND_STOP, snapshot every team's prod container `docker logs`
+        to service-logs.
 
-        Without a handler the api-logs / agent-logs persistence no-ops
-        (service-logs still write because they go through `docker logs`
-        directly, no AgentManager needed).
-        """
-        self._fetch_agent_logs_handler = handler
-
-    async def _on_persist_artifacts(self, event) -> None:
-        """Snapshot agent + service logs at the right moments:
-
-        - PHASE_CHANGE → ATTACK: DEFENSE just ended; the dev container
-          holds the defense agent's stream-json + stderr in /tmp. Fetch
-          it BEFORE the attack-phase kickoff overwrites those files.
-
-        - ROUND_STOP: ATTACK just ended; snapshot the attack agent's
-          logs (same paths) and the prod container's `docker logs`.
+        Per-phase agent transcripts (stream-{phase}.jsonl / agent-{phase}.log
+        / metadata-{phase}.json) are written directly by
+        ClaudeAgentManager.run_phase into the team×round artifact dir — no
+        GameMgr subscriber needed for that path.
         """
         if self.artifacts is None:
-            return  # start() hasn't run yet — nothing to write into.
-
-        if event.type == EventType.PHASE_CHANGE.value and event.phase == Phase.ATTACK.value:
-            await self._persist_agent_logs("defense", event.round_id)
-        elif event.type == EventType.ROUND_STOP.value:
-            await self._persist_agent_logs("attack", event.round_id)
-            await self._persist_service_logs(event.round_id)
-
-    async def _persist_agent_logs(self, phase_label: str, round_id: int) -> None:
-        """Walk every team's dev container, fetch_logs, write to
-        api-logs/<team>/round-<N>/stream-<phase>.jsonl and
-        agent-logs/<team>/round-<N>/agent-<phase>.log.
-
-        Best-effort: any team that fails (no agent installed yet, fetch
-        raised, write raised) gets a log line and is skipped — never
-        bubbles up to crash the round.
-        """
-        if self.artifacts is None or self._fetch_agent_logs_handler is None:
             return
-        for team in self.config.topology.teams:
-            if not team.dev:
-                continue
-            try:
-                handle = self._handle_for(team.dev)
-            except Exception:
-                # Container doesn't exist yet / was torn down — skip silently.
-                continue
-            try:
-                logs = self._fetch_agent_logs_handler(handle)
-            except Exception:
-                log.exception("artifact: fetch_logs failed for %s", team.dev)
-                continue
-            try:
-                api_p = self.artifacts.path_for(
-                    ArtifactKind.API_LOG,
-                    team_id=team.id,
-                    round_id=round_id,
-                    filename=f"stream-{phase_label}.jsonl",
-                )
-                api_p.write_text(logs.stdout or "")
-                agent_p = self.artifacts.path_for(
-                    ArtifactKind.AGENT_LOG,
-                    team_id=team.id,
-                    round_id=round_id,
-                    filename=f"agent-{phase_label}.log",
-                )
-                agent_p.write_text(
-                    f"exit_code={logs.exit_code}\n\n=== stderr ===\n{logs.stderr or ''}"
-                )
-            except Exception:
-                log.exception(
-                    "artifact: write failed for %s round=%d phase=%s",
-                    team.id, round_id, phase_label,
-                )
+        if event.type != EventType.ROUND_STOP.value:
+            return
+        await self._persist_service_logs(event.round_id)
 
     async def _persist_service_logs(self, round_id: int) -> None:
         """Snapshot `docker logs <team{N}_prod>` for every team. End-of-round
@@ -853,13 +896,107 @@ class GameMgr:
             )
         )
 
-    async def record_agent_launched(self, team_id: str, wrapper_pid: int) -> None:
-        """Host emit: supervisor process running, wrapper pid captured."""
+    async def record_phase_started(
+        self,
+        team_id: str,
+        round_id: int,
+        phase: str,
+        prompt: str,
+        is_first: bool,
+    ) -> None:
+        """Bus emit: per-phase agent invocation is about to begin.
+
+        Called by the kickoff handler just before
+        `agents.runner.run_phase_via_transport`. Carries the first line
+        of the prompt + `is_first` flag so panel observers can show
+        whether this is the long briefing or a short continuation cue.
+        """
         await self.bus.publish(
             new_event(
-                EventType.AGENT_LAUNCHED,
+                EventType.AGENT_PROMPT_SENT,
                 team_id=team_id,
-                payload={"team_id": team_id, "wrapper_pid": wrapper_pid, "ts": time.time()},
+                round_id=round_id,
+                phase=phase,
+                payload={
+                    "prompt_first_line": (prompt.splitlines()[0] if prompt else ""),
+                    "is_first": is_first,
+                },
+            )
+        )
+
+    async def record_phase_done(
+        self,
+        team_id: str,
+        round_id: int,
+        phase: str,
+        prompt: str,
+        result,  # agents.transport.CommandResult
+        started_at: float,
+        ended_at: float,
+    ) -> None:
+        """Bus emit + artifact persistence for one finished phase.
+
+        Writes three sibling files to the team×round artifact dir:
+          * `stream-{phase}.jsonl` — raw CLI stdout (stream-json transcript)
+          * `agent-{phase}.log`    — raw CLI stderr
+          * `metadata-{phase}.json` — exit_code / timed_out / timings /
+            prompt_first_line
+
+        Then emits one of AGENT_COMPLETED / AGENT_TIMEOUT / AGENT_FAILED
+        depending on `result.timed_out` and `result.exit_code`.
+
+        Best-effort artifact write: if `self.artifacts` is None (start()
+        hasn't run) or any write raises, the event still publishes so
+        downstream observers see the outcome.
+        """
+        from .artifacts import ArtifactKind
+
+        duration_ms = int((ended_at - started_at) * 1000)
+
+        if self.artifacts is not None:
+            try:
+                base = self.artifacts.path_for(
+                    ArtifactKind.API_LOG,
+                    team_id=team_id, round_id=round_id,
+                    filename=f"stream-{phase}.jsonl",
+                ).parent
+                (base / f"stream-{phase}.jsonl").write_bytes(result.stdout)
+                (base / f"agent-{phase}.log").write_bytes(result.stderr)
+                (base / f"metadata-{phase}.json").write_text(json.dumps({
+                    "round_id": round_id,
+                    "phase": phase,
+                    "exit_code": result.exit_code,
+                    "timed_out": result.timed_out,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "duration_ms": duration_ms,
+                    "prompt_first_line": (prompt.splitlines()[0] if prompt else ""),
+                }))
+            except Exception:
+                log.exception(
+                    "record_phase_done: artifact write failed for %s round=%d phase=%s",
+                    team_id, round_id, phase,
+                )
+
+        payload = {
+            "exit_code": result.exit_code,
+            "duration_ms": duration_ms,
+            "started_at": started_at,
+            "ended_at": ended_at,
+        }
+        if result.timed_out:
+            event_type = EventType.AGENT_TIMEOUT
+        elif result.exit_code == 0:
+            event_type = EventType.AGENT_COMPLETED
+        else:
+            event_type = EventType.AGENT_FAILED
+            payload["error_excerpt"] = f"non-zero exit {result.exit_code}"
+
+        await self.bus.publish(
+            new_event(
+                event_type,
+                team_id=team_id, round_id=round_id, phase=phase,
+                payload=payload,
             )
         )
 
@@ -1176,7 +1313,7 @@ class GameMgr:
         proto_ok = True
         service_obj = self._service_by_owner.get((team_id, service))
         if service_obj is not None:
-            handle = self._handle_for(container_name)
+            handle = self.handle_for(container_name)
             try:
                 proto_ok = await loop.run_in_executor(
                     None, lambda: service_obj.is_alive(handle, HealthLevel.PROTOCOL)
@@ -1319,7 +1456,7 @@ class GameMgr:
 
     # ── helpers ─────────────────────────────────────────────────────────
 
-    def _handle_for(self, container_name: str) -> ContainerHandle:
+    def handle_for(self, container_name: str) -> ContainerHandle:
         node = self.config.topology.node(container_name)
         c = self.orchestrator.containers._client.containers.get(container_name)
         return ContainerHandle(container_id=c.id, name=container_name, networks=list(node.networks))

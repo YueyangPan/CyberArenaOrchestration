@@ -72,29 +72,57 @@ class DockerExecBackend(AgentTransport):
             stderr=asyncio.subprocess.PIPE,
         )
 
+        # We drain stdout/stderr into local buffers via dedicated tasks so
+        # cancelling on timeout doesn't lose any already-buffered output
+        # (the bug `asyncio.wait_for(proc.communicate(), …)` had — when the
+        # outer wait_for cancelled the inner communicate(), the bytes its
+        # gathered read-tasks had accumulated were dropped on the floor).
+        # Drains finish naturally when proc exits and its pipes EOF.
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+
+        async def _drain(reader: asyncio.StreamReader | None, sink: list[bytes]) -> None:
+            if reader is None:
+                return
+            while True:
+                chunk = await reader.read(8192)
+                if not chunk:
+                    return
+                sink.append(chunk)
+
+        stdout_task = asyncio.create_task(_drain(proc.stdout, stdout_chunks))
+        stderr_task = asyncio.create_task(_drain(proc.stderr, stderr_chunks))
+
+        if stdin is not None and proc.stdin is not None:
+            proc.stdin.write(stdin)
+            try:
+                await proc.stdin.drain()
+            finally:
+                proc.stdin.close()
+
         timed_out = False
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=stdin),
-                timeout=timeout,
-            )
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             timed_out = True
-            # SIGTERM the docker exec subprocess; it tries to propagate
-            # to the in-container child. May or may not work cleanly.
+            # SIGTERM the docker exec subprocess (may or may not propagate
+            # to the in-container child; kill_process is the safety net).
             proc.terminate()
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=self.KILL_GRACE_SECS,
-                )
+                await asyncio.wait_for(proc.wait(), timeout=self.KILL_GRACE_SECS)
             except asyncio.TimeoutError:
                 proc.kill()
-                stdout, stderr = await proc.communicate()
+                await proc.wait()
+
+        # Pipes are guaranteed to EOF now that the process has exited;
+        # both drain tasks will return on their own.
+        await stdout_task
+        await stderr_task
 
         return CommandResult(
             exit_code=proc.returncode if proc.returncode is not None else -1,
-            stdout=stdout or b"",
-            stderr=stderr or b"",
+            stdout=b"".join(stdout_chunks),
+            stderr=b"".join(stderr_chunks),
             timed_out=timed_out,
         )
 

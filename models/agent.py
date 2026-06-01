@@ -15,6 +15,11 @@ class AgentStatus(str, Enum):
 @dataclass(frozen=True)
 class AgentConfig:
     cli: str
+    # Which AgentManager subclass to build. Populated from
+    # game.yaml's `agent.provider` (or inferred from `cli`'s leading
+    # token if missing). See `agents.registry.build` for the
+    # dispatch table.
+    provider: str = "claude"
     model: str = ""
     api_key: str = ""
     base_url: str = ""
@@ -67,22 +72,3 @@ class AgentState:
     exit_code: int | None = None
 
 
-@dataclass(frozen=True)
-class DoneInfo:
-    """Returned by `ClaudeAgentManager.run_phase`. Mirrors the per-phase
-    `metadata.json` artifact one-to-one — callers can serialize this
-    directly if they want.
-
-    `timed_out=True` means the phase timer expired and the transport
-    terminated/killed the claude subprocess; `exit_code` reflects the
-    signal-exit (usually non-zero) and `stdout`/`stderr` carry whatever
-    was captured up to that point.
-    """
-
-    exit_code: int
-    timed_out: bool
-    started_at: float
-    ended_at: float
-    duration_ms: int
-    stdout_path: str
-    stderr_path: str

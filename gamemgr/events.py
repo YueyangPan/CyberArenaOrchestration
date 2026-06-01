@@ -20,11 +20,13 @@ class EventType(str, Enum):
     PHASE_CHANGE = "PHASE_CHANGE"
     ROUND_STOP = "ROUND_STOP"
     SERVICE_DEPLOYED = "SERVICE_DEPLOYED"
-    # M4.5 lifecycle chain: host-emitted INSTALLED (prep done, not launched)
-    # → host-emitted LAUNCHED (supervisor pid captured) → MCP-emitted READY
-    # (LLM proved the channel works). Only the first two are load-bearing.
+    # Agent lifecycle: host-emitted INSTALLED (prep done — env / mcp.json /
+    # SSH pivot / workdir staged) → MCP-emitted READY (LLM proved the
+    # channel works by calling report_ready). Per-phase invocation events
+    # (AGENT_PROMPT_SENT / COMPLETED / TIMEOUT / FAILED) cover everything
+    # downstream of install. The M4.5-era AGENT_LAUNCHED event was retired
+    # alongside the supervisor model — there is no separate launch step.
     AGENT_INSTALLED = "AGENT_INSTALLED"
-    AGENT_LAUNCHED = "AGENT_LAUNCHED"
     AGENT_READY = "AGENT_READY"
     FLAG_PLANTED = "FLAG_PLANTED"
     FLAG_SUBMITTED = "FLAG_SUBMITTED"
@@ -68,6 +70,18 @@ class EventType(str, Enum):
     AGENT_COMPLETED = "AGENT_COMPLETED"
     AGENT_TIMEOUT = "AGENT_TIMEOUT"
     AGENT_FAILED = "AGENT_FAILED"
+    # Pre-R1 dry-run readiness probe.
+    # DRY_RUN_START — orchestrator emits per team before invoking the
+    #   agent with the dry-run prompt.
+    # DRY_RUN_OK    — orchestrator emits when AGENT_READY arrives for
+    #   that team within the dry-run window (agent successfully called
+    #   the existing `report_ready` MCP tool — proves the whole setup
+    #   chain works end-to-end).
+    # DRY_RUN_FAILED — orchestrator emits on timeout / process crash
+    #   when AGENT_READY never arrives for that team.
+    DRY_RUN_START = "DRY_RUN_START"
+    DRY_RUN_OK = "DRY_RUN_OK"
+    DRY_RUN_FAILED = "DRY_RUN_FAILED"
 
 
 @dataclass(frozen=True)

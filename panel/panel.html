@@ -164,7 +164,6 @@
   .chip-deploy    { color: var(--accent); }
   .chip-agent     { color: var(--accent); }
   .chip-kickoff   { color: var(--accent); }
-  .chip-launch    { color: var(--accent); }
   .chip-prompt    { color: var(--accent); }
   .chip-ready     { color: var(--good); }
   .chip-restart   { color: var(--plant); }
@@ -290,8 +289,10 @@
       case 'PHASE_CHANGE':             return renderPhaseChange(ev);
       case 'SERVICE_DEPLOYED':         return renderServiceDeployed(ev);
       case 'AGENT_INSTALLED':          return renderAgentInstalled(ev);
-      case 'AGENT_LAUNCHED':           return renderAgentLaunched(ev);
       case 'AGENT_READY':              return renderAgentReady(ev);
+      case 'DRY_RUN_START':            return renderDryRun(ev, 'start');
+      case 'DRY_RUN_OK':               return renderDryRun(ev, 'ok');
+      case 'DRY_RUN_FAILED':           return renderDryRun(ev, 'failed');
       case 'DEFENSE_KICKOFF':          return renderKickoff(ev, 'defense');
       case 'ATTACK_KICKOFF':           return renderKickoff(ev, 'attack');
       case 'AGENT_PROMPT_SENT':        return renderPromptSent(ev);
@@ -350,13 +351,20 @@
     );
     lane.chips.appendChild(chip);
   }
-  function renderAgentLaunched(ev) {
+  function renderDryRun(ev, kind) {
     const lane = getLane(ev.team_id);
     const pl = ev.payload || {};
-    const chip = el('span', 'chip chip-launch');
+    const cls = kind === 'ok' ? 'chip-ready'
+              : kind === 'failed' ? 'chip-reject'
+              : 'chip-kickoff';
+    const mark = kind === 'ok' ? '✓'
+               : kind === 'failed' ? '✗'
+               : '↗';
+    const err = pl.error ? ` — ${pl.error}` : '';
+    const chip = el('span', `chip ${cls}`);
     chip.append(
-      el('span', 'mark', '▶'),
-      document.createTextNode(`agent launched pid=${pl.wrapper_pid || '?'}`),
+      el('span', 'mark', mark),
+      document.createTextNode(`dry-run ${kind}${err}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
     lane.chips.appendChild(chip);
@@ -555,7 +563,19 @@
 
   // ── boot ────────────────────────────────────────────────
   ensureTeamsOrdered(['team1', 'team2']);
-  backfill().then(connect);
+  if (Array.isArray(window.INITIAL_EVENTS)) {
+    // Snapshot mode: events were embedded at build time by
+    // gamemgr/panel_snapshot.py. No live connection, no /game/status
+    // backfill — just replay the events and stop.
+    const conn = $('conn');
+    conn.dataset.state = 'snapshot';
+    conn.querySelector('.text').textContent = 'snapshot';
+    for (const ev of window.INITIAL_EVENTS) {
+      try { render(ev); } catch (e) { /* keep going on bad event */ }
+    }
+  } else {
+    backfill().then(connect);
+  }
 </script>
 </body>
 </html>

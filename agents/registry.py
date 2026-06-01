@@ -1,13 +1,16 @@
-"""Agent registry — picks an AgentManager subclass by cli flavor.
+"""Agent registry — picks an AgentManager subclass by provider.
 
-The flavor is the first whitespace-separated token of cfg.cli, e.g.
+Primary key is `cfg.provider` (from game.yaml's `agent.provider:`).
+For back-compat with yamls that don't set it, falls back to the first
+whitespace-separated token of `cfg.cli`:
 
-  cli: claude --dangerously-skip-permissions     -> "claude"
-  cli: sleep 60                                  -> "sleep"   (test override)
-  cli: codex --some-flag                         -> "codex"
+  provider: claude                                 -> ClaudeAgentManager
+  (provider unset, cli: "claude --print")          -> ClaudeAgentManager
+  (provider unset, cli: "sleep 60")                -> ClaudeAgentManager (test stand-in)
+  provider: codex                                  -> CodexAgentManager (NotImplementedError until added)
 
-The 'sleep' override and any other non-LLM stand-ins reuse ClaudeAgentManager
-(same supervisor-bash mechanics, just skips the npm install step).
+Future CLIs (codex / gemini / openai_compat) register themselves here
+by adding a single line to REGISTRY.
 """
 
 from __future__ import annotations
@@ -25,6 +28,16 @@ DEFAULT: type[AgentManager] = ClaudeAgentManager
 
 
 def build(cfg: AgentConfig) -> AgentManager:
-    flavor = cfg.cli.split(None, 1)[0] if cfg.cli else ""
-    cls = REGISTRY.get(flavor, DEFAULT)
+    """Look up the right AgentManager class for `cfg`.
+
+    Resolution order:
+      1. `cfg.provider` (the canonical knob)
+      2. first token of `cfg.cli` (back-compat; matches the M4-era yaml)
+      3. DEFAULT (ClaudeAgentManager) — so stand-ins like `cli: sleep 60`
+         keep working with no provider set
+    """
+    key = (cfg.provider or "").strip()
+    if not key and cfg.cli:
+        key = cfg.cli.split(None, 1)[0]
+    cls = REGISTRY.get(key, DEFAULT)
     return cls()

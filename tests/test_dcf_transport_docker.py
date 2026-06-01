@@ -30,36 +30,80 @@ def _handle(name: str = "team1_dev") -> ContainerHandle:
     return ContainerHandle(container_id="x", name=name, networks=[])
 
 
-class _FakeProc:
-    """asyncio.subprocess.Process stand-in. Returns canned communicate()
-    output; supports terminate()/kill() by recording the call and
-    completing communicate() on a follow-up await."""
+class _FakeStream:
+    """StreamReader stand-in. `read(n)` yields canned bytes until exhausted,
+    then blocks (until `eof()` is called) and finally returns b"" (EOF).
+    Models docker exec's stdout pipe: bytes accumulate while the proc is
+    alive; EOF only after proc dies."""
 
-    def __init__(self, *, returncode: int, stdout: bytes, stderr: bytes, hang: bool = False):
-        self._stdout = stdout
-        self._stderr = stderr
+    def __init__(self, content: bytes):
+        self._content = content
+        self._returned = False
+        self._eof = asyncio.Event()
+
+    def eof(self) -> None:
+        self._eof.set()
+
+    async def read(self, n: int = -1) -> bytes:
+        if not self._returned and self._content:
+            self._returned = True
+            return self._content
+        # Block until the proc signals EOF, then return empty bytes.
+        await self._eof.wait()
+        return b""
+
+
+class _FakeProc:
+    """asyncio.subprocess.Process stand-in modeling the new run_command
+    contract: drain tasks read from `.stdout` / `.stderr` until EOF;
+    `wait()` resolves on terminate/kill or natural exit; `.returncode`
+    is populated after wait."""
+
+    def __init__(
+        self,
+        *,
+        returncode: int,
+        stdout: bytes,
+        stderr: bytes,
+        hang: bool = False,
+    ):
+        self.stdout = _FakeStream(stdout)
+        self.stderr = _FakeStream(stderr)
+        self.stdin = None
         self._hang = hang
-        self.returncode = returncode if not hang else None
         self.terminated = False
         self.killed = False
-        self._after_signal = False
+        self._exited = asyncio.Event()
+        if hang:
+            self.returncode = None
+            self._final_rc = returncode
+        else:
+            self.returncode = returncode
+            self.stdout.eof()
+            self.stderr.eof()
+            self._exited.set()
 
-    async def communicate(self, input=None):
-        if self._hang and not self._after_signal:
-            # First call: never completes — emulate a hanging process.
-            await asyncio.sleep(3600)
-        # After terminate()/kill() we settle.
-        return self._stdout, self._stderr
+    async def wait(self) -> int:
+        await self._exited.wait()
+        return self.returncode  # type: ignore[return-value]
 
-    def terminate(self):
+    def terminate(self) -> None:
         self.terminated = True
-        self.returncode = 143  # SIGTERM
-        self._after_signal = True
+        # SIGTERM → emulate the process settling. Pipes EOF so drains
+        # can complete.
+        if self.returncode is None:
+            self.returncode = 143  # SIGTERM
+        self.stdout.eof()
+        self.stderr.eof()
+        self._exited.set()
 
-    def kill(self):
+    def kill(self) -> None:
         self.killed = True
-        self.returncode = 137  # SIGKILL
-        self._after_signal = True
+        if self.returncode is None:
+            self.returncode = 137  # SIGKILL
+        self.stdout.eof()
+        self.stderr.eof()
+        self._exited.set()
 
 
 def _patch_subprocess(proc):
@@ -157,9 +201,7 @@ def test_run_command_string_cmd_goes_through_bash():
 
 
 def test_run_command_timeout_terminates_and_returns_timed_out():
-    """On wait_for timeout the backend SIGTERMs and returns timed_out=True
-    with whatever stdout/stderr we observed (here: empty since the proc
-    hung before flushing)."""
+    """On wait_for timeout the backend SIGTERMs and returns timed_out=True."""
     backend = DockerExecBackend(client=MagicMock())
     proc = _FakeProc(returncode=0, stdout=b"", stderr=b"", hang=True)
 
@@ -172,6 +214,38 @@ def test_run_command_timeout_terminates_and_returns_timed_out():
     assert proc.terminated is True
     # exit_code = SIGTERM rc (143). The hangProc settles after terminate.
     assert r.exit_code == 143
+
+
+def test_run_command_timeout_preserves_buffered_stdout():
+    """REGRESSION: when a long-running proc times out, the bytes its
+    stdout pipe had ALREADY buffered must reach the caller.
+
+    Before the fix this returned empty stdout — `asyncio.wait_for(
+    proc.communicate(), timeout)` cancelled the inner gather() and its
+    read-tasks dropped their accumulated bytes on the floor. The new
+    code drains stdout/stderr into local buffers continuously, so a
+    timeout doesn't lose anything."""
+    backend = DockerExecBackend(client=MagicMock())
+    # Proc hangs (won't exit on its own) but its stdout pipe already
+    # has bytes buffered — exactly the live-game shape where claude
+    # streamed transcript chunks then ran past the phase timer.
+    proc = _FakeProc(
+        returncode=0,
+        stdout=b'{"transcript":"line1"}\n{"transcript":"line2"}\n',
+        stderr=b"some warnings\n",
+        hang=True,
+    )
+
+    async def go():
+        with _patch_subprocess(proc):
+            return await backend.run_command(_handle(), ["sleep", "60"], timeout=0.05)
+    r = asyncio.run(go())
+
+    assert r.timed_out is True
+    assert r.stdout == b'{"transcript":"line1"}\n{"transcript":"line2"}\n', (
+        f"buffered stdout was lost on timeout; got {r.stdout!r}"
+    )
+    assert r.stderr == b"some warnings\n", f"buffered stderr was lost on timeout; got {r.stderr!r}"
 
 
 # ── write_file / read_file: docker-py archive paths ───────────────────
