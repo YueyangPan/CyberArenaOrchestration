@@ -134,6 +134,7 @@ def _from_dict(raw: dict) -> GameConfig:
             continue
         agents[t["id"]] = AgentConfig(
             cli=ag["cli"],
+            provider=ag.get("provider", ""),
             model=ag.get("model", ""),
             api_key=ag.get("api_key", ""),
             base_url=ag.get("base_url", ""),

@@ -9,6 +9,7 @@ Lifecycle:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import secrets
 import time
@@ -784,6 +785,110 @@ class GameMgr:
                 EventType.AGENT_INSTALLED,
                 team_id=team_id,
                 payload={"team_id": team_id, "ts": time.time()},
+            )
+        )
+
+    async def record_phase_started(
+        self,
+        team_id: str,
+        round_id: int,
+        phase: str,
+        prompt: str,
+        is_first: bool,
+    ) -> None:
+        """Bus emit: per-phase agent invocation is about to begin.
+
+        Called by the kickoff handler just before
+        `agents.runner.run_phase_via_transport`. Carries the first line
+        of the prompt + `is_first` flag so panel observers can show
+        whether this is the long briefing or a short continuation cue.
+        """
+        await self.bus.publish(
+            new_event(
+                EventType.AGENT_PROMPT_SENT,
+                team_id=team_id,
+                round_id=round_id,
+                phase=phase,
+                payload={
+                    "prompt_first_line": (prompt.splitlines()[0] if prompt else ""),
+                    "is_first": is_first,
+                },
+            )
+        )
+
+    async def record_phase_done(
+        self,
+        team_id: str,
+        round_id: int,
+        phase: str,
+        prompt: str,
+        result,  # agents.transport.CommandResult
+        started_at: float,
+        ended_at: float,
+    ) -> None:
+        """Bus emit + artifact persistence for one finished phase.
+
+        Writes three sibling files to the team×round artifact dir:
+          * `stream-{phase}.jsonl` — raw CLI stdout (stream-json transcript)
+          * `agent-{phase}.log`    — raw CLI stderr
+          * `metadata-{phase}.json` — exit_code / timed_out / timings /
+            prompt_first_line
+
+        Then emits one of AGENT_COMPLETED / AGENT_TIMEOUT / AGENT_FAILED
+        depending on `result.timed_out` and `result.exit_code`.
+
+        Best-effort artifact write: if `self.artifacts` is None (start()
+        hasn't run) or any write raises, the event still publishes so
+        downstream observers see the outcome.
+        """
+        from .artifacts import ArtifactKind
+
+        duration_ms = int((ended_at - started_at) * 1000)
+
+        if self.artifacts is not None:
+            try:
+                base = self.artifacts.path_for(
+                    ArtifactKind.API_LOG,
+                    team_id=team_id, round_id=round_id,
+                    filename=f"stream-{phase}.jsonl",
+                ).parent
+                (base / f"stream-{phase}.jsonl").write_bytes(result.stdout)
+                (base / f"agent-{phase}.log").write_bytes(result.stderr)
+                (base / f"metadata-{phase}.json").write_text(json.dumps({
+                    "round_id": round_id,
+                    "phase": phase,
+                    "exit_code": result.exit_code,
+                    "timed_out": result.timed_out,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "duration_ms": duration_ms,
+                    "prompt_first_line": (prompt.splitlines()[0] if prompt else ""),
+                }))
+            except Exception:
+                log.exception(
+                    "record_phase_done: artifact write failed for %s round=%d phase=%s",
+                    team_id, round_id, phase,
+                )
+
+        payload = {
+            "exit_code": result.exit_code,
+            "duration_ms": duration_ms,
+            "started_at": started_at,
+            "ended_at": ended_at,
+        }
+        if result.timed_out:
+            event_type = EventType.AGENT_TIMEOUT
+        elif result.exit_code == 0:
+            event_type = EventType.AGENT_COMPLETED
+        else:
+            event_type = EventType.AGENT_FAILED
+            payload["error_excerpt"] = f"non-zero exit {result.exit_code}"
+
+        await self.bus.publish(
+            new_event(
+                event_type,
+                team_id=team_id, round_id=round_id, phase=phase,
+                payload=payload,
             )
         )
 

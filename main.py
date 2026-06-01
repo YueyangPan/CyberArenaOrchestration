@@ -9,15 +9,17 @@ import signal
 import sys
 from pathlib import Path
 
+import time
+
 import docker
 import uvicorn
 
-from agents.claude import ClaudeAgentManager
+from agents.manager import AgentManager
+from agents.registry import build as build_agent_manager
+from agents.runner import run_phase_via_transport
 from agents.transport_docker import DockerExecBackend
 from gamemgr.api import build_app
-from gamemgr.artifacts import ArtifactKind
 from gamemgr.config import load as load_game_config
-from gamemgr.events import EventType, new_event
 from gamemgr.game_mgr import GameMgr
 from models.agent import AgentConfig
 from orchestrator import topology
@@ -162,21 +164,38 @@ def _build_challenge_images(config_path: str) -> None:
 
 
 def _wire_phase_kickoffs(game: GameMgr) -> None:
-    """Wire ClaudeAgentManager into GameMgr for persistent-memory v1:
+    """Wire the agent layer into GameMgr for persistent-memory v1.
 
-    - install handler (called once per team by `game.install_all_agents()`
-      from inside start(), before the round loop ticks).
-    - defense + attack kickoff handlers (called per (team, phase) by the
-      round loop; each one awaits a single `run_phase` via the transport
-      and emits AGENT_PROMPT_SENT / AGENT_COMPLETED / AGENT_TIMEOUT /
-      AGENT_FAILED on the bus).
+    One transport (DockerExecBackend), one manager per provider
+    (resolved via `agents.registry.build`). Three handlers:
 
-    One transport, one manager — state lives in the agent container and
-    in Claude CLI's session store, not in the manager.
+      * `install_handler`  — runs once per team from
+        `game.install_all_agents()` (pre-loop). Bridges the sync
+        `AgentManager.install` into the loop via run_in_executor.
+      * `_make_phase_handler` (defense + attack) — runs per (team,
+        phase) from the kickoff subscribers. The whole body is the
+        5-line dance: lookup handle → record_phase_started →
+        run_phase_via_transport → record_phase_done. All CLI-specific
+        details (prompt path, claude argv, kill pattern) live behind
+        `mgr.PROMPT_PATH` / `mgr.phase_command()` / `mgr.PHASE_KILL_PATTERN`.
     """
     client = docker.from_env()
     backend = DockerExecBackend(client=client)
-    agent_mgr = ClaudeAgentManager(transport=backend, client=client)
+
+    # One AgentManager per team — picked from cfg.provider via
+    # agents.registry.build. With one provider in play this is a single
+    # cached instance; mixed-provider games (claude vs codex) will pick
+    # different subclasses per team automatically. Each manager has its
+    # own DockerExecBackend internally for install; the shared `backend`
+    # above is what the per-phase runner uses.
+    mgr_by_team: dict[str, AgentManager] = {}
+    def _mgr_for(team_id: str) -> AgentManager:
+        if team_id not in mgr_by_team:
+            cfg = game.config.agents.get(team_id)
+            if cfg is None:
+                raise KeyError(f"no agent config for team {team_id!r}")
+            mgr_by_team[team_id] = build_agent_manager(cfg)
+        return mgr_by_team[team_id]
 
     # ── install handler (pre-loop) ─────────────────────────────────────
     async def install_handler(team_id: str, cfg: AgentConfig) -> None:
@@ -189,12 +208,13 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
         except Exception:
             log.exception("install: cannot resolve dev handle for %s", team_id)
             return
+        mgr = _mgr_for(team_id)
         loop = asyncio.get_running_loop()
         def _on_installed(tid: str) -> None:
             asyncio.run_coroutine_threadsafe(game.record_agent_installed(tid), loop)
         await loop.run_in_executor(
             None,
-            lambda: agent_mgr.install(handle, cfg, on_installed=_on_installed),
+            lambda: mgr.install(handle, cfg, on_installed=_on_installed),
         )
         log.info("agent installed on %s", team.dev)
 
@@ -219,62 +239,31 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
                 log.exception("%s kickoff: cannot resolve dev handle for %s", phase, team_id)
                 return
 
+            mgr = _mgr_for(team_id)
             prompt = cfg.system_prompt or ""
-            await game.bus.publish(new_event(
-                EventType.AGENT_PROMPT_SENT,
-                team_id=team_id, round_id=round_id, phase=phase,
-                payload={
-                    "prompt_first_line": (prompt.splitlines()[0] if prompt else ""),
-                    "is_first": is_first,
-                },
-            ))
+            await game.record_phase_started(team_id, round_id, phase, prompt, is_first)
 
-            artifact_dir = None
-            if game.artifacts is not None:
-                # path_for returns runs/<ts>/artifacts/<team>/round-<N>/<file>.
-                # run_phase writes 3 sibling files in that dir; .parent IS
-                # the dir we want.
-                artifact_dir = game.artifacts.path_for(
-                    ArtifactKind.API_LOG,
-                    team_id=team_id, round_id=round_id,
-                    filename=f"stream-{phase}.jsonl",
-                ).parent
-
+            started_at = time.time()
             try:
-                done = await agent_mgr.run_phase(
-                    handle, prompt,
-                    round_id=round_id, phase=phase,
-                    timeout=timeout_secs,
-                    artifact_dir=artifact_dir,
-                    model=cfg.model or None,
+                result = await run_phase_via_transport(
+                    mgr, backend, handle, prompt,
+                    timeout=timeout_secs, model=cfg.model or None,
                 )
             except Exception as e:
                 log.exception("%s kickoff: run_phase raised for %s", phase, team_id)
+                from gamemgr.events import EventType, new_event
                 await game.bus.publish(new_event(
                     EventType.AGENT_FAILED,
                     team_id=team_id, round_id=round_id, phase=phase,
                     payload={"error": f"{type(e).__name__}: {e}"[:200]},
                 ))
                 return
+            ended_at = time.time()
 
-            payload = {
-                "exit_code": done.exit_code,
-                "duration_ms": done.duration_ms,
-                "started_at": done.started_at,
-                "ended_at": done.ended_at,
-            }
-            if done.timed_out:
-                event_type = EventType.AGENT_TIMEOUT
-            elif done.exit_code == 0:
-                event_type = EventType.AGENT_COMPLETED
-            else:
-                event_type = EventType.AGENT_FAILED
-                payload["error_excerpt"] = f"non-zero exit {done.exit_code}"
-            await game.bus.publish(new_event(
-                event_type,
-                team_id=team_id, round_id=round_id, phase=phase,
-                payload=payload,
-            ))
+            await game.record_phase_done(
+                team_id, round_id, phase, prompt,
+                result=result, started_at=started_at, ended_at=ended_at,
+            )
         return handler
 
     game.register_defense_kickoff_handler(

@@ -1,16 +1,19 @@
-"""ClaudeAgentManager — host-side controller for one Claude agent per team.
+"""ClaudeAgentManager — Claude Code adapter for the AgentManager ABC.
 
-Lifecycle (persistent-memory v1, see
+Two responsibilities under persistent-memory v1 (see
 docs/persistent_memory_agent_plan_v1.md):
 
-  install(handle, cfg)              # once per team at game start:
-                                    #   npm install, SSH pivot, env, mcp.json
-                                    #   No process is launched.
-  run_phase(handle, prompt,         # per phase:
-            round_id, phase,        #   write prompt, run claude -p --continue
-            timeout)                #   via the AgentTransport, collect
-                                    #   stdout/stderr/exit/timed_out, write
-                                    #   per-phase artifacts.
+  install(handle, cfg)            # once per team at game start: npm
+                                  # install, SSH pivot, env, mcp.json.
+                                  # No process launched.
+  phase_command(model=None)       # returns the shell argv that
+                                  # invokes `claude -p --continue ...`
+                                  # consuming the prompt from PROMPT_PATH.
+
+The per-phase 3-line dance (write prompt → run_command → kill on
+timeout) lives in `agents.runner.run_phase_via_transport`, not here.
+GameMgr owns artifact persistence + AGENT_* event emission via
+`record_phase_started` / `record_phase_done`.
 
 All side effects on the agent host go through `AgentTransport`
 (DockerExecBackend today, SSHBackend tomorrow). The manager never
@@ -21,6 +24,11 @@ CLI's session store lives at /root/.claude/projects/<workdir-cwd>/
 inside the container; `--continue` reloads the most-recent session.
 We pin the cwd to STATE_DIR/workdir so different arenas' sessions
 stay isolated.
+
+`status` / `kill` / `fetch_logs` are NOT part of the ABC anymore —
+they're concrete-only convenience methods kept for the M4-era live
+smoke tests (`test_m4_agent::test_live_hello_world`,
+`test_m5_6_agent_attack`) and `scripts/m6_screenshot_demo.py`.
 """
 
 from __future__ import annotations
@@ -32,17 +40,15 @@ import os
 import shlex
 import subprocess
 import tempfile
-import time
-from pathlib import Path
-from typing import Callable
+from typing import Callable, ClassVar
 
 import docker
 
-from models.agent import AgentConfig, AgentLogs, AgentState, AgentStatus, DoneInfo
+from models.agent import AgentConfig, AgentLogs, AgentState, AgentStatus
 from orchestrator.service import ContainerHandle
 
 from .manager import AgentManager
-from .transport import AgentHandle, AgentTransport, CommandResult
+from .transport import AgentHandle, AgentTransport
 from .transport_docker import DockerExecBackend
 
 log = logging.getLogger(__name__)
@@ -86,6 +92,10 @@ class ClaudeAgentManager(AgentManager):
     can pass a FakeTransport that records calls in-memory.
     """
 
+    # ABC contract (`agents.manager.AgentManager`).
+    PROMPT_PATH: ClassVar[str] = PROMPT_PATH
+    PHASE_KILL_PATTERN: ClassVar[str] = "claude -p"
+
     def __init__(
         self,
         *,
@@ -122,8 +132,9 @@ class ClaudeAgentManager(AgentManager):
           5. Write mcp.json if cfg.mcp_endpoint set.
           6. Fire on_installed (caller bridges to AGENT_INSTALLED on the bus).
 
-        NO process is launched. The first `run_phase` invocation is
-        what actually starts Claude.
+        NO process is launched. The first `phase_command` invocation
+        (driven by `agents.runner.run_phase_via_transport`) is what
+        actually starts Claude.
         """
         # All dirs the per-phase flow expects to exist.
         self._exec_sync(container, ["mkdir", "-p", STATE_DIR, LOG_DIR, RUN_DIR, WORKDIR], check=True)
@@ -150,114 +161,51 @@ class ClaudeAgentManager(AgentManager):
         log.info("agent installed on %s (cli=%r)", container.name, cfg.cli)
 
         # The one install-side lifecycle hook. There's no separate
-        # "launched" step — `run_phase` is what starts Claude per-phase
-        # and emits its own AGENT_PROMPT_SENT / COMPLETED / TIMEOUT /
-        # FAILED events.
+        # "launched" step — claude is spawned per-phase by
+        # `agents.runner.run_phase_via_transport` (which composes
+        # `phase_command()` with the transport); GameMgr.record_phase_*
+        # emits AGENT_PROMPT_SENT / COMPLETED / TIMEOUT / FAILED.
         if on_installed is not None and cfg.team_id:
             on_installed(cfg.team_id)
 
-    async def run_phase(
-        self,
-        container: ContainerHandle,
-        prompt: str,
-        *,
-        round_id: int,
-        phase: str,
-        timeout: float,
-        artifact_dir: Path | None = None,
-        model: str | None = None,
-    ) -> DoneInfo:
-        """Run one phase: drop the prompt, invoke `claude -p --continue`
-        through the transport, capture artifacts, return DoneInfo.
+    def phase_command(self, *, model: str | None = None) -> list[str]:
+        """Shell argv that drives one phase of Claude Code.
 
-        `timeout` is the phase timer in seconds. On expiry the transport
-        terminates the subprocess (SIGTERM → SIGKILL) and we issue a
-        belt-and-suspenders `pkill -KILL -f 'claude -p'` inside the
-        container in case docker-exec signal propagation lost the signal.
+        Wraps the actual claude invocation in `bash -c` so we can:
+          - cd into WORKDIR (claude --continue is cwd-scoped, so the
+            session store at /root/.claude/projects/<cwd-hash>/ stays
+            isolated to this arena)
+          - source agent.env (ANTHROPIC_API_KEY / BASE_URL / CLAUDE_MODEL)
+          - redirect stdin from PROMPT_PATH (claude reads the user prompt
+            from stdin in -p mode)
 
-        `artifact_dir`, if provided, gets `stream-{phase}.jsonl`,
-        `agent-{phase}.log`, and `metadata-{phase}.json` written into it.
-        If None, only the DoneInfo return value is populated and the
-        caller handles persistence.
-
-        `model` overrides `$CLAUDE_MODEL` (sourced from agent.env in the
-        container) for this invocation. Useful for tests; production
-        flows leave it None.
+        `model` overrides `$CLAUDE_MODEL` (which agent.env exports from
+        cfg.model). Production leaves it None; tests pass it explicitly
+        when the test mock client doesn't ship a model env var.
         """
-        ctx = json.dumps({"round_id": round_id, "phase": phase})
-        self._transport.write_file(container, PROMPT_PATH, prompt.encode())
-        self._transport.write_file(container, PHASE_CONTEXT_PATH, ctx.encode())
-
         model_arg = (
             f"--model {shlex.quote(model)} "
             if model
             else '--model "$CLAUDE_MODEL" '
         )
+        return [
+            "bash", "-c",
+            f"cd {shlex.quote(WORKDIR)} && "
+            f"set -a && . {shlex.quote(ENV_PATH)} && set +a && "
+            "claude -p --continue "
+            "--output-format stream-json --verbose "
+            "--dangerously-skip-permissions "
+            + model_arg
+            + f"--mcp-config {shlex.quote(MCP_CONFIG_PATH)} "
+            f"< {shlex.quote(self.PROMPT_PATH)}",
+        ]
 
-        # The whole claude invocation is wrapped in a shell so we can:
-        #   - cd into WORKDIR (claude --continue picks the cwd-scoped session)
-        #   - source agent.env to get ANTHROPIC_API_KEY / BASE_URL / CLAUDE_MODEL
-        #   - redirect stdin from PROMPT_PATH (Claude reads the prompt from stdin
-        #     in -p mode)
-        # The transport handles the timeout escalation; we just await.
-        started_at = time.time()
-        result: CommandResult = await self._transport.run_command(
-            container,
-            [
-                "bash", "-c",
-                f"cd {shlex.quote(WORKDIR)} && "
-                f"set -a && . {shlex.quote(ENV_PATH)} && set +a && "
-                "claude -p --continue "
-                "--output-format stream-json --verbose "
-                "--dangerously-skip-permissions "
-                + model_arg
-                + f"--mcp-config {shlex.quote(MCP_CONFIG_PATH)} "
-                f"< {shlex.quote(PROMPT_PATH)}"
-            ],
-            timeout=timeout,
-        )
-        ended_at = time.time()
-        duration_ms = int((ended_at - started_at) * 1000)
-
-        if result.timed_out:
-            # docker exec may not propagate SIGTERM cleanly to the
-            # in-container claude child; pkill as a safety net.
-            self._transport.kill_process(container, "claude -p")
-
-        # Per-phase artifact files. Path naming matches the existing
-        # DEFCON artifact store layout from
-        # docs/DEFCON_challenge_framework_report_v1.md.
-        stdout_path = ""
-        stderr_path = ""
-        if artifact_dir is not None:
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            stream_p = artifact_dir / f"stream-{phase}.jsonl"
-            agent_p = artifact_dir / f"agent-{phase}.log"
-            meta_p = artifact_dir / f"metadata-{phase}.json"
-            stream_p.write_bytes(result.stdout)
-            agent_p.write_bytes(result.stderr)
-            meta_p.write_text(json.dumps({
-                "round_id": round_id,
-                "phase": phase,
-                "exit_code": result.exit_code,
-                "timed_out": result.timed_out,
-                "started_at": started_at,
-                "ended_at": ended_at,
-                "duration_ms": duration_ms,
-                "prompt_first_line": (prompt.splitlines()[0] if prompt else ""),
-            }))
-            stdout_path = str(stream_p)
-            stderr_path = str(agent_p)
-
-        return DoneInfo(
-            exit_code=result.exit_code,
-            timed_out=result.timed_out,
-            started_at=started_at,
-            ended_at=ended_at,
-            duration_ms=duration_ms,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-        )
+    # ── concrete-only convenience methods (NOT on the ABC) ─────────────
+    # Kept for the M4-era live-smoke tests (test_m4_agent::test_live_hello_world,
+    # test_m5_6_agent_attack) + scripts/m6_screenshot_demo.py. Under
+    # persistent-memory v1 install no longer writes PID/WRAPPER_PID/
+    # EXIT_CODE files, so these are mostly best-effort no-ops on this
+    # subclass — but the live smokes still expect them to be callable.
 
     def status(self, container: ContainerHandle) -> AgentState:
         """Legacy M4/M4.5 status read against the supervisor pid files.
