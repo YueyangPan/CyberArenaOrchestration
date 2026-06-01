@@ -108,8 +108,29 @@ async def _run_start(args) -> int:
     )
 
     await game.stop()
+
+    # Tell uvicorn to wind down. `should_exit` triggers graceful shutdown
+    # (drains in-flight requests + closes idle keep-alives), but it can
+    # hang indefinitely on long-lived streams — panel WebSockets and the
+    # MCP StreamableHTTP SSE sessions are both "long-lived" by design.
+    # Escalate to `force_exit` (drops connections) after a short grace,
+    # then to outright task cancellation if even that doesn't fire.
     server.should_exit = True
-    await server_task
+    try:
+        await asyncio.wait_for(server_task, timeout=10)
+    except asyncio.TimeoutError:
+        log.warning("uvicorn didn't exit within 10s; setting force_exit")
+        server.force_exit = True
+        try:
+            await asyncio.wait_for(server_task, timeout=5)
+        except asyncio.TimeoutError:
+            log.error("uvicorn force_exit also stalled; cancelling task")
+            server_task.cancel()
+            try:
+                await server_task
+            except asyncio.CancelledError:
+                pass
+
     if not loop_task.done():
         loop_task.cancel()
         try:
