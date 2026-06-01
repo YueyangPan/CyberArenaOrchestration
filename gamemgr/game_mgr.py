@@ -125,15 +125,21 @@ class GameMgr:
         # Subscribe at construction time (not start()): the subscribers
         # have no file-sink dependency and tests routinely drive
         # PHASE_CHANGE events directly onto the bus without the round loop.
-        # ORDER MATTERS:
-        #   _on_persist_service_logs     — snapshot prod-container docker logs
-        #   _on_defense_end_health_check — final per-team health probe
-        #   _on_defense_kickoff          — only fires on DEFENSE
-        #   _on_attack_kickoff           — only fires on ATTACK
+        # ORDER MATTERS — `bus.publish` awaits each subscriber sequentially,
+        # so anything subscribed *after* `_on_defense_kickoff` gets blocked
+        # for the entire DEFENSE phase (the kickoff awaits asyncio.gather
+        # over all team handlers, which awaits run_phase). Keep rotation
+        # FIRST so /flag flips at DEFENSE entry, not at DEFENSE exit.
+        #   _on_persist_service_logs     — ROUND_STOP only; phase-independent
+        #   _on_defense_end_health_check — fires on PHASE_CHANGE → ATTACK
+        #   _on_rotation_event           — rotate /flag at DEFENSE entry (MUST be before kickoff)
+        #   _on_defense_kickoff          — long-running; only on DEFENSE
+        #   _on_attack_kickoff           — long-running; only on ATTACK
         #   _on_deploy_complete          — drains _defense_pending, may
         #                                  signal RoundLoop early-end
         self.bus.subscribe(self._on_persist_service_logs)
         self.bus.subscribe(self._on_defense_end_health_check)
+        self.bus.subscribe(self._on_rotation_event)
         self.bus.subscribe(self._on_defense_kickoff)
         self.bus.subscribe(self._on_attack_kickoff)
         self.bus.subscribe(self._on_deploy_complete)
@@ -298,12 +304,9 @@ class GameMgr:
         # handler was registered (tests / observer-only runs).
         await self.install_all_agents()
 
-        # Re-plant at each DEFENSE entry (M5.5). Sequential await in
-        # bus.publish means this handler completes before _enter_phase
-        # returns and the DEFENSE timer begins.
-        self.bus.subscribe(self._on_rotation_event)
-        # NB: _on_defense_kickoff is subscribed in __init__ (it doesn't
-        # depend on file-sink state and tests need it active without start()).
+        # NB: _on_rotation_event, _on_defense_kickoff and friends are all
+        # subscribed in __init__ — rotation BEFORE kickoff so /flag flips
+        # at DEFENSE entry, not at DEFENSE exit.
 
         self.round_loop = RoundLoop(self.bus, self.orchestrator.network, self.config.rounds)
         await self.round_loop.run()
