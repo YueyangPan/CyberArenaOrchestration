@@ -102,6 +102,15 @@ class GameMgr:
         self._install_agent_handler: (
             Callable[[str, AgentConfig], Awaitable[None]] | None
         ) = None
+        # Pre-R1 dry-run readiness probe. Handler runs one short claude
+        # invocation with a prompt asking the agent to call
+        # `mcp__cyberarena__report_ready`. GameMgr watches the bus for
+        # AGENT_READY per team within `dry_run_all_agents`. Signature:
+        #   async def handler(team_id) -> None
+        # None = event-only mode (tests).
+        self._dry_run_handler: (
+            Callable[[str], Awaitable[None]] | None
+        ) = None
         # Idempotency keys per round so a re-fire of PHASE_CHANGE doesn't
         # spawn duplicate work.
         self._defense_kickoff_done: set[tuple[int, str, str]] = set()
@@ -305,6 +314,12 @@ class GameMgr:
         # handler was registered (tests / observer-only runs).
         await self.install_all_agents()
 
+        # Pre-R1 dry-run readiness probe: spawn a tiny agent run per
+        # team asking it to call `report_ready` via MCP. Watch the bus
+        # for AGENT_READY; emit DRY_RUN_OK or DRY_RUN_FAILED per team.
+        # Best-effort — failures don't halt the round loop.
+        await self.dry_run_all_agents()
+
         # NB: _on_rotation_event, _on_defense_kickoff and friends are all
         # subscribed in __init__ — rotation BEFORE kickoff so /flag flips
         # at DEFENSE entry, not at DEFENSE exit.
@@ -417,6 +432,93 @@ class GameMgr:
         await asyncio.gather(
             *(_one(t.id) for t in self.config.topology.teams)
         )
+
+    # ── Persistent-memory v1: pre-R1 dry-run readiness probe ────────────
+
+    def register_dry_run_handler(
+        self,
+        handler: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """Register the per-team dry-run handler.
+
+        Signature: `async def handler(team_id) -> None`. Handler is
+        expected to spawn one short claude invocation whose prompt
+        asks the agent to call `mcp__cyberarena__report_ready`.
+        GameMgr coordinates the per-team timeout + bus watch.
+
+        Without a handler `dry_run_all_agents` no-ops (test mode).
+        """
+        self._dry_run_handler = handler
+
+    async def dry_run_all_agents(
+        self,
+        *,
+        timeout_secs: float = 60.0,
+    ) -> None:
+        """Pre-R1 readiness probe across every team in parallel.
+
+        For each team: emit DRY_RUN_START, invoke the registered handler
+        (which runs a tiny claude phase asking the agent to call
+        `mcp__cyberarena__report_ready`), then watch the bus for an
+        AGENT_READY event for that team. If AGENT_READY arrives within
+        `timeout_secs`, emit DRY_RUN_OK; otherwise (timeout / handler
+        raised / agent process crashed) emit DRY_RUN_FAILED with a brief
+        reason in the payload.
+
+        Best-effort: a team that fails dry run still gets to try R1
+        (its kickoff will likely also fail with a cleaner AGENT_FAILED).
+        We don't halt — we just surface the failure on the bus so the
+        operator sees it on the panel before the round loop ticks.
+        """
+        if self._dry_run_handler is None:
+            return  # event-only mode (tests)
+
+        handler = self._dry_run_handler
+        teams = list(self.config.topology.teams)
+
+        # Per-team AGENT_READY watcher.
+        ready_events: dict[str, asyncio.Event] = {t.id: asyncio.Event() for t in teams}
+
+        async def _watch(event):
+            if event.type == EventType.AGENT_READY.value:
+                tid = event.team_id
+                if tid in ready_events:
+                    ready_events[tid].set()
+
+        self.bus.subscribe(_watch)
+        try:
+            async def _one(team_id: str) -> None:
+                await self.bus.publish(new_event(
+                    EventType.DRY_RUN_START,
+                    team_id=team_id,
+                    payload={"team_id": team_id, "ts": time.time()},
+                ))
+                handler_error: str | None = None
+                try:
+                    await asyncio.wait_for(handler(team_id), timeout=timeout_secs)
+                except asyncio.TimeoutError:
+                    handler_error = f"handler exceeded {timeout_secs}s"
+                except Exception as e:
+                    log.exception("dry_run: handler raised for %s", team_id)
+                    handler_error = f"{type(e).__name__}: {e}"[:200]
+
+                if ready_events[team_id].is_set():
+                    await self.bus.publish(new_event(
+                        EventType.DRY_RUN_OK,
+                        team_id=team_id,
+                        payload={"team_id": team_id, "ts": time.time()},
+                    ))
+                else:
+                    reason = handler_error or "AGENT_READY not received"
+                    await self.bus.publish(new_event(
+                        EventType.DRY_RUN_FAILED,
+                        team_id=team_id,
+                        payload={"team_id": team_id, "error": reason, "ts": time.time()},
+                    ))
+
+            await asyncio.gather(*(_one(t.id) for t in teams))
+        finally:
+            self.bus.unsubscribe(_watch)
 
     # ── DEFCON: defense kickoff on PHASE_CHANGE → DEFENSE ───────────────
 

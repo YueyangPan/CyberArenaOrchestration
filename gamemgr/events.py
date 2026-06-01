@@ -70,6 +70,18 @@ class EventType(str, Enum):
     AGENT_COMPLETED = "AGENT_COMPLETED"
     AGENT_TIMEOUT = "AGENT_TIMEOUT"
     AGENT_FAILED = "AGENT_FAILED"
+    # Pre-R1 dry-run readiness probe.
+    # DRY_RUN_START — orchestrator emits per team before invoking the
+    #   agent with the dry-run prompt.
+    # DRY_RUN_OK    — orchestrator emits when AGENT_READY arrives for
+    #   that team within the dry-run window (agent successfully called
+    #   the existing `report_ready` MCP tool — proves the whole setup
+    #   chain works end-to-end).
+    # DRY_RUN_FAILED — orchestrator emits on timeout / process crash
+    #   when AGENT_READY never arrives for that team.
+    DRY_RUN_START = "DRY_RUN_START"
+    DRY_RUN_OK = "DRY_RUN_OK"
+    DRY_RUN_FAILED = "DRY_RUN_FAILED"
 
 
 @dataclass(frozen=True)

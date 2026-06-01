@@ -29,6 +29,27 @@ log = logging.getLogger("main")
 
 DEFAULT_CONFIG = Path(__file__).parent / "config" / "game.yaml"
 
+# Pre-R1 dry-run readiness probe. Sent as the prompt to a tiny one-turn
+# claude invocation per team before the round loop starts. Body kept
+# minimal: success path is one MCP call. Failure path doesn't need the
+# agent to do anything special — if it can't reach MCP, the orchestrator
+# observes the missing AGENT_READY and emits DRY_RUN_FAILED on timeout.
+_DRY_RUN_PROMPT = (
+    "Pre-game setup check. Call the MCP tool "
+    "`mcp__cyberarena__report_ready` once, then exit immediately.\n"
+    "\n"
+    "Do not run any shell commands, edit any files, or perform any other\n"
+    "actions. This is purely an MCP-channel readiness probe — the\n"
+    "orchestrator infers that your CLI / auth / mcp.json / X-Team-Token\n"
+    "are all wired correctly when it sees your report_ready land.\n"
+)
+
+# Outer cap on how long the dry-run agent is given to call report_ready.
+# Production claude usually settles in 5–10s for one tool call; we give
+# plenty of slack for cold-start latency. Independent of GameMgr's bus-
+# watch window (`dry_run_all_agents(timeout_secs=...)`).
+DRY_RUN_AGENT_TIMEOUT_SECS = 60.0
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cyberarena")
@@ -219,6 +240,34 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
         log.info("agent installed on %s", team.dev)
 
     game.register_install_agent_handler(install_handler)
+
+    # ── pre-R1 dry-run handler ─────────────────────────────────────────
+    # Tiny one-turn invocation: ask the agent to call report_ready via
+    # MCP, then exit. Success is observed by GameMgr.dry_run_all_agents
+    # watching the bus for AGENT_READY for this team.
+    async def dry_run_handler(team_id: str) -> None:
+        team = next((t for t in game.config.topology.teams if t.id == team_id), None)
+        if team is None or not team.dev:
+            log.warning("dry_run: team %s has no dev container; skipping", team_id)
+            return
+        try:
+            handle = game.handle_for(team.dev)
+        except Exception:
+            log.exception("dry_run: cannot resolve dev handle for %s", team_id)
+            return
+        mgr = _mgr_for(team_id)
+        cfg = game.config.agents.get(team_id)
+        model = (cfg.model if cfg is not None else "") or None
+        prompt = _DRY_RUN_PROMPT
+        # Run the agent. We don't persist artifacts here (it's a single
+        # MCP call). Success/failure is signalled via AGENT_READY on
+        # the bus, observed by GameMgr.dry_run_all_agents.
+        await run_phase_via_transport(
+            mgr, backend, handle, prompt,
+            timeout=DRY_RUN_AGENT_TIMEOUT_SECS, model=model,
+        )
+
+    game.register_dry_run_handler(dry_run_handler)
 
     # ── per-phase kickoff handler ──────────────────────────────────────
     def _make_phase_handler(timeout_secs: float):

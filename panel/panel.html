@@ -290,6 +290,9 @@
       case 'SERVICE_DEPLOYED':         return renderServiceDeployed(ev);
       case 'AGENT_INSTALLED':          return renderAgentInstalled(ev);
       case 'AGENT_READY':              return renderAgentReady(ev);
+      case 'DRY_RUN_START':            return renderDryRun(ev, 'start');
+      case 'DRY_RUN_OK':               return renderDryRun(ev, 'ok');
+      case 'DRY_RUN_FAILED':           return renderDryRun(ev, 'failed');
       case 'DEFENSE_KICKOFF':          return renderKickoff(ev, 'defense');
       case 'ATTACK_KICKOFF':           return renderKickoff(ev, 'attack');
       case 'AGENT_PROMPT_SENT':        return renderPromptSent(ev);
@@ -344,6 +347,24 @@
     chip.append(
       el('span', 'mark', '◆'),
       document.createTextNode('agent installed'),
+      el('span', 'ts', fmtTs(ev.ts)),
+    );
+    lane.chips.appendChild(chip);
+  }
+  function renderDryRun(ev, kind) {
+    const lane = getLane(ev.team_id);
+    const pl = ev.payload || {};
+    const cls = kind === 'ok' ? 'chip-ready'
+              : kind === 'failed' ? 'chip-reject'
+              : 'chip-kickoff';
+    const mark = kind === 'ok' ? '✓'
+               : kind === 'failed' ? '✗'
+               : '↗';
+    const err = pl.error ? ` — ${pl.error}` : '';
+    const chip = el('span', `chip ${cls}`);
+    chip.append(
+      el('span', 'mark', mark),
+      document.createTextNode(`dry-run ${kind}${err}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
     lane.chips.appendChild(chip);
