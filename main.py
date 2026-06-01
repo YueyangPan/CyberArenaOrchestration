@@ -45,10 +45,15 @@ _DRY_RUN_PROMPT = (
 )
 
 # Outer cap on how long the dry-run agent is given to call report_ready.
-# Production claude usually settles in 5–10s for one tool call; we give
-# plenty of slack for cold-start latency. Independent of GameMgr's bus-
-# watch window (`dry_run_all_agents(timeout_secs=...)`).
-DRY_RUN_AGENT_TIMEOUT_SECS = 60.0
+# Generous to absorb cold-start: first claude invocation after npm install
+# can take 30-90s before the model returns the first token, plus any proxy
+# / rate-limit hiccups. The first live run hit this exact ceiling on
+# team1 (handler exceeded 60.0s), so we matched defense_secs (180s) here.
+# GameMgr's `dry_run_all_agents(timeout_secs=...)` is set to this + a
+# few seconds of slack so the transport-level timeout fires FIRST (the
+# transport kills claude cleanly via pkill; the coordinator timeout
+# would only fire if the transport itself hung).
+DRY_RUN_AGENT_TIMEOUT_SECS = 180.0
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -453,7 +453,7 @@ class GameMgr:
     async def dry_run_all_agents(
         self,
         *,
-        timeout_secs: float = 60.0,
+        timeout_secs: float = 195.0,
     ) -> None:
         """Pre-R1 readiness probe across every team in parallel.
 
@@ -469,6 +469,12 @@ class GameMgr:
         (its kickoff will likely also fail with a cleaner AGENT_FAILED).
         We don't halt — we just surface the failure on the bus so the
         operator sees it on the panel before the round loop ticks.
+
+        `timeout_secs` default is the coordinator-side wait; it should
+        be slightly larger than main.py's `DRY_RUN_AGENT_TIMEOUT_SECS`
+        (the transport-level kill deadline) so the transport always
+        wins the race and claude is pkilled cleanly inside the
+        container. 195s = 180s transport + 15s slack.
         """
         if self._dry_run_handler is None:
             return  # event-only mode (tests)
