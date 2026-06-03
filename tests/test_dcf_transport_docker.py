@@ -132,69 +132,37 @@ def test_run_command_returns_canonical_result():
     assert r.timed_out is False
 
 
-def test_run_command_list_form_does_not_wrap_in_bash():
-    """For a plain list cmd with no cwd/env, argv is `docker exec -i NAME <cmd...>`."""
+def test_run_command_argv_composition():
+    """Three branches of argv shape:
+      * list cmd, no cwd → `docker exec -i NAME <cmd...>` (no bash wrap)
+      * list cmd + cwd → `docker exec -i NAME bash -c 'cd <cwd> && <cmd>'`
+      * str cmd → `docker exec -i NAME bash -c '<str>'`
+    """
     backend = DockerExecBackend(client=MagicMock())
-    proc = _FakeProc(returncode=0, stdout=b"", stderr=b"")
-    seen = {}
+    seen: list = []
 
     async def _factory(*args, **kwargs):
-        seen["argv"] = args
-        return proc
+        seen.append(list(args))
+        return _FakeProc(returncode=0, stdout=b"", stderr=b"")
 
     async def go():
         with patch("asyncio.create_subprocess_exec", side_effect=_factory):
             await backend.run_command(_handle(), ["echo", "hi"])
-    asyncio.run(go())
-
-    argv = list(seen["argv"])
-    assert argv[:4] == ["docker", "exec", "-i", "team1_dev"]
-    assert argv[4:] == ["echo", "hi"]
-
-
-def test_run_command_with_cwd_wraps_in_bash():
-    """cwd forces a bash -c invocation with `cd <cwd> && <cmd>`."""
-    backend = DockerExecBackend(client=MagicMock())
-    proc = _FakeProc(returncode=0, stdout=b"", stderr=b"")
-    seen = {}
-
-    async def _factory(*args, **kwargs):
-        seen["argv"] = args
-        return proc
-
-    async def go():
-        with patch("asyncio.create_subprocess_exec", side_effect=_factory):
-            await backend.run_command(
-                _handle(), ["echo", "ok"], cwd="/tmp/work",
-            )
-    asyncio.run(go())
-
-    argv = list(seen["argv"])
-    assert argv[:4] == ["docker", "exec", "-i", "team1_dev"]
-    assert argv[4:6] == ["bash", "-c"]
-    shell = argv[6]
-    assert "cd /tmp/work" in shell or "cd '/tmp/work'" in shell
-    assert "echo ok" in shell
-
-
-def test_run_command_string_cmd_goes_through_bash():
-    """A `str` cmd is shell input; the backend should bash -c it."""
-    backend = DockerExecBackend(client=MagicMock())
-    proc = _FakeProc(returncode=0, stdout=b"", stderr=b"")
-    seen = {}
-
-    async def _factory(*args, **kwargs):
-        seen["argv"] = args
-        return proc
-
-    async def go():
-        with patch("asyncio.create_subprocess_exec", side_effect=_factory):
+            await backend.run_command(_handle(), ["echo", "ok"], cwd="/tmp/work")
             await backend.run_command(_handle(), "echo hi | cat")
     asyncio.run(go())
 
-    argv = list(seen["argv"])
-    assert argv[4:6] == ["bash", "-c"]
-    assert argv[6] == "echo hi | cat"
+    # List + no cwd → no bash wrap
+    assert seen[0][:4] == ["docker", "exec", "-i", "team1_dev"]
+    assert seen[0][4:] == ["echo", "hi"]
+    # List + cwd → bash -c, with `cd <cwd>` baked into the shell string
+    assert seen[1][4:6] == ["bash", "-c"]
+    shell = seen[1][6]
+    assert "cd /tmp/work" in shell or "cd '/tmp/work'" in shell
+    assert "echo ok" in shell
+    # Str cmd → bash -c passthrough
+    assert seen[2][4:6] == ["bash", "-c"]
+    assert seen[2][6] == "echo hi | cat"
 
 
 # ── run_command: timeout escalation ───────────────────────────────────

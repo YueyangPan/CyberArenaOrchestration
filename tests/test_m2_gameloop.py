@@ -67,13 +67,13 @@ def test_full_lifecycle(client, cfg, tmp_path):
         run_dir = tmp_path / "run01"
         asyncio.run(game.start(run_dir=run_dir))
 
-        types = [e.type for e in game.bus.history()]
+        types = [e.type for e in game.timeline.history()]
         assert "SERVICE_DEPLOYED" in types
         assert "ROUND_START" in types
         assert "PHASE_CHANGE" in types
         assert "ROUND_STOP" in types
         # 2 rounds * (ROUND_START + 2 PHASE_CHANGE + ROUND_STOP) + 2 SERVICE_DEPLOYED = 10 events
-        assert len(game.bus.history()) >= 10
+        assert len(game.timeline.history()) >= 10
 
         events_file = run_dir / "events.jsonl"
         assert events_file.exists()

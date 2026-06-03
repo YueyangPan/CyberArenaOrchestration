@@ -113,7 +113,7 @@ def build_mcp_app(game: "GameMgr") -> tuple[FastMCP, "Starlette"]:
         """Submit a stolen flag. Returns {accepted, reason}.
 
         Shares the same `GameMgr.submit_flag()` handler as REST, so the
-        emitted `FLAG_SUBMITTED` event is identical regardless of which
+        recorded `FLAG_SUBMITTED` event is identical regardless of which
         transport the submission arrived through.
         """
         team_id = _team_id_from_ctx(ctx)
@@ -153,16 +153,16 @@ def build_mcp_app(game: "GameMgr") -> tuple[FastMCP, "Starlette"]:
         Async by design: returns `{job_id}` immediately. The orchestrator
         runs the per-challenge restart_cmd via docker exec in a background
         task; STARTED / COMPLETED|FAILED + per-level SERVICE_HEALTH_CHECK
-        events land on the bus as the job progresses. Agent waits for the
-        service to be reachable (TCP-probe its own prod) and then calls
-        report_deploy_complete.
+        events land on the timeline as the job progresses. Agent waits
+        for the service to be reachable (TCP-probe its own prod) and
+        then calls report_deploy_complete.
 
         Returns:
           {"job_id": "<12-hex>"} — restart accepted, running in background.
         Raises:
           InvalidParams: unknown service, no restart_cmd in spec, or a
             restart is already in flight for (team, service).
-          Unauthorized: bad / missing X-Team-Token (silent on the bus).
+          Unauthorized: bad / missing X-Team-Token (silent on the timeline).
         """
         team_id = _team_id_from_ctx(ctx)
         try:

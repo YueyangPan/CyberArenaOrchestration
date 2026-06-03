@@ -1,9 +1,19 @@
 # GameMgr layer — UML
 
-`GameMgr` is the domain controller. It owns the event bus, the round
-loop, the flag store, the artifact store, and the per-team agent
-handlers. Everything that's "the game" (vs. "the CLI" or "the host")
-lives here.
+`GameMgr` is the orchestration executor. It owns the timeline, the
+round loop, the artifact store, and the per-team agent handlers, and
+holds references to two independent facilities: the FlagServer and the
+HealthPoller. Game state and per-flag/per-probe mechanics live in those
+facilities; GameMgr keeps only the public method shapes
+(`plant_initial_flags`, `submit_flag`, `restart_service`, `flags`)
+that callers expect, and delegates the work.
+
+**Post-bus refactor (2026-06).** GameMgr no longer subscribes to
+events. Internal control flow is driven by direct method calls
+(`enter_defense_phase`, `enter_attack_phase`, `record_deploy_complete`,
+…). `Timeline` is observation-only — used by FileSink + WebSocket panel
+consumers. See [timeline.md](timeline.md), [flag.md](flag.md), and
+[health.md](health.md).
 
 ## Class diagram
 
@@ -12,10 +22,13 @@ classDiagram
   class GameMgr {
     +config: GameConfig
     +orchestrator: Orchestrator
-    +bus: EventBus
+    +timeline: Timeline
     +round_loop: RoundLoop
-    +flags: FlagStore
+    +flag_server: FlagServer
+    +flags: FlagStore  «property → flag_server.store»
     +artifacts: ArtifactStore
+    +health_checker: HealthChecker
+    +health_poller: HealthPoller
     +run_dir: Path
     +deploy_challenges() None
     +plant_initial_flags() list
@@ -26,6 +39,11 @@ classDiagram
     +restart_service(team_id, service) str
     +install_all_agents() None
     +dry_run_all_agents(*, timeout_secs) None
+    +on_round_start(round_id, phase) None
+    +enter_defense_phase(round_id) list~Task~
+    +enter_attack_phase(round_id) list~Task~
+    +on_round_stop(round_id, phase) None
+    +on_game_end(round_id, phase, payload) None
     +record_phase_started(...) None
     +record_phase_done(...) None
     +record_agent_installed(team_id) None
@@ -63,18 +81,16 @@ classDiagram
     STOPPED
   }
 
-  class EventBus {
-    -_subscribers: list
+  class Timeline {
     -_history: list
-    +subscribe(cb) None
-    +unsubscribe(cb) None
-    +publish(event) None
+    -_sinks: list
+    -_streams: list
+    +record(type_, ...) Event
+    +attach_sink(cb) None
+    +attach_file_sink(path) None
+    +attach_stream(*, maxsize) Queue
+    +detach_stream(q) None
     +history() list
-  }
-
-  class FileSink {
-    -path: Path
-    +__call__(event) None
     +close() None
   }
 
@@ -114,14 +130,14 @@ classDiagram
     +path_for(kind, *, team_id, round_id, filename) Path
   }
 
-  GameMgr "1" *-- "1" EventBus : owns
+  GameMgr "1" *-- "1" Timeline : owns
   GameMgr "1" *-- "1" RoundLoop : owns
-  GameMgr "1" *-- "1" FlagStore : owns
+  GameMgr "1" *-- "1" FlagServer : owns
   GameMgr "1" *-- "1" ArtifactStore : owns (lazy in start())
-  EventBus o-- FileSink : subscribed in start()
-  EventBus ..> Event : publishes
+  GameMgr "1" *-- "1" HealthPoller : owns (lazy in start())
+  Timeline ..> Event : records
   RoundLoop ..> Phase : tracks
-  RoundLoop ..> EventBus : publishes ROUND_START / PHASE_CHANGE / ROUND_STOP / GAME_END
+  RoundLoop ..> GameMgr : calls on_round_start / enter_*_phase / on_round_stop / on_game_end
 ```
 
 ## Phase state machine
@@ -143,24 +159,26 @@ stateDiagram-v2
   end note
   note left of ATTACK
     cross-team net: OPEN
-    end-of-defense health check on entry
+    HealthPoller running (per-spec interval)
   end note
 ```
 
-## Event bus subscribers (in subscription order)
+## RoundLoop ↔ GameMgr dispatch
 
-`bus.publish` awaits subscribers sequentially. Order matters — a
-slow subscriber blocks the rest until it returns.
+Direct method calls — no pub-sub. Order is encoded in each method
+body (e.g. `enter_defense_phase` rotates flags BEFORE spawning kickoff
+tasks). Long-running work is fire-and-forget via `asyncio.create_task`
+so phase transitions never block.
 
-| # | Subscriber | Fires on | Job |
-|---|---|---|---|
-| 1 | `_on_persist_service_logs` | `ROUND_STOP` | `docker logs <team{N}_prod>` → `runs/<ts>/artifacts/<team>/round-N/docker.log` |
-| 2 | `_on_defense_end_health_check` | `PHASE_CHANGE` → ATTACK | run 4-level health chain per team |
-| 3 | `_on_rotation_event` | `PHASE_CHANGE` → DEFENSE | `plant_flags(round_id)` + emit FLAG_PLANTED — MUST be before kickoff |
-| 4 | `_on_defense_kickoff` | `PHASE_CHANGE` → DEFENSE | emit DEFENSE_KICKOFF + await asyncio.gather of defense handlers |
-| 5 | `_on_attack_kickoff` | `PHASE_CHANGE` → ATTACK | emit ATTACK_KICKOFF + await asyncio.gather of attack handlers |
-| 6 | `_on_deploy_complete` | `DEPLOY_COMPLETE` | drain `_defense_pending`; signal RoundLoop early-end |
-| + | `FileSink` | every event | append one JSON line to `events.jsonl` (subscribed in `start()`) |
+| Callback | Fires on | Job |
+|---|---|---|
+| `on_round_start(round_id, phase)` | top of each round | record ROUND_START |
+| `enter_defense_phase(round_id)` | round-loop enters DEFENSE | record PHASE_CHANGE → stop HealthPoller → `_rotate_flags` (FLAG_PLANTED records) → `_spawn_defense_kickoff` (DEFENSE_KICKOFF records + per-team handler tasks) |
+| `enter_attack_phase(round_id)` | round-loop enters ATTACK | record PHASE_CHANGE → `HealthPoller.on_attack_enter` (immediate probe + periodic loop per target) → `_spawn_attack_kickoff` |
+| `on_round_stop(round_id, phase)` | bottom of each round | record ROUND_STOP → `_persist_service_logs` (docker logs → service-logs/) |
+| `on_game_end(round_id, phase, payload)` | round-loop finally | record GAME_END |
+| `record_deploy_complete(...)` | MCP `report_deploy_complete` | record DEPLOY_COMPLETE + drain `_defense_pending` + `end_phase_early` when empty |
+| `record_agent_ready(team_id)` | MCP `report_ready` | record AGENT_READY + set `_ready_events[team_id]` |
 
 ## Game lifecycle sequence
 
@@ -169,32 +187,36 @@ sequenceDiagram
   participant Op as Operator (main.py)
   participant G as GameMgr
   participant RL as RoundLoop
-  participant Bus as EventBus
+  participant TL as Timeline
+  participant HP as HealthPoller
   participant H as Kickoff handler<br/>(registered)
 
   Op->>G: deploy_challenges + plant_initial_flags
   Op->>G: start(run_dir)
-  G->>Bus: subscribe FileSink<br/>+ build ArtifactStore
-  G->>Bus: emit SERVICE_DEPLOYED + FLAG_PLANTED (R0)
+  G->>TL: attach_file_sink + build ArtifactStore + build HealthPoller
+  G->>TL: record SERVICE_DEPLOYED + FLAG_PLANTED (R0)
   G->>G: install_all_agents() (parallel)
-  G->>Bus: AGENT_INSTALLED x N (one per team)
+  G->>TL: AGENT_INSTALLED x N (one per team)
   G->>G: dry_run_all_agents() (parallel)
-  G->>Bus: DRY_RUN_START / DRY_RUN_OK · _FAILED x N
+  G->>TL: DRY_RUN_START / DRY_RUN_OK · _FAILED x N
   G->>RL: run()
 
   loop per round
-    RL->>Bus: ROUND_START
-    RL->>Bus: PHASE_CHANGE → DEFENSE
-    Note over Bus,H: rotation subscriber fires FIRST<br/>(FLAG_PLANTED before kickoff)
-    Bus->>H: defense_kickoff_handler (per team)
-    H-->>RL: deploy_complete via MCP → end_phase_early
-    RL->>Bus: PHASE_CHANGE → ATTACK
-    Bus->>H: attack_kickoff_handler (per team)
-    H-->>Bus: FLAG_SUBMITTED (via REST or MCP)
-    RL->>Bus: ROUND_STOP
+    RL->>G: on_round_start
+    RL->>G: enter_defense_phase
+    G->>HP: on_attack_exit (stop polling)
+    G->>TL: PHASE_CHANGE + FLAG_PLANTED + DEFENSE_KICKOFF
+    G->>H: spawn defense_kickoff_handler (per team, fire-and-forget)
+    H-->>G: deploy_complete via MCP<br/>→ record_deploy_complete<br/>→ end_phase_early
+    RL->>G: enter_attack_phase
+    G->>HP: on_attack_enter (immediate + periodic probes)
+    G->>TL: PHASE_CHANGE + ATTACK_KICKOFF
+    G->>H: spawn attack_kickoff_handler (per team, fire-and-forget)
+    H-->>G: submit_flag → record FLAG_SUBMITTED
+    RL->>G: on_round_stop
   end
 
-  RL->>Bus: GAME_END
+  RL->>G: on_game_end (records GAME_END)
   Op->>G: stop()
   Note over Op: write_snapshot(run_dir)<br/>→ runs/<ts>/panel.html
 ```
@@ -204,11 +226,15 @@ sequenceDiagram
 | Path | Role |
 |---|---|
 | `gamemgr/game_mgr.py` | `GameMgr` (the class) |
-| `gamemgr/round.py` | `RoundLoop` + `Phase` enum |
-| `gamemgr/events.py` | `EventBus` + `EventType` + `Event` + `FileSink` |
-| `gamemgr/flag.py` | `FlagStore` + `new_flag` + `SubmitResult` |
+| `gamemgr/round.py` | `RoundLoop` + `Phase` enum (calls back into GameMgr) |
+| `gamemgr/timeline.py` | `Timeline` (append-only telemetry; replaces EventBus) |
+| `gamemgr/events.py` | `EventType` + `Event` + `new_event` (data shapes only) |
+| `flag/store.py` | `FlagStore` + `new_flag` + `SubmitResult` (in-memory state) |
+| `flag/server.py` | `FlagServer` (planting + rotation + submit + timeline records) |
 | `gamemgr/artifacts.py` | `ArtifactStore` + `ArtifactKind` |
 | `gamemgr/config.py` | `GameConfig` + `ChallengeConfig` + `RoundConfig` + YAML loader |
 | `gamemgr/api.py` | FastAPI `build_app(game, shutdown)` |
 | `gamemgr/mcp_server.py` | MCP tools (submit_flag, report_ready, restart_service, …) |
 | `gamemgr/panel_snapshot.py` | `write_snapshot(run_dir)` |
+| `health/checker.py` | `HealthChecker` (4-level probe primitive) |
+| `health/poller.py` | `HealthPoller` (ATTACK-only periodic + trigger_now) |

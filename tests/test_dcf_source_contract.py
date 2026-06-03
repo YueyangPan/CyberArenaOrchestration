@@ -67,24 +67,22 @@ def test_spec_names_are_unique_within_source(source):
 
 def test_mandatory_spec_fields_populated(source):
     """Every spec must have non-empty name/source/image_tag, a positive
-    int port, and a FlagMechanism enum value."""
-    for spec in source.list_challenges():
+    int port, a FlagMechanism enum value, and a metadata dict. Also
+    pins that ChallengeSpec is frozen — accidental mutation downstream
+    would be silently destabilizing."""
+    from dataclasses import FrozenInstanceError
+
+    specs = source.list_challenges()
+    for spec in specs:
         assert isinstance(spec.name, str) and spec.name
         assert isinstance(spec.source, str) and spec.source
         assert isinstance(spec.port, int) and spec.port > 0
         assert isinstance(spec.image_tag, str) and spec.image_tag
         assert isinstance(spec.flag_mechanism, FlagMechanism)
         assert isinstance(spec.metadata, dict)
-
-
-def test_spec_is_frozen_dataclass(source):
-    """ChallengeSpec is `frozen=True` — accidental mutation downstream
-    would be silently destabilizing. Attempt to mutate; expect FrozenInstanceError."""
-    from dataclasses import FrozenInstanceError
-
-    spec = source.list_challenges()[0]
+    # Frozen invariant — pin once per source.
     with pytest.raises(FrozenInstanceError):
-        spec.port = 9999  # type: ignore[misc]
+        specs[0].port = 9999  # type: ignore[misc]
 
 
 # ── Per-source specifics ──────────────────────────────────────────────
@@ -146,12 +144,6 @@ def test_nautilus_unknown_include_name_raises(tmp_path, monkeypatch):
         raise
 
 
-# ── HealthLevel ordering (used by the cheese-path test) ───────────────
-
-
-def test_health_level_enum_has_all_four_values():
-    """The plan's whole defense-soundness story hinges on 4 levels."""
-    from challenges.source import HealthLevel
-
-    levels = {l.value for l in HealthLevel}
-    assert levels == {"process", "tcp", "protocol", "checker"}
+# HealthLevel enum sanity is exercised by test_health_checker.py's chain
+# tests — every level shows up there, and a missing/renamed level would
+# break those tests immediately.

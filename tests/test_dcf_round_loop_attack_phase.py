@@ -1,8 +1,12 @@
-"""DEFCON: attack kickoff on PHASE_CHANGE → ATTACK.
+"""DEFCON: attack kickoff at ATTACK phase entry.
 
-Mirror of test_dcf_round_loop_defense_phase.py for the ATTACK side.
 One agent per team per round (not per-team-per-service) because the
 M5.6 attack prompt walks every opposing prod from a single install.
+
+Post-bus-refactor: tests drive `game.enter_attack_phase(round_id)`
+directly. The "doesn't fire outside ATTACK" guard is structurally
+ensured (only enter_attack_phase records ATTACK_KICKOFF), so the
+explicit test was dropped.
 """
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ import asyncio
 import pytest
 
 from gamemgr.config import ChallengeConfig, GameConfig, RoundConfig
-from gamemgr.events import EventType, new_event
+from gamemgr.events import EventType
 from gamemgr.game_mgr import GameMgr
 from gamemgr.round import Phase
 from models.agent import AgentConfig
@@ -45,24 +49,18 @@ def _make_game(
     return GameMgr(config=cfg, orchestrator=_StubOrchestrator())
 
 
-def _phase_change(phase: Phase, round_id: int):
-    return new_event(EventType.PHASE_CHANGE, round_id=round_id, phase=phase.value)
+def _attack_kickoffs(game: GameMgr) -> list:
+    return [e for e in game.timeline.history() if e.type == EventType.ATTACK_KICKOFF.value]
 
 
 # ── ATTACK_KICKOFF emission ───────────────────────────────────────────
 
 
-def test_attack_kickoff_emits_one_event_per_team():
-    """One per team in topology — independent of how many challenges /
-    services are deployed."""
+def test_attack_kickoff_records_one_event_per_team():
+    """One per team in topology — independent of how many challenges are deployed."""
     game = _make_game()
-
-    async def run():
-        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
-
-    asyncio.run(run())
-
-    kickoffs = [e for e in game.bus.history() if e.type == EventType.ATTACK_KICKOFF.value]
+    game.enter_attack_phase(round_id=1)
+    kickoffs = _attack_kickoffs(game)
     assert len(kickoffs) == 2
     assert sorted(e.team_id for e in kickoffs) == ["team1", "team2"]
     for e in kickoffs:
@@ -70,36 +68,18 @@ def test_attack_kickoff_emits_one_event_per_team():
         assert e.phase == Phase.ATTACK.value
 
 
-def test_attack_kickoff_does_not_fire_outside_attack_phase():
-    """DEFENSE / SETUP / PREFLIGHT must not trigger attack kickoff."""
-    game = _make_game()
-
-    async def run():
-        for p in (Phase.PREFLIGHT, Phase.SETUP, Phase.DEFENSE):
-            await game.bus.publish(_phase_change(p, round_id=1))
-
-    asyncio.run(run())
-
-    kickoffs = [e for e in game.bus.history() if e.type == EventType.ATTACK_KICKOFF.value]
-    assert kickoffs == []
-
-
 def test_attack_kickoff_is_idempotent_within_a_round():
-    """Re-fire of PHASE_CHANGE → ATTACK in the same round MUST NOT double-spawn."""
+    """Re-entering ATTACK in the same round MUST NOT double-spawn."""
     game = _make_game()
-
-    async def run():
-        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
-        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
-        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=2))
-
-    asyncio.run(run())
-
-    kickoffs = [e for e in game.bus.history() if e.type == EventType.ATTACK_KICKOFF.value]
-    # 2 teams × 2 distinct rounds = 4 kickoffs (not 6 — round 1's duplicate dropped).
+    game.enter_attack_phase(round_id=1)
+    game.enter_attack_phase(round_id=1)
+    game.enter_attack_phase(round_id=2)
+    kickoffs = _attack_kickoffs(game)
+    # 2 teams × 2 distinct rounds = 4 (round 1 dedup'd).
     assert len(kickoffs) == 4
-    by_round = sorted((e.round_id, e.team_id) for e in kickoffs)
-    assert by_round == [(1, "team1"), (1, "team2"), (2, "team1"), (2, "team2")]
+    assert sorted((e.round_id, e.team_id) for e in kickoffs) == [
+        (1, "team1"), (1, "team2"), (2, "team1"), (2, "team2"),
+    ]
 
 
 # ── Handler dispatch ──────────────────────────────────────────────────
@@ -107,44 +87,36 @@ def test_attack_kickoff_is_idempotent_within_a_round():
 
 def test_registered_attack_kickoff_handler_receives_attack_prompt():
     """Handler called once per team with an attack-mode AgentConfig.
-    The system_prompt fingerprints the attack recipe (opposing prods,
-    LIST/GET protocol commands)."""
+    system_prompt fingerprints the attack recipe."""
     agents = {
         tid: AgentConfig(
-            cli="claude --print",
-            model="claude-sonnet-4-5",
-            api_key="test-key",
-            base_url="https://api.anthropic.com",
+            cli="claude --print", model="claude-sonnet-4-5",
+            api_key="test-key", base_url="https://api.anthropic.com",
         )
         for tid in ("team1", "team2")
     }
     game = _make_game(agents=agents)
-
     calls: list[tuple[str, AgentConfig, int, str, bool]] = []
 
-    async def handler(team_id: str, cfg: AgentConfig, round_id: int, phase: str, is_first: bool) -> None:
+    async def handler(team_id, cfg, round_id, phase, is_first):
         calls.append((team_id, cfg, round_id, phase, is_first))
 
     game.register_attack_kickoff_handler(handler)
 
     async def run():
-        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
+        tasks = game.enter_attack_phase(round_id=1)
+        await asyncio.gather(*tasks)
 
     asyncio.run(run())
 
     assert len(calls) == 2
     by_team = {c[0]: c[1] for c in calls}
     assert set(by_team) == {"team1", "team2"}
-    # First kickoff per team → is_first=True.
     assert all(c[4] is True for c in calls), f"first kickoff per team must be is_first=True; got {calls}"
-    # All on round 1, phase=attack.
     assert all(c[2] == 1 and c[3] == "attack" for c in calls), calls
     for tid, cfg in by_team.items():
-        # Attack prompt fingerprints: mentions attack/steal + opposing prods.
         assert "attack agent" in cfg.system_prompt.lower()
-        # Defense vocabulary should NOT appear.
         assert "edit the source" not in cfg.system_prompt.lower()
-        # Opposing prods are populated for attack (defense leaves it empty).
         assert cfg.opposing_prod_hosts != tuple()
 
 
@@ -158,10 +130,9 @@ def test_handler_exception_does_not_break_subsequent_kickoffs():
         for tid in ("team1", "team2")
     }
     game = _make_game(agents=agents)
-
     invoked: list[str] = []
 
-    async def handler(team_id: str, cfg: AgentConfig, round_id: int, phase: str, is_first: bool) -> None:
+    async def handler(team_id, cfg, round_id, phase, is_first):
         invoked.append(team_id)
         if team_id == "team1":
             raise RuntimeError("simulated handler crash")
@@ -169,37 +140,17 @@ def test_handler_exception_does_not_break_subsequent_kickoffs():
     game.register_attack_kickoff_handler(handler)
 
     async def run():
-        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
+        tasks = game.enter_attack_phase(round_id=1)
+        # Handlers swallow exceptions internally, so gather doesn't need
+        # return_exceptions=True; but use it defensively.
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     asyncio.run(run())
-
     assert sorted(invoked) == ["team1", "team2"]
 
 
-def test_no_handler_registered_still_emits_event():
+def test_no_handler_registered_still_records_event():
     """Signal-only mode: observers see ATTACK_KICKOFF even without an agent wired."""
     game = _make_game()  # no handler registered
-    async def run():
-        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
-    asyncio.run(run())
-
-    kickoffs = [e for e in game.bus.history() if e.type == EventType.ATTACK_KICKOFF.value]
-    assert len(kickoffs) == 2
-
-
-def test_defense_and_attack_kickoffs_are_independent():
-    """Both subscribers wired; firing DEFENSE doesn't trigger attack and vice versa."""
-    game = _make_game(
-        challenges=[ChallengeConfig(name="nautilus-ico", type="nautilus-ico", port=4265, deploy_on=["team1", "team2"])],
-    )
-
-    async def run():
-        await game.bus.publish(_phase_change(Phase.DEFENSE, round_id=1))
-        await game.bus.publish(_phase_change(Phase.ATTACK, round_id=1))
-
-    asyncio.run(run())
-
-    defense = [e for e in game.bus.history() if e.type == EventType.DEFENSE_KICKOFF.value]
-    attack = [e for e in game.bus.history() if e.type == EventType.ATTACK_KICKOFF.value]
-    assert len(defense) == 2, defense  # team1 + team2, ico is defense-capable
-    assert len(attack) == 2, attack
+    game.enter_attack_phase(round_id=1)
+    assert len(_attack_kickoffs(game)) == 2

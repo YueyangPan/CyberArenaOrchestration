@@ -123,6 +123,10 @@ class NautilusSource(ChallengeSource):
             metadata["health_check"] = {
                 "process_pattern": hc.get("process_pattern"),
                 "checker_command": hc.get("checker_command"),
+                # interval_secs drives the ATTACK-phase periodic poller
+                # (health.poller). Falls back to DEFAULT_INTERVAL_SECS
+                # when missing.
+                "interval_secs": hc.get("interval_secs"),
             }
 
         return ChallengeSpec(

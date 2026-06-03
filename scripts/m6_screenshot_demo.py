@@ -40,7 +40,7 @@ sys.path.insert(0, str(REPO))
 from agents.claude import ClaudeAgentManager  # noqa: E402
 from gamemgr.api import build_app  # noqa: E402
 from gamemgr.config import load as load_game_config  # noqa: E402
-from gamemgr.events import EventType, new_event  # noqa: E402
+from gamemgr.events import EventType  # noqa: E402
 from gamemgr.game_mgr import GameMgr  # noqa: E402
 from orchestrator.orchestrator import Orchestrator  # noqa: E402
 from orchestrator.service import ContainerHandle  # noqa: E402
@@ -145,11 +145,11 @@ def main() -> int:
             # production code path emits it yet. Surface it here so the panel
             # shows the installed-agent chip. Future M4.5 will emit from
             # ClaudeAgentManager directly.
-            asyncio.run(game.bus.publish(new_event(
+            game.timeline.record(
                 EventType.AGENT_INSTALLED,
                 team_id=tid,
                 payload={"cli": cfg_.cli.split()[0]},
-            )))
+            )
 
         # Wait for BOTH teams to land at least one ACCEPTED. If only one
         # lands within the budget we still take the screenshot — partial
@@ -158,7 +158,7 @@ def main() -> int:
         last_log = 0.0
         accepted_by = set()
         while time.monotonic() < deadline:
-            for e in game.bus.history():
+            for e in game.timeline.history():
                 if e.type == "FLAG_SUBMITTED" and e.payload.get("accepted"):
                     accepted_by.add(e.payload.get("submitter_team_id"))
             if {"team1", "team2"}.issubset(accepted_by):

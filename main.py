@@ -104,7 +104,7 @@ async def _run_start(args) -> int:
 
     # Persistent-memory v1: install once pre-loop, run_phase per phase.
     # Wires install + defense/attack kickoff handlers on game; the
-    # install handler runs inside game.start() (after FileSink is up)
+    # install handler runs inside game.start() (after the timeline file sink is attached)
     # via game.install_all_agents().
     _wire_phase_kickoffs(game)
 
@@ -316,12 +316,12 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
                 )
             except Exception as e:
                 log.exception("%s kickoff: run_phase raised for %s", phase, team_id)
-                from gamemgr.events import EventType, new_event
-                await game.bus.publish(new_event(
+                from gamemgr.events import EventType
+                game.timeline.record(
                     EventType.AGENT_FAILED,
                     team_id=team_id, round_id=round_id, phase=phase,
                     payload={"error": f"{type(e).__name__}: {e}"[:200]},
-                ))
+                )
                 return
             ended_at = time.time()
 

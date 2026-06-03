@@ -20,7 +20,7 @@ import docker
 import pytest
 
 from gamemgr.config import load as load_game_config
-from gamemgr.flag import FlagStore, SubmitResult, new_flag
+from flag import FlagStore, SubmitResult, new_flag
 from gamemgr.game_mgr import GameMgr
 from orchestrator.orchestrator import Orchestrator
 
@@ -184,7 +184,7 @@ def test_cross_team_steal_via_prod_pivot(client, game):
 def test_submit_accepted_emits_event(game):
     """Stealing then submitting a foreign flag yields ACCEPTED + event with no flag leak."""
     t1_flag = game.flags.planted[("team1", "notes")]
-    history_before = len(game.bus.history())
+    history_before = len(game.timeline.history())
 
     result = asyncio.run(game.submit_flag("team2", t1_flag))
     assert result.accepted is True
@@ -192,7 +192,7 @@ def test_submit_accepted_emits_event(game):
     assert result.victim_team_id == "team1"
     assert result.service == "notes"
 
-    new_events = game.bus.history()[history_before:]
+    new_events = game.timeline.history()[history_before:]
     submitted = [e for e in new_events if e.type == "FLAG_SUBMITTED"]
     assert len(submitted) == 1, f"expected exactly 1 FLAG_SUBMITTED, got {len(submitted)}"
     ev = submitted[0]
@@ -206,28 +206,7 @@ def test_submit_accepted_emits_event(game):
     assert t1_flag not in flat, "flag string leaked into FLAG_SUBMITTED payload"
 
 
-def test_submit_own_flag_rejected(game):
-    """team1 trying to submit its own flag → OWN."""
-    t1_flag = game.flags.planted[("team1", "notes")]
-    r = asyncio.run(game.submit_flag("team1", t1_flag))
-    assert r.accepted is False
-    assert r.reason == "OWN"
-
-
-def test_submit_unknown_flag_rejected(game):
-    r = asyncio.run(game.submit_flag("team2", "FLAG{ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ}"))
-    assert r.accepted is False
-    assert r.reason == "UNKNOWN"
-
-
-def test_submit_duplicate_rejected(game):
-    """Second submission of the same (victim, service) by the same team → DUPLICATE.
-
-    Runs after test_submit_accepted_emits_event has already submitted team1's
-    flag from team2 (module-scoped fixture preserves FlagStore state across
-    tests in this file).
-    """
-    t1_flag = game.flags.planted[("team1", "notes")]
-    r = asyncio.run(game.submit_flag("team2", t1_flag))
-    assert r.accepted is False
-    assert r.reason == "DUPLICATE"
+# OWN / UNKNOWN / DUPLICATE rejection logic is unit-tested at the
+# FlagStore level (test_submit_rejects_own_flag, _rejects_unknown_flag,
+# test_submit_accepts_then_rejects_duplicate above). GameMgr.submit_flag
+# wiring is covered by test_submit_accepted_emits_event.

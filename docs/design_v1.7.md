@@ -9,13 +9,15 @@
 | Module | Status | Delta from v1.6 |
 |--------|--------|-----------------|
 | Orchestrator | ✅ | unchanged |
-| GameMgr | ✅ | + `restart_service`, `_emit_health_chain`, defense kickoff subscriber, `defense_agent_config_for`, `register_defense_kickoff_handler` |
+| GameMgr | ✅ | orchestration executor only — owns `Timeline`, holds FlagServer + HealthPoller; defense/attack kickoff dispatch via direct methods (`enter_defense_phase`/`enter_attack_phase`/`on_round_stop`/…); no longer subscribes to events |
+| Timeline | ✅ replaces EventBus | append-only telemetry: `record()` + `attach_file_sink` + `attach_stream`; nothing internal subscribes |
+| Flag facility | ✅ new `flag/` package | `FlagStore` (state + decision logic) + `FlagServer` (plant / rotate / submit + Timeline records); GameMgr keeps `plant_initial_flags` / `submit_flag` / `flags` as thin delegates |
+| Health facility | ✅ new `health/` package | `HealthChecker` (4-level probe primitive) + `HealthPoller` (ATTACK-only periodic + on-demand `trigger_now`); driven by GameMgr at phase boundaries |
 | Challenges | ✅ 2 adapters | `notes` (toy) + `nautilus-ico` via new `ChallengeSource` ABC |
 | Agent (LLM) | ✅ | defense prompt; SSHes in as `arena_agent` (non-root) when target is a challenge prod |
 | MCP server | ✅ 4 tools | + `restart_service(service) → {job_id}` |
 | ArtifactStore | ✅ layout reserved | 3 kinds wired-ready (api/agent/service logs); 5 reserved |
-| Observation Panel | ✅ | unchanged |
-| Poller / Healthcheck | ✅ 4-level | `HealthLevel` enum; CHECKER catches socat-cheese |
+| Observation Panel | ✅ | consumes via `timeline.attach_stream` (per-connection queue) instead of bus subscribe |
 | Scoreboard | ⬜ deferred | as before |
 
 ---
@@ -33,16 +35,30 @@
    stub passes PROCESS+TCP but not CHECKER).
 3. **Async `restart_service(team_id, service) → job_id`.** MCP tool
    returns `{job_id}` immediately; orchestrator runs `spec.restart_cmd`
-   via `docker exec` in a background asyncio task. Emits
+   via `docker exec` in a background asyncio task. Records
    `SERVICE_RESTART_STARTED` → `COMPLETED|FAILED` (with `duration_ms`)
-   → per-level `SERVICE_HEALTH_CHECK`. Re-entrant call for the same
-   `(team, service)` rejected at the MCP layer.
-4. **`DEFENSE_KICKOFF` event + injected handler.** GameMgr subscribes
-   to `PHASE_CHANGE → DEFENSE`, emits `DEFENSE_KICKOFF` per (team,
-   defense-capable service), and dispatches to a handler registered
-   via `register_defense_kickoff_handler`. Idempotent per
-   `(round_id, team_id, service)`. A challenge is defense-capable iff
-   its spec has `restart_cmd` (notes is correctly excluded).
+   → per-level `SERVICE_HEALTH_CHECK` (via `HealthPoller.trigger_now`).
+   Re-entrant call for the same `(team, service)` rejected at the MCP layer.
+4. **`DEFENSE_KICKOFF` event + injected handler.** RoundLoop calls
+   `game.enter_defense_phase(round_id)`, which rotates flags, records
+   `DEFENSE_KICKOFF` per (team, defense-capable service), and spawns
+   per-team handler tasks. Idempotent per `(round_id, team_id, service)`.
+   Defense-capable ⇔ spec has `restart_cmd` (notes excluded).
+4a. **Timeline + direct-method dispatch** (post-v1.7 bus refactor —
+   2026-06). The legacy `EventBus` is replaced by `gamemgr.timeline.Timeline`:
+   append-only telemetry only, no subscribers driving internal logic.
+   PHASE_CHANGE / DEPLOY_COMPLETE / AGENT_READY etc. drive control flow
+   via direct GameMgr methods (`enter_defense_phase`, `enter_attack_phase`,
+   `on_deploy_complete`, `record_agent_ready` …). Slow / long-running
+   work (kickoff handlers) is fire-and-forget via `asyncio.create_task`
+   so no consumer can block another.
+4b. **`HealthPoller`** (post-bus refactor) — independent facility in
+   `health/`. Owns the 4-level probe (`HealthChecker.run_chain`).
+   GameMgr drives it: `enter_attack_phase` → `poller.on_attack_enter`
+   (immediate probe per defense-capable target + periodic loop),
+   `enter_defense_phase` → `poller.on_attack_exit`. Restart-post probe
+   uses `poller.trigger_now`. Per-spec `health_check.interval_secs`;
+   default fallback when missing.
 5. **`arena_agent` non-root SSH user inside challenge containers.**
    M5.6's "root SSH" was for attack-mode introspection; with defense
    mode + MCP-mediated restart the agent doesn't need root. Per-challenge
@@ -77,14 +93,16 @@ v1's per-(team, challenge) container split was considered and deferred.
 ## 3. Defense workflow
 
 ```
-PHASE_CHANGE → DEFENSE
-  → _on_rotation_event: plant fresh flags + FLAG_PLANTED events
-  → _on_defense_kickoff:
-      for each (team, defense-capable challenge):
-        publish DEFENSE_KICKOFF
-        if handler registered:
-          build defense AgentConfig
-          await handler(team_id, cfg)   # spawns ClaudeAgentManager
+RoundLoop._enter_defense
+  → game.enter_defense_phase(round_id):
+      timeline.record(PHASE_CHANGE, phase=defense)
+      health_poller.on_attack_exit()         # stop polling during DEFENSE
+      _rotate_flags(round_id)                # plant + FLAG_PLANTED records
+      _spawn_defense_kickoff(round_id):
+        for each (team, defense-capable challenge):
+          timeline.record(DEFENSE_KICKOFF)
+          if handler registered:
+            asyncio.create_task(handler(team_id, cfg, round_id, "defense", is_first))
 ```
 
 Agent recipe (per `build_defense_prompt`):
@@ -95,20 +113,25 @@ Agent recipe (per `build_defense_prompt`):
 4. TCP-probe `127.0.0.1:<port>` every few seconds until reachable.
 5. Call `mcp__cyberarena__report_deploy_complete(...)`.
 
-Restart event chain on the bus:
+Restart timeline records (post-bus refactor):
 
 ```
 SERVICE_RESTART_STARTED   { job_id, team_id, service, started_at }
 SERVICE_RESTART_COMPLETED { job_id, team_id, service, duration_ms }
-SERVICE_HEALTH_CHECK      { team_id, service, level=process,  passed, detail }
+SERVICE_HEALTH_CHECK      { team_id, service, level=process,  passed, detail }   # via HealthPoller.trigger_now
 SERVICE_HEALTH_CHECK      { team_id, service, level=tcp,      passed, detail }
 SERVICE_HEALTH_CHECK      { team_id, service, level=protocol, passed, detail }
 SERVICE_HEALTH_CHECK      { team_id, service, level=checker,  passed, detail }
-DEPLOY_COMPLETE           { service, duration_ms }            # agent-emitted
+DEPLOY_COMPLETE           { service, duration_ms }            # agent-emitted via MCP
 ```
 
 Failure path: `SERVICE_RESTART_FAILED` with `{error, duration_ms}`;
 no health chain runs.
+
+During ATTACK, HealthPoller also fires the same `SERVICE_HEALTH_CHECK`
+chain on its own cadence (per-spec `interval_secs`) for every
+defense-capable target — so the panel reflects ongoing service health,
+not just post-restart snapshots.
 
 ---
 

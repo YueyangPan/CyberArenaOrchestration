@@ -127,7 +127,7 @@ def test_round_loop_triggers_rotation_via_phase_change_subscriber(game, tmp_path
     containers (the docker daemon is shared; spinning up a parallel
     Orchestrator on the same names would invalidate the fixture's state).
     """
-    history_before = len(game.bus.history())
+    history_before = len(game.timeline.history())
 
     # Swap in fast RoundConfig just for this run, then restore.
     fast = RoundConfig(defense_secs=1, attack_secs=1, total_rounds=2)
@@ -151,7 +151,7 @@ def test_round_loop_triggers_rotation_via_phase_change_subscriber(game, tmp_path
     finally:
         game.config = original_cfg
 
-    new_events = game.bus.history()[history_before:]
+    new_events = game.timeline.history()[history_before:]
     planted_events = [e for e in new_events if e.type == "FLAG_PLANTED"]
     # 1 pre-game emission per (team, service) at round_id=0 (from start())
     #   + 1 rotation emission per (team, service) per round (2 rounds).
@@ -196,14 +196,14 @@ def test_submit_with_valid_token_accepted(http_app, fresh_flag):
 
 
 def test_submit_with_wrong_token_rejected(http_app, game, fresh_flag):
-    before = sum(1 for e in game.bus.history() if e.type == "FLAG_SUBMITTED")
+    before = sum(1 for e in game.timeline.history() if e.type == "FLAG_SUBMITTED")
     r = http_app.post(
         "/game/flag/submit",
         headers={"X-Team-Token": "not-a-real-token"},
         json={"flag": fresh_flag},
     )
     assert r.json() == {"accepted": False, "reason": "BAD_TOKEN"}
-    after = sum(1 for e in game.bus.history() if e.type == "FLAG_SUBMITTED")
+    after = sum(1 for e in game.timeline.history() if e.type == "FLAG_SUBMITTED")
     assert after == before, "BAD_TOKEN must not emit a FLAG_SUBMITTED event"
 
 

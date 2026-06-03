@@ -13,8 +13,10 @@ graph TD
     direction TB
     Main["main.py<br/>(setup · teardown · start)"]
     Orch(["Orchestrator<br/>(docker · network)"]):::core
-    Game(["GameMgr<br/>(state · round loop · events)"]):::core
-    Bus(["EventBus<br/>(pub-sub + FileSink)"]):::core
+    Game(["GameMgr<br/>(orchestration · round loop)"]):::core
+    TL(["Timeline<br/>(append-only · FileSink + WS)"]):::core
+    FS(["FlagServer<br/>(plant · rotate · submit)"]):::core
+    HP(["HealthPoller<br/>(ATTACK-only periodic)"]):::core
     Mgr(["AgentManager<br/>(CLI recipe)"]):::core
     Tx(["AgentTransport<br/>(host execution)"]):::core
     Runner(["agents.runner<br/>(3-line dance)"]):::glue
@@ -25,13 +27,17 @@ graph TD
     Main --> Game
     Main --> Mgr
     Main --> Tx
-    Game --> Bus
-    Bus --> Panel
+    Game --> TL
+    Game --> FS
+    Game --> HP
+    FS --> TL
+    HP --> TL
+    TL --> Panel
     Game --> Runner
     Runner --> Mgr
     Runner --> Tx
     Game --> API
-    API --> Bus
+    API --> TL
   end
 
   subgraph CONTAINERS["Agent hosts (per-team dev + prod containers)"]
@@ -57,7 +63,10 @@ classDef glue stroke-dasharray:4 4,opacity:0.7
 |---|---|---|
 | **main.py** | Entry point | Wires `Orchestrator`, `GameMgr`, `AgentManager` per team via registry, registers handlers, starts FastAPI + round loop |
 | **Orchestrator** | Docker lifecycle | Creates containers + networks per [topology.yaml](../m1_topology_plan.md), exposes `set_cross_team_network(allow)` for phase-driven isolation. See [orchestrator.md](orchestrator.md) |
-| **GameMgr** | Game state | Owns event bus, round loop, flag store, artifact store. Emits AGENT_* / FLAG_* / SERVICE_* events. See [game_manager.md](game_manager.md) |
+| **GameMgr** | Orchestration executor | Owns timeline, round loop, artifact store; holds references to FlagServer + HealthPoller facilities. Records AGENT_* events; drives phase transitions via direct methods. See [game_manager.md](game_manager.md) |
+| **Timeline** | Append-only telemetry | `record()` + `attach_file_sink` + `attach_stream`. Replaces the legacy EventBus — no subscribers drive internal logic. See [timeline.md](timeline.md) |
+| **FlagServer** | Flag mechanics | Plants flags (SERVICE_PROTOCOL via adapter / FILE_AT_PATH via docker exec), runs per-round rotation, verifies submissions, records FLAG_PLANTED / FLAG_SUBMITTED. See [flag.md](flag.md) |
+| **HealthPoller** | Service health observation | 4-level chain (PROCESS → TCP → PROTOCOL → CHECKER) via `HealthChecker`. Runs periodically during ATTACK + one-shot after restart. See [health.md](health.md) |
 | **AgentManager** | Per-CLI recipe | ABC: `install` + `phase_command` + 2 constants. Concrete: ClaudeAgentManager (codex / gemini future). See [agent_manager.md](agent_manager.md) |
 | **AgentTransport** | Host execution | Protocol: `run_command` / `write_file` / `kill_process`. Concrete: DockerExecBackend (SSH later). See [agent_manager.md](agent_manager.md) |
 | **agents.runner** | Glue | One free function: stage prompt → run CLI with timeout → pkill on timeout. Returns raw `CommandResult` to caller. See [agent_manager.md](agent_manager.md) |
@@ -97,7 +106,10 @@ Two cross-cutting concerns:
 ## Further reading
 
 - [docs/UML/agent_manager.md](agent_manager.md) — agent layer (install + phase_command + transport + runner)
-- [docs/UML/game_manager.md](game_manager.md) — GameMgr internals (event bus, round loop, artifacts, flags)
+- [docs/UML/game_manager.md](game_manager.md) — GameMgr internals (timeline, round loop, artifacts)
+- [docs/UML/timeline.md](timeline.md) — Timeline append-only telemetry stream (post-bus refactor)
+- [docs/UML/flag.md](flag.md) — FlagServer + FlagStore (plant / rotate / submit)
+- [docs/UML/health.md](health.md) — HealthChecker + HealthPoller (4-level probe + ATTACK polling)
 - [docs/UML/orchestrator.md](orchestrator.md) — Docker / network lifecycle
 - [docs/UML/challenges.md](challenges.md) — pluggable challenge sources
 - [docs/persistent_memory_agent_plan_v1.md](../persistent_memory_agent_plan_v1.md) — design rationale for the agent layer

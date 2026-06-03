@@ -102,7 +102,7 @@ def test_restart_service_unknown_team():
 def test_restart_service_happy_path_emits_started_completed_with_health_chain(monkeypatch):
     """Mock docker exec to a no-op success; assert the full event chain."""
     game = _make_game()
-    bus = game.bus
+    bus = game.timeline
 
     # Mock _exec_in_container so docker isn't required. Return (0, "ok") for
     # restart + all health checks.
@@ -111,6 +111,10 @@ def test_restart_service_happy_path_emits_started_completed_with_health_chain(mo
 
     with patch.object(GameMgr, "_exec_in_container", fake_exec):
         async def run():
+            # restart_service routes its post-restart probe through the
+            # HealthPoller — build the facility before driving the test
+            # (production code does this inside start()).
+            game._build_health_facility()
             job_id = await game.restart_service("team1", "nautilus-ico")
             assert isinstance(job_id, str) and len(job_id) == 12
             # Background task is running; let it finish.
@@ -146,7 +150,7 @@ def test_restart_service_happy_path_emits_started_completed_with_health_chain(mo
 def test_restart_service_failed_path_emits_failed_no_health(monkeypatch):
     """A non-zero exit from restart_cmd → FAILED event, no health chain runs."""
     game = _make_game()
-    bus = game.bus
+    bus = game.timeline
 
     def fake_exec(self, container_name, cmd):
         return (1, "fpc: syntax error in ico.pas\n")

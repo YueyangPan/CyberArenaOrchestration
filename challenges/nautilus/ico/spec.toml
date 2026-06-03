@@ -28,3 +28,8 @@ process_pattern = "/srv/challenge/ico/ico"
 # Path to the gameplay-correctness checker (CHECKER level). Same
 # protections as restart.sh — baked, root-owned, outside source_view.
 checker_command = "/arena/checker.sh"
+# Period between ATTACK-phase health-poller probes for this service
+# (seconds). HealthPoller falls back to a framework default if missing;
+# 30s here balances signal-vs-load for the ico checker (which talks to
+# the running service over TCP each tick).
+interval_secs = 30

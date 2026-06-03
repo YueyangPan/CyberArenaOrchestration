@@ -41,7 +41,7 @@ def _make_game() -> GameMgr:
 
 
 def _event_types_for_team(game: GameMgr, team_id: str) -> list[str]:
-    return [e.type for e in game.bus.history() if e.team_id == team_id]
+    return [e.type for e in game.timeline.history() if e.team_id == team_id]
 
 
 # ── no handler registered ────────────────────────────────────────────
@@ -52,7 +52,7 @@ def test_dry_run_all_agents_noop_when_no_handler():
     and emits nothing — keeps test-mode `start()` runs cheap."""
     game = _make_game()
     asyncio.run(game.dry_run_all_agents())
-    assert game.bus.history() == []
+    assert game.timeline.history() == []
 
 
 # ── happy path: AGENT_READY arrives → DRY_RUN_OK ─────────────────────
@@ -98,7 +98,7 @@ def test_dry_run_emits_failed_when_no_agent_ready():
     assert sorted(invoked) == ["team1", "team2"]
     for team_id in ("team1", "team2"):
         failed = [
-            e for e in game.bus.history()
+            e for e in game.timeline.history()
             if e.team_id == team_id and e.type == EventType.DRY_RUN_FAILED.value
         ]
         assert len(failed) == 1
@@ -119,7 +119,7 @@ def test_dry_run_emits_failed_when_handler_raises():
 
     for team_id in ("team1", "team2"):
         failed = [
-            e for e in game.bus.history()
+            e for e in game.timeline.history()
             if e.team_id == team_id and e.type == EventType.DRY_RUN_FAILED.value
         ]
         assert len(failed) == 1
@@ -147,7 +147,7 @@ def test_dry_run_emits_failed_when_handler_hangs():
 
     for team_id in ("team1", "team2"):
         failed = [
-            e for e in game.bus.history()
+            e for e in game.timeline.history()
             if e.team_id == team_id and e.type == EventType.DRY_RUN_FAILED.value
         ]
         assert len(failed) == 1
@@ -172,10 +172,10 @@ def test_dry_run_one_team_failing_does_not_block_other():
     # team1 → FAILED
     assert any(
         e.type == EventType.DRY_RUN_FAILED.value and e.team_id == "team1"
-        for e in game.bus.history()
+        for e in game.timeline.history()
     )
     # team2 → OK
     assert any(
         e.type == EventType.DRY_RUN_OK.value and e.team_id == "team2"
-        for e in game.bus.history()
+        for e in game.timeline.history()
     )

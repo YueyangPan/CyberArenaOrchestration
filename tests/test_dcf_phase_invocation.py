@@ -103,20 +103,17 @@ def test_phase_command_contains_continue_workdir_envfile_and_stdin_redirect():
     assert "< " in shell  # stdin redirect
 
 
-def test_phase_command_default_model_falls_back_to_env_var():
-    """No `model=` → shell sources $CLAUDE_MODEL (which agent.env exports)."""
+def test_phase_command_model_default_vs_explicit_override():
+    """Default: shell sources $CLAUDE_MODEL (from agent.env).
+    Explicit `model=` injects a literal `--model <name>` and drops the env-var fallback."""
     mgr = ClaudeAgentManager(transport=_FakeTransport(), client=None)
-    shell = mgr.phase_command()[2]
-    assert '--model "$CLAUDE_MODEL"' in shell
 
+    default_shell = mgr.phase_command()[2]
+    assert '--model "$CLAUDE_MODEL"' in default_shell
 
-def test_phase_command_explicit_model_overrides_env_var():
-    """Passing `model=` injects --model literal into the argv,
-    overriding $CLAUDE_MODEL. Useful for tests + model-A/B runs."""
-    mgr = ClaudeAgentManager(transport=_FakeTransport(), client=None)
-    shell = mgr.phase_command(model="claude-haiku-4-5")[2]
-    assert "--model claude-haiku-4-5" in shell or "--model 'claude-haiku-4-5'" in shell
-    assert "$CLAUDE_MODEL" not in shell
+    override_shell = mgr.phase_command(model="claude-haiku-4-5")[2]
+    assert "--model claude-haiku-4-5" in override_shell or "--model 'claude-haiku-4-5'" in override_shell
+    assert "$CLAUDE_MODEL" not in override_shell
 
 
 def test_prompt_path_and_kill_pattern_match_abc_contract():
@@ -269,7 +266,7 @@ def test_record_phase_done_emits_agent_completed_on_clean_exit(tmp_path):
         )
     asyncio.run(go())
 
-    events = [e for e in game.bus.history() if e.team_id == "team1"]
+    events = [e for e in game.timeline.history() if e.team_id == "team1"]
     assert any(e.type == EventType.AGENT_COMPLETED.value for e in events), events
     assert not any(e.type in (EventType.AGENT_TIMEOUT.value, EventType.AGENT_FAILED.value) for e in events)
 
@@ -285,7 +282,7 @@ def test_record_phase_done_emits_agent_timeout_when_timed_out(tmp_path):
         )
     asyncio.run(go())
 
-    events = [e for e in game.bus.history()]
+    events = [e for e in game.timeline.history()]
     timeouts = [e for e in events if e.type == EventType.AGENT_TIMEOUT.value]
     assert len(timeouts) == 1
     assert timeouts[0].payload["duration_ms"] == 120000
@@ -303,7 +300,7 @@ def test_record_phase_done_emits_agent_failed_on_nonzero_exit(tmp_path):
         )
     asyncio.run(go())
 
-    failed = [e for e in game.bus.history() if e.type == EventType.AGENT_FAILED.value]
+    failed = [e for e in game.timeline.history() if e.type == EventType.AGENT_FAILED.value]
     assert len(failed) == 1
     assert "non-zero exit 137" in failed[0].payload.get("error_excerpt", "")
 
@@ -326,5 +323,5 @@ def test_record_phase_done_artifact_write_failure_still_emits_event(tmp_path):
         )
     asyncio.run(go())
 
-    completed = [e for e in game.bus.history() if e.type == EventType.AGENT_COMPLETED.value]
+    completed = [e for e in game.timeline.history() if e.type == EventType.AGENT_COMPLETED.value]
     assert len(completed) == 1, "event must publish even when artifact write failed"
