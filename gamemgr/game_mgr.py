@@ -876,6 +876,15 @@ class GameMgr:
             "started_at": started_at,
             "ended_at": ended_at,
         }
+        # pkilled_at: when the phase boundary actually hit this agent
+        # (SIGTERM was issued). The subprocess can take tens of seconds
+        # to settle through docker exec; the event ts (recorded just
+        # below) is when that settling completed, which can lag the
+        # next phase's events on the panel. Surfacing pkilled_at lets
+        # the panel render this event at the right relative position
+        # without changing the canonical event ts.
+        if result.pkilled_at is not None:
+            payload["pkilled_at"] = result.pkilled_at
         if result.timed_out:
             event_type = EventType.AGENT_TIMEOUT
         elif result.exit_code == 0:
@@ -936,7 +945,16 @@ class GameMgr:
             },
         )
 
-        # Drain defense-pending; signal early-end when set empties.
+        # Drain defense-pending; signal DEFENSE early-end when set empties.
+        # ONLY effective during the DEFENSE phase. A late DEPLOY_COMPLETE
+        # arriving after ATTACK has started (e.g. a slow agent's
+        # report_deploy_complete that flushed past the phase boundary)
+        # must NOT touch pending or signal end_phase_early — the
+        # early-end signal is phase-agnostic and would otherwise cut
+        # ATTACK short. The report is still recorded above for the
+        # operator/panel; only the round-loop coupling is gated.
+        if st.get("phase") != Phase.DEFENSE.value:
+            return
         pending = self._defense_pending.get(round_id)
         if pending is None:
             return  # no defense kickoff was recorded for this round

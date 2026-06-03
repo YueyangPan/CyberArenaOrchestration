@@ -177,7 +177,7 @@ so phase transitions never block.
 | `enter_attack_phase(round_id)` | round-loop enters ATTACK | record PHASE_CHANGE → `HealthPoller.on_attack_enter` (immediate probe + periodic loop per target) → `_spawn_attack_kickoff` |
 | `on_round_stop(round_id, phase)` | bottom of each round | record ROUND_STOP → `_persist_service_logs` (docker logs → service-logs/) |
 | `on_game_end(round_id, phase, payload)` | round-loop finally | record GAME_END |
-| `record_deploy_complete(...)` | MCP `report_deploy_complete` | record DEPLOY_COMPLETE + drain `_defense_pending` + `end_phase_early` when empty |
+| `record_deploy_complete(...)` | MCP `report_deploy_complete` | record DEPLOY_COMPLETE always; drain `_defense_pending` + `end_phase_early` only when current phase is DEFENSE (late reports from claude that flushed past the phase boundary record on the timeline but must not cut ATTACK short) |
 | `record_agent_ready(team_id)` | MCP `report_ready` | record AGENT_READY + set `_ready_events[team_id]` |
 
 ## Game lifecycle sequence

@@ -254,6 +254,23 @@
     const rel = Math.max(0, ts - state.t0);
     return '+' + rel.toFixed(1) + 's';
   }
+  // Insert a chip into lane.chips at the position dictated by its
+  // effective timestamp (payload.pkilled_at when present — for
+  // AGENT_TIMEOUT events that settled late through docker exec —
+  // otherwise ev.ts). Existing chips are tagged with data-ts so the
+  // scan can find the right insertion point.
+  function attachChip(lane, chip, ev) {
+    const pl = ev.payload || {};
+    const ts = (pl.pkilled_at != null) ? pl.pkilled_at : ev.ts;
+    chip.dataset.ts = String(ts);
+    for (const sib of lane.chips.children) {
+      if (parseFloat(sib.dataset.ts || '0') > ts) {
+        lane.chips.insertBefore(chip, sib);
+        return;
+      }
+    }
+    attachChip(lane, chip, ev);
+  }
   function getLane(team_id) {
     let key = team_id || 'other';
     if (!state.teams.has(key)) {
@@ -339,7 +356,7 @@
       document.createTextNode(`deploy ${pl.service || '?'}:${pl.port || '?'}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
-    lane.chips.appendChild(chip);
+    attachChip(lane, chip, ev);
   }
   function renderAgentInstalled(ev) {
     const lane = getLane(ev.team_id);
@@ -349,7 +366,7 @@
       document.createTextNode('agent installed'),
       el('span', 'ts', fmtTs(ev.ts)),
     );
-    lane.chips.appendChild(chip);
+    attachChip(lane, chip, ev);
   }
   function renderDryRun(ev, kind) {
     const lane = getLane(ev.team_id);
@@ -367,7 +384,7 @@
       document.createTextNode(`dry-run ${kind}${err}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
-    lane.chips.appendChild(chip);
+    attachChip(lane, chip, ev);
   }
   function renderAgentReady(ev) {
     const lane = getLane(ev.team_id);
@@ -377,7 +394,7 @@
       document.createTextNode('agent ready'),
       el('span', 'ts', fmtTs(ev.ts)),
     );
-    lane.chips.appendChild(chip);
+    attachChip(lane, chip, ev);
   }
   function renderKickoff(ev, mode) {
     const lane = getLane(ev.team_id);
@@ -391,7 +408,7 @@
       document.createTextNode(label),
       el('span', 'ts', fmtTs(ev.ts)),
     );
-    lane.chips.appendChild(chip);
+    attachChip(lane, chip, ev);
   }
   function renderPromptSent(ev) {
     const lane = getLane(ev.team_id);
@@ -404,7 +421,7 @@
       document.createTextNode(`${phase}prompt sent${flag}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
-    lane.chips.appendChild(chip);
+    attachChip(lane, chip, ev);
   }
   function renderAgentDone(ev, kind) {
     const lane = getLane(ev.team_id);
@@ -420,12 +437,18 @@
     const errTail = err ? ` — ${err}` : '';
     const chip = el('span', `chip ${cls}`);
     const phase = ev.phase ? `${ev.phase} ` : '';
+    // For AGENT_TIMEOUT, the event's `ts` is when the process actually
+    // settled (which can lag the phase boundary by tens of seconds).
+    // pkilled_at is when the phase boundary fired the kill — that's
+    // what the panel should display so the timeline reads in true
+    // chronological order alongside the next phase's events.
+    const displayTs = (pl.pkilled_at != null) ? pl.pkilled_at : ev.ts;
     chip.append(
       el('span', 'mark', mark),
       document.createTextNode(`${phase}agent ${kind}${dur}${errTail}`),
-      el('span', 'ts', fmtTs(ev.ts)),
+      el('span', 'ts', fmtTs(displayTs)),
     );
-    lane.chips.appendChild(chip);
+    attachChip(lane, chip, ev);
   }
   function renderRestart(ev, kind) {
     const lane = getLane(ev.team_id);
@@ -440,7 +463,7 @@
       document.createTextNode(`restart ${kind}${dur}${err}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
-    lane.chips.appendChild(chip);
+    attachChip(lane, chip, ev);
   }
   function renderHealthCheck(ev) {
     const lane = getLane(ev.team_id);
@@ -453,7 +476,7 @@
       document.createTextNode(`health/${pl.level || '?'}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
-    lane.chips.appendChild(chip);
+    attachChip(lane, chip, ev);
   }
   function renderDeployComplete(ev) {
     const lane = getLane(ev.team_id);
@@ -465,7 +488,7 @@
       document.createTextNode(`deploy_complete${dur}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
-    lane.chips.appendChild(chip);
+    attachChip(lane, chip, ev);
   }
   function renderFlagPlanted(ev) {
     const lane = getLane(ev.team_id);
@@ -476,7 +499,7 @@
       document.createTextNode(`plant ${pl.service || ''} r${ev.round_id || 0}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
-    lane.chips.appendChild(chip);
+    attachChip(lane, chip, ev);
   }
   function renderFlagSubmitted(ev) {
     const pl = ev.payload || {};
@@ -490,7 +513,7 @@
       document.createTextNode(`submit ${pl.reason}${victim}${svc}`),
       el('span', 'ts', fmtTs(ev.ts)),
     );
-    lane.chips.appendChild(chip);
+    attachChip(lane, chip, ev);
 
     const key = ok ? 'accepted' : 'rejected';
     lane[key] += 1;

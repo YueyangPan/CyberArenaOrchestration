@@ -30,12 +30,20 @@ AgentHandle = ContainerHandle
 class CommandResult:
     """Returned by AgentTransport.run_command. `timed_out=True` means
     the backend already escalated SIGTERM → SIGKILL; stdout/stderr
-    are whatever was captured up to that point."""
+    are whatever was captured up to that point.
+
+    `pkilled_at`: when the timeout actually fired and SIGTERM was issued
+    (wall-clock seconds, time.time()). None when the process exited
+    cleanly. Surfaces "when the phase boundary really hit this agent"
+    separately from "when the subprocess finally settled" — useful for
+    panel ordering, since the latter can lag by tens of seconds while
+    docker exec propagates the signal."""
 
     exit_code: int
     stdout: bytes
     stderr: bytes
     timed_out: bool
+    pkilled_at: float | None = None
 
 
 class AgentTransport(Protocol):

@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import shlex
+import time
 
 import docker
 
@@ -101,10 +102,16 @@ class DockerExecBackend(AgentTransport):
                 proc.stdin.close()
 
         timed_out = False
+        pkilled_at: float | None = None
         try:
             await asyncio.wait_for(proc.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             timed_out = True
+            # Stamp the moment the phase boundary hit this agent. The
+            # subprocess settling can lag by tens of seconds while
+            # docker exec propagates the signal — pkilled_at is what
+            # the panel should use for ordering, not the event ts.
+            pkilled_at = time.time()
             # SIGTERM the docker exec subprocess (may or may not propagate
             # to the in-container child; kill_process is the safety net).
             proc.terminate()
@@ -124,6 +131,7 @@ class DockerExecBackend(AgentTransport):
             stdout=b"".join(stdout_chunks),
             stderr=b"".join(stderr_chunks),
             timed_out=timed_out,
+            pkilled_at=pkilled_at,
         )
 
     def write_file(

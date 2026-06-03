@@ -50,7 +50,11 @@ def test_deploy_complete_drains_pending_and_ends_phase_when_empty():
     game = _make_game()
     # round_loop must exist so end_phase_early has somewhere to signal.
     game.round_loop = RoundLoop(game, game.orchestrator.network, game.config.rounds)
-    game.round_loop.round = 1  # so status() reports the right round to record_deploy_complete
+    game.round_loop.round = 1
+    # status() reads phase from round_loop.phase; the drain+early-end
+    # path is gated on phase=DEFENSE, so set it the way RoundLoop's
+    # _enter_defense would.
+    game.round_loop.phase = Phase.DEFENSE
 
     async def run():
         # Simulate DEFENSE kickoff for both teams in round 1.
@@ -75,10 +79,43 @@ def test_one_team_complete_does_not_end_phase():
     game = _make_game()
     game.round_loop = RoundLoop(game, game.orchestrator.network, game.config.rounds)
     game.round_loop.round = 1
+    game.round_loop.phase = Phase.DEFENSE
 
     async def run():
         game.enter_defense_phase(round_id=1)
         await game.record_deploy_complete("team1", "nautilus-ico", 1000)
+        assert not game.round_loop._phase_early_end_event.is_set()
+
+    asyncio.run(run())
+
+
+def test_deploy_complete_during_attack_does_not_signal_early_end():
+    """REGRESSION: a late DEPLOY_COMPLETE that lands after ATTACK has
+    started must NOT touch _defense_pending or signal end_phase_early —
+    that would cut ATTACK short. Slow defense agents (whose claude
+    flushed report_deploy_complete past the DEFENSE→ATTACK boundary)
+    were observed doing exactly this in DEFCON live runs."""
+    game = _make_game()
+    game.round_loop = RoundLoop(game, game.orchestrator.network, game.config.rounds)
+    game.round_loop.round = 1
+
+    async def run():
+        game.round_loop.phase = Phase.DEFENSE
+        game.enter_defense_phase(round_id=1)
+        baseline = dict(game._defense_pending)
+
+        # Phase boundary — RoundLoop transitions to ATTACK.
+        game.round_loop.phase = Phase.ATTACK
+
+        # Late DEPLOY_COMPLETE for both teams. The events still record
+        # on the timeline (for the operator/panel), but:
+        #   - pending must NOT be drained
+        #   - end_phase_early must NOT fire
+        await game.record_deploy_complete("team1", "nautilus-ico", 1000)
+        await game.record_deploy_complete("team2", "nautilus-ico", 1100)
+        assert game._defense_pending == baseline, (
+            "pending must be untouched when DEPLOY_COMPLETE arrives outside DEFENSE"
+        )
         assert not game.round_loop._phase_early_end_event.is_set()
 
     asyncio.run(run())
@@ -98,6 +135,7 @@ def test_deploy_complete_for_non_defense_capable_service_is_silent():
     game = GameMgr(config=cfg, orchestrator=_StubOrchestrator())
     game.round_loop = RoundLoop(game, game.orchestrator.network, game.config.rounds)
     game.round_loop.round = 1
+    game.round_loop.phase = Phase.DEFENSE
 
     async def run():
         game.enter_defense_phase(round_id=1)
