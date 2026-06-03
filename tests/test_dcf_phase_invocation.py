@@ -74,7 +74,10 @@ class _FakeTransport(AgentTransport):
         return self.files.get(remote_path, b"")
 
     def kill_process(self, handle, pattern):
-        self.kill_calls.append((handle.name, pattern))
+        self.kill_calls.append((handle.name, "process", pattern))
+
+    def kill_session(self, handle, session_marker):
+        self.kill_calls.append((handle.name, "session", session_marker))
 
 
 def _handle(name: str = "team1_dev") -> ContainerHandle:
@@ -138,12 +141,19 @@ def test_runner_writes_prompt_then_invokes_phase_command():
 
     # Prompt was written to PROMPT_PATH.
     assert transport.files[PROMPT_PATH] == b"do the thing"
-    # The shell argv passed to run_command came from mgr.phase_command().
+    # The shell argv passed to run_command came from mgr.phase_command()
+    # with a per-invocation session marker baked into the bash wrapper.
+    # The marker is random; assert the shape (setsid wrapper + pidfile)
+    # rather than literal equality with the default phase_command().
     assert len(transport.run_calls) == 1
     container_name, cmd, timeout = transport.run_calls[0]
     assert container_name == "team1_dev"
     assert timeout == 10
-    assert cmd == mgr.phase_command()
+    assert cmd[0] == "bash" and cmd[1] == "-c"
+    shell = cmd[2]
+    assert "setsid -w bash -c" in shell, shell
+    assert "/tmp/cyberarena_phase_" in shell and ".pid" in shell, shell
+    assert "claude -p --continue" in shell
 
 
 def test_runner_returns_raw_command_result():
@@ -171,10 +181,11 @@ def test_runner_returns_raw_command_result():
     assert result.timed_out is False
 
 
-def test_runner_timeout_fires_kill_process_with_class_pattern():
-    """On timeout the runner calls transport.kill_process with
-    mgr.PHASE_KILL_PATTERN — the belt-and-suspenders SIGKILL inside the
-    container if docker exec's SIGTERM didn't propagate."""
+def test_runner_timeout_fires_kill_session_with_invocation_marker():
+    """On timeout the runner calls transport.kill_session with the
+    per-invocation session marker — precision SIGKILL on the timed-out
+    claude's process group (not a pattern that would race with a
+    sibling claude started by the next phase)."""
     transport = _FakeTransport(
         next_result=CommandResult(
             exit_code=-1, stdout=b"partial\n", stderr=b"", timed_out=True,
@@ -189,7 +200,15 @@ def test_runner_timeout_fires_kill_process_with_class_pattern():
     result = asyncio.run(go())
 
     assert result.timed_out is True
-    assert transport.kill_calls == [("team2_dev", "claude -p")]
+    assert len(transport.kill_calls) == 1
+    container, kind, marker = transport.kill_calls[0]
+    assert container == "team2_dev"
+    assert kind == "session"
+    # secrets.token_hex(6) → 12 hex chars
+    assert len(marker) == 12 and all(c in "0123456789abcdef" for c in marker)
+    # The same marker must have been baked into phase_command's shell.
+    shell = transport.run_calls[0][1][2]
+    assert marker in shell, f"marker {marker!r} not found in shell {shell!r}"
 
 
 def test_runner_no_kill_on_clean_exit():

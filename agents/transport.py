@@ -76,7 +76,23 @@ class AgentTransport(Protocol):
         ...
 
     def kill_process(self, handle: AgentHandle, pattern: str) -> None:
-        """Force-kill processes matching pattern (pgrep-style). Used
-        after a run_command timeout if SIGTERM didn't propagate cleanly
-        (e.g. through `docker exec`). Best-effort: never raises."""
+        """Force-kill processes matching pattern (pgrep-style). Used by
+        teardown paths (e.g. ClaudeAgentManager.kill) that don't have a
+        specific PID. Best-effort: never raises.
+
+        Prefer `kill_session` from the per-phase runner — `kill_process`
+        races when the same container hosts multiple phases in sequence
+        (a freshly-started next-phase claude matches the same pattern).
+        """
+        ...
+
+    def kill_session(self, handle: AgentHandle, session_marker: str) -> None:
+        """Kill the specific process whose PID was written to
+        `/tmp/cyberarena_phase_<marker>.pid` by phase_command's bash
+        wrapper. No-op (best-effort) when the file is missing or empty.
+
+        Replaces the racy pattern-based `kill_process` for the runner's
+        on-timeout pkill: targets exactly the claude instance started
+        under this session marker, not a sibling that just started in
+        the next phase."""
         ...
