@@ -269,7 +269,7 @@
         return;
       }
     }
-    attachChip(lane, chip, ev);
+    lane.chips.appendChild(chip);
   }
   function getLane(team_id) {
     let key = team_id || 'other';
