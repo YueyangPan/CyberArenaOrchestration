@@ -197,6 +197,11 @@ challenges/
     functionality_test.py          # port-connect + LIST/COUNT
     flag_handler.py                # protocol-level PUT/GET
     prompts.py                     # attack prompt (no defense)
+    build.py                       # docker build of the notes image
+    image/                         # docker build context for chal-notes
+      Dockerfile
+      server.py                    # the daemon, baked at /opt/cyberarena/notes/
+      entrypoint.sh                # sshd -D + spawn the daemon
 
   nautilus_ico/                    # DEFCON ico (full workflow)
     __init__.py
@@ -206,7 +211,7 @@ challenges/
     restart_handler.py             # docker exec /arena/restart.sh
     prompts.py                     # attack + defense prompts
     build.py                       # docker build of the ico image
-    image/                         # docker build context for the ico image
+    image/                         # docker build context for chal-nautilus-ico
       Dockerfile
       restart.sh
       checker.sh
@@ -256,8 +261,10 @@ Plus four entries in [`challenges/registry.py`](../../challenges/registry.py):
 
 * `_CHALLENGE_FACTORIES["<name>"] = NewChallenge` — required.
 * `_INITIAL_START["<name>"] = <hook>` — only when first-time start
-  needs more than the image's own entrypoint (e.g. notes ships a
-  script, ico kicks `/arena/restart.sh`).
+  needs more than the image's own entrypoint (e.g. ico kicks
+  `/arena/restart.sh` because its entrypoint compiles the binary but
+  doesn't spawn it). Notes leaves this empty — its image entrypoint
+  starts the daemon directly.
 * `_IMAGE_BUILDERS["<name>"] = <builder>` — only when the image isn't
   pre-baked (i.e. needs `docker build` at game-start).
 * `_HEALTH_INTERVAL_SECS["<name>"] = N` — only when the default
@@ -277,7 +284,7 @@ Zero touches to [gamemgr/](../../gamemgr/), [flag/](../../flag/),
 | `challenges/<name>/functionality_test.py` | `FunctionalityTest` implementation |
 | `challenges/<name>/flag_handler.py` | `FlagHandler` implementation |
 | `challenges/<name>/restart_handler.py` | `RestartHandler` implementation (defense-capable only) |
-| `challenges/<name>/build.py` | `build_image()` for challenges that ship a docker context (e.g. nautilus_ico) |
-| `challenges/<name>/image/` | optional: per-challenge docker build context — Dockerfile + startup/restart/checker scripts |
+| `challenges/<name>/build.py` | `build_image()` for challenges that ship a docker context (both bundled challenges have one — `cyberarena/chal-notes`, `cyberarena/chal-nautilus-ico`) |
+| `challenges/<name>/image/` | per-challenge docker build context — Dockerfile + entrypoint + any baked assets |
 | `challenges/<name>/prompts.py` | `build_attack_prompt(cfg)` / `build_defense_prompt(cfg, …)` for the challenge |
 | [`challenges/registry.py`](../../challenges/registry.py) | `build_challenge` + `initial_start` + `build_images` + `health_interval_secs` |
