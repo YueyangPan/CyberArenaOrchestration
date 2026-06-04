@@ -13,6 +13,7 @@ DEFENSE_KICKOFF dispatch filters notes out.
 from __future__ import annotations
 
 from functools import cached_property
+from pathlib import Path
 
 from challenges.interface import (
     Challenge,
@@ -26,14 +27,15 @@ from .flag_handler import NotesFlagHandler
 from .functionality_test import NotesFunctionalityTest
 
 
-# The notes daemon ships in `cyberarena/prod-base` (the same generic
-# image every dev/prod container is built from). Until Stage 9 bakes a
-# dedicated `cyberarena/chal-notes:<pin>` image, the orchestrator's
-# deploy step also docker-execs `challenges.notes._server_script` into
-# the container at startup — see GameMgr.deploy_challenges.
+# Self-contained per-challenge image. Built from challenges/notes/image/
+# by `challenges.notes.build.build_image()` (registered in
+# challenges.registry._IMAGE_BUILDERS). Bumping the tag triggers a
+# rebuild; docker's content-addressable layer cache makes that cheap
+# when only the daemon source changed.
 _VULBOX_IMAGE = VulboxImage(
-    reference="cyberarena/prod-base",
+    reference="cyberarena/chal-notes:v1",
     exposed_ports={"service": 5000},
+    build_context=str(Path(__file__).resolve().parent / "image"),
 )
 
 

@@ -49,7 +49,12 @@ def write_snapshot(run_dir: Path, out_path: Path | None = None) -> Path:
         log.warning("panel_snapshot: %s missing; writing empty snapshot", events_path)
 
     template = _PANEL_TEMPLATE.read_text()
-    if "</body>" not in template:
+    # Inject before the LAST </body> in the template. The first match
+    # might be inside an HTML comment or JS string — bug-bait that
+    # already cost one debug session. `rfind` pins it to the real
+    # closing tag at end-of-document.
+    inject_at = template.rfind("</body>")
+    if inject_at < 0:
         raise RuntimeError(
             f"panel template at {_PANEL_TEMPLATE} missing </body>; cannot inject"
         )
@@ -64,7 +69,7 @@ def write_snapshot(run_dir: Path, out_path: Path | None = None) -> Path:
         f"window.INITIAL_EVENTS = {payload};\n"
         "</script>\n"
     )
-    snapshot = template.replace("</body>", injection + "</body>", 1)
+    snapshot = template[:inject_at] + injection + template[inject_at:]
 
     out_path.write_text(snapshot)
     log.info("panel snapshot written: %s (%d events)", out_path, len(events))

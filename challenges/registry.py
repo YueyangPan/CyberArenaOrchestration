@@ -31,7 +31,6 @@ from typing import Callable
 from challenges.interface import Challenge, VulboxTarget
 from challenges.nautilus_ico import IcoChallenge
 from challenges.notes import NotesChallenge
-from challenges.notes._server_script import SERVER_SCRIPT_PATH, SERVER_SOURCE, REMOTE_DIR
 
 log = logging.getLogger(__name__)
 
@@ -76,42 +75,6 @@ InitialStartFn = Callable[[VulboxTarget, ExecFn], None]
 """(target, exec_in_container) -> None. Raise on hard failure."""
 
 
-def _notes_initial_start(target: VulboxTarget, exec_in: ExecFn) -> None:
-    """Ship the notes daemon source into the container and spawn it.
-
-    Notes runs in the generic prod-base image (no per-challenge baked
-    image — yet); the script is delivered at deploy time and detached
-    via nohup. Idempotent: a re-deploy overwrites the script and the
-    server flag-rotation path (PUT a new flag) doesn't care about the
-    in-memory store carrying over.
-    """
-    import base64
-
-    port = target.ports["service"]
-    # base64-encode the script source so the shell command stays a single
-    # line (no embedded newlines / quotes to escape). The container has
-    # base64(1) from coreutils via the prod-base image.
-    b64 = base64.b64encode(SERVER_SOURCE.encode()).decode()
-    deliver = (
-        f"mkdir -p {REMOTE_DIR} && "
-        f"echo {b64} | base64 -d > {SERVER_SCRIPT_PATH} && "
-        f"chmod 755 {SERVER_SCRIPT_PATH}"
-    )
-    rc, out = exec_in(target.host, deliver)
-    if rc != 0:
-        raise RuntimeError(
-            f"notes initial_start: script delivery failed on {target.host}: "
-            f"rc={rc}, out={out[-200:]!r}"
-        )
-    exec_in(
-        target.host,
-        f"nohup python3 {SERVER_SCRIPT_PATH} {port} >/tmp/notes.log 2>&1 &",
-    )
-    # exec_run with `&` returns immediately; the rc here just reflects
-    # whether the shell parsed the command. The actual readiness is
-    # checked by the functionality_test health probe.
-
-
 def _ico_initial_start(target: VulboxTarget, exec_in: ExecFn) -> None:
     """Kick the framework restart script so the ico binary is running.
 
@@ -128,7 +91,8 @@ def _ico_initial_start(target: VulboxTarget, exec_in: ExecFn) -> None:
 
 
 _INITIAL_START: dict[str, InitialStartFn] = {
-    "notes": _notes_initial_start,
+    # `notes` has no entry: its image entrypoint launches the daemon at
+    # container start, so the deploy step doesn't need a hook.
     "nautilus-ico": _ico_initial_start,
 }
 
@@ -155,10 +119,14 @@ def _ico_build() -> str:
     return build_image()
 
 
+def _notes_build() -> str:
+    from challenges.notes.build import build_image
+    return build_image()
+
+
 _IMAGE_BUILDERS: dict[str, ImageBuilderFn] = {
-    "nautilus-ico": _ico_build,
-    # `notes` reuses the generic `cyberarena/prod-base` image (which the
-    # orchestrator builds from topology), so no entry here.
+    "notes":         _notes_build,
+    "nautilus-ico":  _ico_build,
 }
 
 

@@ -76,29 +76,15 @@ def _record_exec():
     return fake, calls, queue
 
 
-def test_initial_start_notes_ships_script_and_spawns():
-    """The notes hook issues two exec calls: deliver the daemon source,
-    then nohup-spawn it. Both go through the recorded exec_in."""
+def test_initial_start_notes_is_noop():
+    """Notes now has no initial_start hook — the chal-notes image's
+    entrypoint launches the daemon at container start. Verify the
+    registry treats notes as a no-op (no exec calls) instead of the
+    legacy ship-and-spawn dance."""
     exec_in, calls, _ = _record_exec()
     ch = registry.build_challenge("notes")
     registry.initial_start(ch, _target(port=5000), exec_in)
-    assert len(calls) == 2
-    deliver_cmd = calls[0][1]
-    assert "base64 -d" in deliver_cmd
-    assert "server.py" in deliver_cmd
-    spawn_cmd = calls[1][1]
-    assert "nohup python3" in spawn_cmd
-    assert "5000" in spawn_cmd
-
-
-def test_initial_start_notes_raises_when_delivery_fails():
-    """If the script-delivery exec returns non-zero, the hook raises so
-    GameMgr.deploy_challenges surfaces the failure immediately."""
-    exec_in, _calls, queue = _record_exec()
-    queue.append((1, "disk full"))  # script-delivery exec fails
-    ch = registry.build_challenge("notes")
-    with pytest.raises(RuntimeError, match="script delivery failed"):
-        registry.initial_start(ch, _target(), exec_in)
+    assert calls == []
 
 
 def test_initial_start_ico_invokes_restart_sh():
@@ -180,24 +166,33 @@ class _Cfg:
 def test_build_images_invokes_per_challenge_builder(monkeypatch):
     """Each `cfg.challenges` entry with an entry in `_IMAGE_BUILDERS`
     triggers exactly one builder call; the returned tag goes into the
-    result list."""
+    result list. Both bundled challenges have builders."""
     calls: list[str] = []
+
+    def fake_notes_build() -> str:
+        calls.append("notes")
+        return "cyberarena/chal-notes:test"
 
     def fake_ico_build() -> str:
         calls.append("ico")
         return "cyberarena/chal-nautilus-ico:test"
 
+    monkeypatch.setitem(registry._IMAGE_BUILDERS, "notes", fake_notes_build)
     monkeypatch.setitem(registry._IMAGE_BUILDERS, "nautilus-ico", fake_ico_build)
     tags = registry.build_images(_Cfg("notes", "nautilus-ico"))
-    # notes has no builder -> skipped; ico builds exactly once.
-    assert calls == ["ico"]
-    assert tags == ["cyberarena/chal-nautilus-ico:test"]
+    assert calls == ["notes", "ico"]
+    assert tags == ["cyberarena/chal-notes:test", "cyberarena/chal-nautilus-ico:test"]
 
 
-def test_build_images_skips_challenges_without_a_builder():
-    """notes-only configs produce no builds (notes uses prod-base from
-    topology, not a per-challenge image)."""
-    assert registry.build_images(_Cfg("notes")) == []
+def test_build_images_skips_unregistered_challenge(monkeypatch):
+    """A `cfg.challenges` entry whose name isn't in `_IMAGE_BUILDERS`
+    is silently skipped — challenges that reuse a pre-built infra
+    image (none in tree today) don't need a builder."""
+    # Stub the bundled builders so we don't shell out to docker.
+    monkeypatch.setitem(registry._IMAGE_BUILDERS, "notes", lambda: "cyberarena/chal-notes:test")
+    monkeypatch.setitem(registry._IMAGE_BUILDERS, "nautilus-ico", lambda: "cyberarena/chal-nautilus-ico:test")
+    # Unregistered name -> no builder, no entry in tags.
+    assert registry.build_images(_Cfg("unregistered-challenge")) == []
 
 
 def test_build_images_empty_when_no_challenges_configured():

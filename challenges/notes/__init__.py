@@ -1,7 +1,7 @@
 """Game-simple notes challenge — attack-only TCP daemon.
 
 Composition under `challenges.interface.Challenge`:
-  vulbox             — generic prod-base image; ports={"service": 5000}
+  vulbox             — cyberarena/chal-notes:<tag>; ports={"service": 5000}
   functionality_test — 4-level chain (process / tcp / protocol / checker)
   flag_handler       — PUT <flag> via the notes daemon's own protocol
   restart_handler    — None (attack-only)

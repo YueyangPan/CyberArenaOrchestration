@@ -10,20 +10,10 @@
   :root {
     --bg: #0f0f1a;
     --bg-card: #181828;
-    --bg-band: rgba(124, 110, 240, 0.07);
     --text: #e0e0e0;
     --text-dim: #888;
     --text-faint: #555;
-
-    --accent: #7c6ef0;            /* purple — header, active phase */
-    --team1: #ffe66d;             /* yellow */
-    --team2: #a8d8ea;             /* light blue */
-    --attack: #ff6b6b;
-    --defense: #4ecdc4;
-    --good: #6ee7b7;              /* ACCEPTED */
-    --bad: #ff8b8b;               /* OWN / UNKNOWN / DUPLICATE */
-    --plant: #ffb86c;
-
+    --accent: #7c6ef0;
     --mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', Menlo, monospace;
     --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
   }
@@ -33,516 +23,556 @@
     color: var(--text);
     font-family: var(--sans);
     min-height: 100vh;
-    padding: 2rem 2.5rem;
+    padding: 1.5rem 1.5rem 4rem;
     line-height: 1.4;
   }
 
-  .container { max-width: 1400px; margin: 0 auto; }
-
-  /* ── header ─────────────────────────────────────────────── */
   header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
+    max-width: 1400px; margin: 0 auto 1.2rem;
+    display: flex; align-items: baseline; justify-content: space-between;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
     padding-bottom: 1rem;
-    margin-bottom: 1.2rem;
   }
-  header h1 {
-    font-size: 1.4rem;
-    font-weight: 700;
-    letter-spacing: 0.02em;
-  }
+  header h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: 0.02em; }
   header h1 .accent { color: var(--accent); }
   header .meta {
-    display: flex;
-    gap: 2rem;
-    align-items: baseline;
-    font-family: var(--mono);
-    font-size: 0.8rem;
+    display: flex; gap: 2rem; align-items: baseline;
+    font-family: var(--mono); font-size: 0.85rem; color: var(--text-dim);
   }
-  header .meta .label { color: var(--text-faint); margin-right: 0.4rem; }
+  header .meta .label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; }
   header .meta .round { color: var(--text); font-weight: 600; }
   header .meta .phase {
-    padding: 0.18rem 0.7rem;
-    border-radius: 999px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    border: 1px solid currentColor;
+    padding: 0.2rem 0.6rem; border-radius: 4px;
+    background: rgba(124, 110, 240, 0.15); color: var(--accent);
+    font-size: 0.75rem; font-weight: 600; letter-spacing: 0.05em;
   }
-  header .meta .phase[data-phase=DEFENSE]  { color: var(--defense); }
-  header .meta .phase[data-phase=ATTACK]   { color: var(--attack); }
-  header .meta .phase[data-phase=INIT],
-  header .meta .phase[data-phase=STOPPED]  { color: var(--text-dim); }
+  header .meta .phase[data-phase=DEFENSE] { background: rgba(78, 205, 196, 0.15); color: #4ecdc4; }
+  header .meta .phase[data-phase=ATTACK]  { background: rgba(255, 107, 107, 0.15); color: #ff6b6b; }
 
-  /* ── timeline strip (phase bands) ───────────────────────── */
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center;
+    max-width: 1400px; margin: 0 auto 1rem;
+    padding: 0.7rem 1rem;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px;
+  }
+  .cat-toggle {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    font-size: 0.72rem; font-family: var(--mono);
+    padding: 0.25rem 0.6rem; border-radius: 4px;
+    cursor: pointer; user-select: none;
+    background: rgba(255,255,255,0.05);
+  }
+  .cat-toggle:hover { background: rgba(255,255,255,0.10); }
+  .cat-toggle.off { opacity: 0.35; text-decoration: line-through; }
+  .cat-toggle .swatch { width: 0.7rem; height: 0.7rem; border-radius: 2px; }
+
+  .zoom-row {
+    display: flex; align-items: center; gap: 0.7rem; justify-content: center;
+    max-width: 1400px; margin: 0 auto 0.6rem;
+    font-family: var(--mono); font-size: 0.72rem; color: var(--text-dim);
+  }
+  .zoom-row input[type=range] { width: 220px; accent-color: var(--accent); }
+  .zoom-row .val { color: #ddd; min-width: 4ch; text-align: right; }
+  .zoom-row label { display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; }
+
   .timeline {
-    background: var(--bg-card);
-    border-radius: 8px;
-    padding: 0.8rem 1rem;
-    margin-bottom: 1.4rem;
-    border: 1px solid rgba(255, 255, 255, 0.05);
+    max-width: 1400px; margin: 0 auto;
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 1rem 0 1.5rem;
+    position: relative;
+    overflow: auto; max-height: 70vh;
   }
-  .timeline .strip-label {
-    font-family: var(--mono);
-    font-size: 0.65rem;
-    color: var(--text-faint);
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    margin-bottom: 0.4rem;
+  .timeline-row {
+    /* Inner flex container so the lane-label gutter can stick to the
+       left edge while the SVG canvas scrolls horizontally. */
+    display: flex; align-items: flex-start;
+    min-width: max-content;
   }
-  .timeline .strip {
-    display: flex;
-    gap: 0.4rem;
-    flex-wrap: wrap;
-    font-family: var(--mono);
-    font-size: 0.72rem;
+  .lane-gutter {
+    position: sticky; left: 0; z-index: 2;
+    flex: 0 0 110px;
+    background: #131321;
+    /* Top padding matches the SVG axis area so labels line up with lanes. */
+    padding-top: 64px;
+    border-right: 1px solid rgba(255,255,255,0.05);
   }
-  .timeline .band {
-    padding: 0.25rem 0.6rem;
-    border-radius: 4px;
-    border: 1px solid currentColor;
-    background: rgba(255, 255, 255, 0.02);
-  }
-  .timeline .band[data-phase=DEFENSE] { color: var(--defense); }
-  .timeline .band[data-phase=ATTACK]  { color: var(--attack); }
-  .timeline .band .ts { color: var(--text-faint); margin-left: 0.4rem; }
-
-  /* ── team lanes ─────────────────────────────────────────── */
-  .lanes {
-    display: flex;
-    flex-direction: column;
-    gap: 0.8rem;
-    margin-bottom: 1.4rem;
-  }
-  .lane {
-    background: var(--bg-card);
-    border-radius: 8px;
-    padding: 1rem 1.2rem;
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    border-left-width: 4px;
-  }
-  .lane[data-team=team1] { border-left-color: var(--team1); }
-  .lane[data-team=team2] { border-left-color: var(--team2); }
-  .lane[data-team=other] { border-left-color: var(--text-faint); }
-
-  .lane .lane-head {
-    display: flex;
-    align-items: baseline;
-    gap: 0.8rem;
-    margin-bottom: 0.6rem;
-  }
-  .lane .lane-head .team-name {
-    font-family: var(--mono);
-    font-weight: 700;
-    font-size: 0.95rem;
-  }
-  .lane[data-team=team1] .team-name { color: var(--team1); }
-  .lane[data-team=team2] .team-name { color: var(--team2); }
-  .lane .lane-head .stat {
-    font-family: var(--mono);
-    font-size: 0.7rem;
-    color: var(--text-dim);
-  }
-  .lane .lane-head .stat .num { color: var(--text); font-weight: 600; }
-
-  .chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-  }
-  .chip {
-    font-family: var(--mono);
-    font-size: 0.7rem;
-    padding: 0.2rem 0.55rem;
-    border-radius: 4px;
-    border: 1px solid currentColor;
-    background: rgba(255, 255, 255, 0.02);
+  .lane-gutter .lane-label {
+    height: 36px;
+    line-height: 36px;
+    padding: 0 12px 0 0;
+    text-align: right;
+    font-family: var(--mono); font-size: 11px;
     white-space: nowrap;
   }
-  .chip .ts { color: var(--text-faint); margin-left: 0.4rem; font-size: 0.62rem; }
-  .chip-deploy    { color: var(--accent); }
-  .chip-agent     { color: var(--accent); }
-  .chip-kickoff   { color: var(--accent); }
-  .chip-prompt    { color: var(--accent); }
-  .chip-ready     { color: var(--good); }
-  .chip-restart   { color: var(--plant); }
-  .chip-health-ok { color: var(--good); }
-  .chip-health-no { color: var(--bad); }
-  .chip-deploy-done { color: var(--good); }
-  .chip-plant     { color: var(--plant); }
-  .chip-accept    { color: var(--good); }
-  .chip-reject    { color: var(--bad); }
-  .chip .mark { font-weight: 700; margin-right: 0.3rem; }
+  .timeline svg { display: block; }
 
-  /* ── footer ─────────────────────────────────────────────── */
+  .tooltip {
+    position: fixed; pointer-events: none;
+    background: #1d1d2e; border: 1px solid rgba(255,255,255,0.15);
+    color: var(--text); padding: 0.5rem 0.7rem; border-radius: 6px;
+    font-family: var(--mono); font-size: 0.7rem;
+    max-width: 540px; line-height: 1.45;
+    white-space: pre-wrap; box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+    opacity: 0; transition: opacity 0.1s ease; z-index: 100;
+  }
+  .tooltip.show { opacity: 1; }
+  .tooltip .tt-cat   { font-weight: 700; margin-right: 0.5rem; }
+  .tooltip .tt-actor { color: #ffe66d; font-size: 0.65rem; }
+  .tooltip .tt-ts    { color: #4ecdc4; font-size: 0.65rem; }
+  .tooltip .tt-meta  { color: #888;   font-size: 0.65rem; display: block; margin: 0.2rem 0; }
+
   footer {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-family: var(--mono);
-    font-size: 0.72rem;
-    color: var(--text-dim);
-    padding-top: 0.8rem;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    max-width: 1400px; margin: 1.2rem auto 0;
+    padding-top: 1rem; border-top: 1px solid rgba(255, 255, 255, 0.08);
+    display: flex; justify-content: space-between; align-items: center;
+    font-family: var(--mono); font-size: 0.72rem; color: var(--text-dim);
   }
-  footer .conn .dot {
-    display: inline-block;
-    width: 0.55rem; height: 0.55rem;
-    border-radius: 50%;
-    margin-right: 0.5rem;
-    vertical-align: middle;
+  .conn { display: inline-flex; align-items: center; gap: 0.4rem; }
+  .conn .dot {
+    width: 0.55rem; height: 0.55rem; border-radius: 50%;
+    background: var(--text-faint);
+    box-shadow: 0 0 0 0 rgba(0,0,0,0);
+    transition: background 0.2s, box-shadow 0.2s;
   }
-  footer .conn[data-state=ok]      .dot { background: var(--good); box-shadow: 0 0 6px var(--good); }
-  footer .conn[data-state=lost]    .dot { background: var(--bad); }
-  footer .conn[data-state=trying]  .dot { background: var(--plant); }
-  footer .placeholder { color: var(--text-faint); font-style: italic; }
+  .conn[data-state=trying]  .dot { background: #fbb360; box-shadow: 0 0 8px rgba(251, 179, 96, 0.6); }
+  .conn[data-state=ok]      .dot { background: #6ee7b7; box-shadow: 0 0 8px rgba(110, 231, 183, 0.6); }
+  .conn[data-state=lost]    .dot { background: #ff8b8b; box-shadow: 0 0 8px rgba(255, 139, 139, 0.6); }
+  .conn[data-state=snapshot] .dot { background: var(--accent); box-shadow: 0 0 8px rgba(124, 110, 240, 0.6); }
+  .conn .text { color: var(--text-dim); }
 </style>
 </head>
 <body>
-<div class="container">
 
-  <header>
-    <h1>Cyber Arena <span class="accent">— Live Panel</span></h1>
-    <div class="meta">
-      <span>
-        <span class="label">round</span>
-        <span class="round" id="round-num">0</span>
-        <span class="label" style="margin-left: 0.4rem">/</span>
-        <span class="round" id="round-total">?</span>
-      </span>
-      <span class="phase" id="phase" data-phase="INIT">INIT</span>
-    </div>
-  </header>
-
-  <section class="timeline">
-    <div class="strip-label">phase timeline</div>
-    <div class="strip" id="phase-strip"></div>
-  </section>
-
-  <section class="lanes" id="lanes"></section>
-
-  <footer>
-    <span class="conn" id="conn" data-state="trying">
-      <span class="dot"></span>
-      <span class="text">connecting…</span>
+<header>
+  <h1>Cyber Arena <span class="accent">— Live Panel</span></h1>
+  <div class="meta">
+    <span>
+      <span class="label">round</span>
+      <span class="round" id="round-num">0</span>
+      <span class="label" style="margin-left: 0.4rem">/</span>
+      <span class="round" id="round-total">?</span>
     </span>
-    <span class="placeholder">scoreboard / service-health: pending (Scoreboard milestone)</span>
-  </footer>
+    <span class="phase" id="phase" data-phase="INIT">INIT</span>
+  </div>
+</header>
 
+<div class="controls" id="controls"></div>
+<div class="zoom-row">
+  <label><input type="checkbox" id="follow" checked> follow live tail</label>
+  <span style="margin-left: 1rem">zoom</span>
+  <input type="range" id="zoom" min="6" max="120" step="1" value="24">
+  <span class="val" id="zoom-val">24</span> px/s
 </div>
+<div class="timeline" id="timeline"></div>
+<div class="tooltip" id="tooltip"></div>
+
+<footer>
+  <span class="conn" id="conn" data-state="trying">
+    <span class="dot"></span>
+    <span class="text">connecting…</span>
+  </span>
+  <span id="lane-summary">orchestrator · (teams) · flag-server · health-poller</span>
+</footer>
 
 <script>
-  // ── state ────────────────────────────────────────────────
+  // ── lanes ────────────────────────────────────────────────────
+  // Layout is: orchestrator → team1 → team2 → … → teamN → flag_server → health_poller.
+  // Team lanes are discovered from events (any team_id that looks like a
+  // team is added to the team group); the framework lanes stay in their
+  // fixed slots regardless of team count.
+  const FRAMEWORK_HEAD = ['orchestrator'];
+  const FRAMEWORK_TAIL = ['flag_server', 'health_poller'];
+  const TEAM_COLOR_PALETTE = [
+    '#ffe66d', '#a8d8ea', '#ff8b8b', '#82d97c', '#fbb360',
+    '#b794f4', '#5ec9c8', '#f687b3', '#a18bff', '#ffaa66',
+  ];
+  // Static lane colors; team colors are assigned from the palette in order
+  // of discovery (first team -> palette[0], second team -> palette[1], …).
+  const STATIC_COLORS = {
+    orchestrator:  '#7c6ef0',
+    flag_server:   '#82d97c',
+    health_poller: '#fbb360',
+  };
+  function colorForActor(a) {
+    if (STATIC_COLORS[a]) return STATIC_COLORS[a];
+    const idx = state.teamLanes.indexOf(a);
+    return idx >= 0 ? TEAM_COLOR_PALETTE[idx % TEAM_COLOR_PALETTE.length] : '#ddd';
+  }
+  function actors() {
+    return FRAMEWORK_HEAD.concat(state.teamLanes, FRAMEWORK_TAIL);
+  }
+  // True for any actor string we should treat as a team lane (i.e. add to
+  // state.teamLanes on first sight). Matches the team_id naming convention
+  // used by topology.yaml — `team` followed by one or more digits.
+  function isTeamActor(a) {
+    return typeof a === 'string' && /^team\d+$/.test(a);
+  }
+
+  // ── categories (drives dot color + toggle bar) ──────────────
+  const CATEGORIES = [
+    { key: 'phase',    label: 'Phase',           color: '#a18bff', on: true },
+    { key: 'kickoff',  label: 'Kickoff',         color: '#ffe66d', on: true },
+    { key: 'agent',    label: 'Agent lifecycle', color: '#ff6b9d', on: true },
+    { key: 'dry_run',  label: 'Dry-run',         color: '#4ecdc4', on: true },
+    { key: 'service',  label: 'Service',         color: '#fbb360', on: true },
+    { key: 'health',   label: 'Health check',    color: '#5ec9c8', on: true },
+    { key: 'flag',     label: 'Flag',            color: '#82d97c', on: true },
+    { key: 'other',    label: 'Other',           color: '#888',    on: true },
+  ];
+  const COLOR = Object.fromEntries(CATEGORIES.map(c => [c.key, c.color]));
+  const VISIBLE = Object.fromEntries(CATEGORIES.map(c => [c.key, c.on]));
+
+  function categoryFor(type) {
+    if (type === 'ROUND_START' || type === 'ROUND_STOP' || type === 'PHASE_CHANGE' || type === 'GAME_END') return 'phase';
+    if (type === 'DEFENSE_KICKOFF' || type === 'ATTACK_KICKOFF') return 'kickoff';
+    if (type === 'SERVICE_HEALTH_CHECK') return 'health';
+    if (type.startsWith('DRY_RUN_')) return 'dry_run';
+    if (type.startsWith('AGENT_'))   return 'agent';
+    if (type.startsWith('FLAG_'))    return 'flag';
+    if (type.startsWith('SERVICE_') || type === 'DEPLOY_COMPLETE') return 'service';
+    return 'other';
+  }
+
+  // Event → actor (lane). Routes by event TYPE first so flag and health
+  // events get their own lanes regardless of the embedded team_id.
+  function actorFor(ev) {
+    const t = ev.type;
+    if (t === 'SERVICE_HEALTH_CHECK')       return 'health_poller';
+    if (t === 'FLAG_PLANTED')               return 'flag_server';
+    if (t === 'FLAG_SUBMITTED')             return 'flag_server';
+    if (t === 'ROUND_START' || t === 'ROUND_STOP' ||
+        t === 'PHASE_CHANGE' || t === 'GAME_END') return 'orchestrator';
+    if (t === 'SERVICE_DEPLOYED') {
+      // SERVICE_DEPLOYED's team_id is null; route by container_name suffix.
+      const c = (ev.payload && ev.payload.container) || '';
+      const m = c.match(/^(team\d+)_/);
+      return m ? m[1] : 'orchestrator';
+    }
+    if (ev.team_id) return ev.team_id;
+    return 'orchestrator';
+  }
+
+  // Short tooltip-body summary per event type.
+  function summarize(ev) {
+    const t = ev.type;
+    const p = ev.payload || {};
+    if (t === 'PHASE_CHANGE') return `phase → ${ev.phase}`;
+    if (t === 'ROUND_START' || t === 'ROUND_STOP') return `R${ev.round_id}`;
+    if (t === 'GAME_END') return `reason=${p.reason || '?'}`;
+    if (t === 'FLAG_SUBMITTED') {
+      const verdict = p.accepted ? 'ACCEPTED' : (p.reason || '?');
+      return `${verdict} ${p.submitter_team_id || '?'} → ${p.victim_team_id || '?'} (${p.service || '?'})`;
+    }
+    if (t === 'FLAG_PLANTED' || t === 'DEPLOY_COMPLETE' || t === 'DEFENSE_KICKOFF' ||
+        t === 'ATTACK_KICKOFF' || t === 'SERVICE_DEPLOYED' ||
+        t === 'SERVICE_RESTART_STARTED' || t === 'SERVICE_RESTART_COMPLETED' ||
+        t === 'SERVICE_RESTART_FAILED') {
+      const dur = p.duration_ms ? ` ${p.duration_ms}ms` : '';
+      const team = ev.team_id || (p.container || '').replace(/_prod$|_dev$/, '');
+      return `${p.service || '?'}${dur}${team ? ' · ' + team : ''}`;
+    }
+    if (t === 'SERVICE_HEALTH_CHECK') {
+      return `${ev.team_id || '?'}/${p.service || '?'} ${p.level || '?'}=${p.passed} (${(p.detail || '').slice(0, 80)})`;
+    }
+    if (t === 'AGENT_PROMPT_SENT') {
+      const first = p.prompt_first_line || '';
+      return `${ev.team_id} first=${p.is_first} · ${first.slice(0, 80)}`;
+    }
+    if (t === 'AGENT_COMPLETED' || t === 'AGENT_TIMEOUT' || t === 'AGENT_FAILED') {
+      return `${ev.team_id} exit=${p.exit_code} dur=${p.duration_ms}ms`;
+    }
+    if (t === 'DRY_RUN_OK' || t === 'DRY_RUN_FAILED') return p.error || 'ok';
+    if (t === 'AGENT_INSTALLED' || t === 'AGENT_READY' || t === 'DRY_RUN_START') return ev.team_id || '';
+    return '';
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, m => (
+      {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]
+    ));
+  }
+
+  // ── state ────────────────────────────────────────────────────
   const state = {
-    teams: new Map(),      // team_id -> { name, chips: [Element] }
-    seenEventIds: new Set(),
-    t0: null,              // first event timestamp (for relative time display)
-    totalRounds: null,
+    events: [],            // [{ ts, offset_s, type, category, actor, msg, ev }]
+    seenIds: new Set(),
+    t0: null,              // first event ts, for offset_s computation
+    teamLanes: [],         // discovered team_id values, sorted by lane index
   };
 
-  // ── helpers ──────────────────────────────────────────────
-  function $(id) { return document.getElementById(id); }
-  function el(tag, cls, text) {
-    const e = document.createElement(tag);
-    if (cls)  e.className = cls;
-    if (text != null) e.textContent = text;
-    return e;
-  }
-  function fmtTs(ts) {
+  function ingest(ev) {
+    if (!ev || !ev.id || state.seenIds.has(ev.id)) return false;
+    state.seenIds.add(ev.id);
+    const ts = ev.ts || 0;
     if (state.t0 == null) state.t0 = ts;
-    const rel = Math.max(0, ts - state.t0);
-    return '+' + rel.toFixed(1) + 's';
+    const offset = Math.max(0, ts - state.t0);
+    const actor = actorFor(ev);
+    // Grow the team-lane list whenever we see a new team_id. Natural
+    // numeric sort so team1 / team2 / … / team10 / team11 stay ordered
+    // by their digit suffix rather than lexicographically.
+    if (isTeamActor(actor) && state.teamLanes.indexOf(actor) < 0) {
+      state.teamLanes.push(actor);
+      state.teamLanes.sort((a, b) =>
+        parseInt(a.slice(4), 10) - parseInt(b.slice(4), 10)
+      );
+    }
+    state.events.push({
+      ts, offset_s: offset,
+      type: ev.type, category: categoryFor(ev.type),
+      actor, msg: summarize(ev), ev,
+    });
+    // Header side-effects.
+    if (ev.type === 'ROUND_START') $('round-num').textContent = ev.round_id;
+    if (ev.type === 'PHASE_CHANGE' || ev.phase) {
+      const ph = $('phase');
+      const raw = (ev.type === 'PHASE_CHANGE') ? (ev.payload?.phase || ev.phase) : ev.phase;
+      // Normalize to upper-case so the CSS color class matches and the
+      // badge stays consistent regardless of how the event was stamped.
+      const phase = raw ? String(raw).toUpperCase() : null;
+      if (phase) { ph.textContent = phase; ph.dataset.phase = phase; }
+    }
+    return true;
   }
-  // Insert a chip into lane.chips at the position dictated by its
-  // effective timestamp (payload.pkilled_at when present — for
-  // AGENT_TIMEOUT events that settled late through docker exec —
-  // otherwise ev.ts). Existing chips are tagged with data-ts so the
-  // scan can find the right insertion point.
-  function attachChip(lane, chip, ev) {
-    const pl = ev.payload || {};
-    const ts = (pl.pkilled_at != null) ? pl.pkilled_at : ev.ts;
-    chip.dataset.ts = String(ts);
-    for (const sib of lane.chips.children) {
-      if (parseFloat(sib.dataset.ts || '0') > ts) {
-        lane.chips.insertBefore(chip, sib);
-        return;
+
+  function $(id) { return document.getElementById(id); }
+
+  // ── SVG renderer ─────────────────────────────────────────────
+  const TIMELINE = $('timeline');
+  const TOOLTIP  = $('tooltip');
+  const NS = 'http://www.w3.org/2000/svg';
+  let DENSITY = 24;     // px per second
+  let FOLLOW = true;    // auto-scroll to right edge when new events arrive
+
+  function render() {
+    TIMELINE.innerHTML = '';
+    const ACTOR_LIST = actors();
+    const ROW_H = 36;
+    const LANE_TOP = 64;          // top padding above lanes (axis area)
+    const LEFT_PAD = 16;          // breathing room for the "0s" tick label
+    const RIGHT_PAD = 12;
+    // Bottom of time window: max of last-event offset and 60s, so the
+    // axis isn't collapsed before the first events arrive.
+    const lastOffset = state.events.length ? state.events[state.events.length - 1].offset_s : 0;
+    const T_MAX = Math.max(lastOffset, 60);
+    // SVG canvas width: at least enough to render every event at the
+    // current px/s density, plus pad on both sides. The gutter is
+    // rendered separately as sticky HTML.
+    const W = Math.max(800, LEFT_PAD + T_MAX * DENSITY + RIGHT_PAD);
+    const H = LANE_TOP + ACTOR_LIST.length * ROW_H + 24;
+    const xOf = t => LEFT_PAD + (W - LEFT_PAD - RIGHT_PAD) * (t / T_MAX);
+    const yOf = a => {
+      const i = ACTOR_LIST.indexOf(a);
+      return i < 0 ? null : LANE_TOP + i * ROW_H + ROW_H / 2;
+    };
+
+    // Flex container: sticky lane-label gutter on the left, SVG canvas on the right.
+    const row = document.createElement('div');
+    row.className = 'timeline-row';
+    const gutter = document.createElement('div');
+    gutter.className = 'lane-gutter';
+    ACTOR_LIST.forEach(a => {
+      const lbl = document.createElement('div');
+      lbl.className = 'lane-label';
+      lbl.textContent = a;
+      lbl.style.color = colorForActor(a);
+      gutter.appendChild(lbl);
+    });
+    row.appendChild(gutter);
+
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    svg.setAttribute('width', W);
+    svg.setAttribute('height', H);
+
+    // Lane backgrounds (alternating stripes).
+    ACTOR_LIST.forEach((a, i) => {
+      const bg = document.createElementNS(NS, 'rect');
+      bg.setAttribute('x', 0);
+      bg.setAttribute('y', LANE_TOP + i * ROW_H);
+      bg.setAttribute('width', W);
+      bg.setAttribute('height', ROW_H);
+      bg.setAttribute('fill', i % 2 ? 'rgba(255,255,255,0.015)' : 'rgba(255,255,255,0.035)');
+      svg.appendChild(bg);
+    });
+
+    // Time-axis ticks (adaptive density).
+    const targetTicks = Math.max(4, Math.min(12, Math.floor(W / 120)));
+    const candidates = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+    let dt = candidates[candidates.length - 1];
+    for (const c of candidates) { if (T_MAX / c <= targetTicks) { dt = c; break; } }
+    for (let t = 0; t <= T_MAX + 0.001; t += dt) {
+      const x = xOf(t);
+      const tick = document.createElementNS(NS, 'line');
+      tick.setAttribute('x1', x); tick.setAttribute('y1', LANE_TOP - 8);
+      tick.setAttribute('x2', x); tick.setAttribute('y2', H - 12);
+      tick.setAttribute('stroke', 'rgba(255,255,255,0.06)');
+      svg.appendChild(tick);
+      const lbl = document.createElementNS(NS, 'text');
+      lbl.setAttribute('x', x); lbl.setAttribute('y', LANE_TOP - 14);
+      lbl.setAttribute('text-anchor', 'middle');
+      lbl.setAttribute('font-family', "'JetBrains Mono', monospace");
+      lbl.setAttribute('font-size', '10');
+      lbl.setAttribute('fill', '#666');
+      lbl.textContent = `${t.toFixed(0)}s`;
+      svg.appendChild(lbl);
+    }
+
+    // Phase bands behind lanes: PHASE_CHANGE delimits DEFENSE/ATTACK.
+    const phaseChanges = state.events
+      .filter(e => e.type === 'PHASE_CHANGE')
+      .sort((a, b) => a.offset_s - b.offset_s);
+    const phaseFill = {
+      DEFENSE: 'rgba(78, 205, 196, 0.07)',
+      ATTACK:  'rgba(255, 107, 107, 0.06)',
+    };
+    for (let i = 0; i < phaseChanges.length; i++) {
+      const p = phaseChanges[i];
+      const next = phaseChanges[i + 1];
+      const x0 = xOf(p.offset_s);
+      const x1 = next ? xOf(next.offset_s) : xOf(T_MAX);
+      const phaseName = (p.ev.payload?.phase || p.ev.phase || '').toString();
+      const band = document.createElementNS(NS, 'rect');
+      band.setAttribute('x', x0);
+      band.setAttribute('y', LANE_TOP);
+      band.setAttribute('width', Math.max(1, x1 - x0));
+      band.setAttribute('height', ACTOR_LIST.length * ROW_H);
+      band.setAttribute('fill', phaseFill[phaseName] || 'rgba(255,255,255,0.02)');
+      svg.appendChild(band);
+    }
+
+    // ROUND_START / GAME_END as labelled dashed ticks above the lanes,
+    // packed into two rows so neighbors don't collide.
+    const rowYs = [LANE_TOP - 32, LANE_TOP - 16];
+    const rowEnds = rowYs.map(() => -Infinity);
+    for (const ev of state.events) {
+      if (ev.type !== 'ROUND_START' && ev.type !== 'GAME_END') continue;
+      const x = xOf(ev.offset_s);
+      const label = ev.type === 'ROUND_START' ? `R${ev.ev.round_id}` : 'END';
+      const approxWidth = label.length * 7 + 14;
+      let row = rowYs.length - 1;
+      for (let r = 0; r < rowYs.length; r++) {
+        if (x >= rowEnds[r]) { row = r; break; }
       }
+      rowEnds[row] = x + approxWidth;
+      const tick = document.createElementNS(NS, 'line');
+      tick.setAttribute('x1', x); tick.setAttribute('y1', rowYs[row] + 3);
+      tick.setAttribute('x2', x); tick.setAttribute('y2', H - 12);
+      tick.setAttribute('stroke', '#a18bff');
+      tick.setAttribute('stroke-opacity', '0.45');
+      tick.setAttribute('stroke-dasharray', '3,3');
+      svg.appendChild(tick);
+      const t = document.createElementNS(NS, 'text');
+      t.setAttribute('x', x + 4); t.setAttribute('y', rowYs[row]);
+      t.setAttribute('font-family', "'JetBrains Mono', monospace");
+      t.setAttribute('font-size', '11');
+      t.setAttribute('fill', '#a18bff');
+      t.setAttribute('font-weight', '700');
+      t.textContent = label;
+      svg.appendChild(t);
     }
-    lane.chips.appendChild(chip);
-  }
-  function getLane(team_id) {
-    let key = team_id || 'other';
-    if (!state.teams.has(key)) {
-      const lane = el('div', 'lane');
-      lane.dataset.team = ['team1', 'team2'].includes(key) ? key : 'other';
-      const head = el('div', 'lane-head');
-      head.appendChild(el('span', 'team-name', key));
-      const stats = el('span', 'stat');
-      stats.innerHTML = '<span class="num" data-stat="accepted">0</span> accepted · '
-                     + '<span class="num" data-stat="rejected">0</span> rejected';
-      head.appendChild(stats);
-      lane.appendChild(head);
-      const chips = el('div', 'chips');
-      lane.appendChild(chips);
-      $('lanes').appendChild(lane);
-      state.teams.set(key, { lane, chips, accepted: 0, rejected: 0 });
+
+    // Event dots.
+    for (const e of state.events) {
+      if (!VISIBLE[e.category]) continue;
+      if (e.type === 'PHASE_CHANGE' || e.type === 'ROUND_START' ||
+          e.type === 'ROUND_STOP'  || e.type === 'GAME_END') continue;
+      const cx = xOf(e.offset_s);
+      const cy = yOf(e.actor);
+      if (cy == null) continue;
+      const dot = document.createElementNS(NS, 'circle');
+      dot.setAttribute('cx', cx);
+      dot.setAttribute('cy', cy);
+      dot.setAttribute('r', 4);
+      dot.setAttribute('fill', COLOR[e.category] || '#888');
+      dot.setAttribute('fill-opacity', '0.85');
+      dot.setAttribute('stroke', 'rgba(0,0,0,0.4)');
+      dot.setAttribute('stroke-width', '0.5');
+      dot.style.cursor = 'crosshair';
+      dot.addEventListener('mouseenter', evt => showTooltip(evt, e));
+      dot.addEventListener('mousemove',  evt => moveTooltip(evt));
+      dot.addEventListener('mouseleave', () => hideTooltip());
+      svg.appendChild(dot);
     }
-    return state.teams.get(key);
-  }
-  function ensureTeamsOrdered(ids) {
-    // Render team1, team2 first regardless of event order.
-    for (const id of ids) getLane(id);
-  }
 
-  // ── render dispatch ──────────────────────────────────────
-  function render(ev) {
-    if (state.seenEventIds.has(ev.id)) return;
-    state.seenEventIds.add(ev.id);
+    row.appendChild(svg);
+    TIMELINE.appendChild(row);
 
-    switch (ev.type) {
-      case 'ROUND_START':              return renderRoundStart(ev);
-      case 'ROUND_STOP':               return renderRoundStop(ev);
-      case 'PHASE_CHANGE':             return renderPhaseChange(ev);
-      case 'SERVICE_DEPLOYED':         return renderServiceDeployed(ev);
-      case 'AGENT_INSTALLED':          return renderAgentInstalled(ev);
-      case 'AGENT_READY':              return renderAgentReady(ev);
-      case 'DRY_RUN_START':            return renderDryRun(ev, 'start');
-      case 'DRY_RUN_OK':               return renderDryRun(ev, 'ok');
-      case 'DRY_RUN_FAILED':           return renderDryRun(ev, 'failed');
-      case 'DEFENSE_KICKOFF':          return renderKickoff(ev, 'defense');
-      case 'ATTACK_KICKOFF':           return renderKickoff(ev, 'attack');
-      case 'AGENT_PROMPT_SENT':        return renderPromptSent(ev);
-      case 'AGENT_COMPLETED':          return renderAgentDone(ev, 'completed');
-      case 'AGENT_TIMEOUT':            return renderAgentDone(ev, 'timeout');
-      case 'AGENT_FAILED':             return renderAgentDone(ev, 'failed');
-      case 'SERVICE_RESTART_STARTED':  return renderRestart(ev, 'started');
-      case 'SERVICE_RESTART_COMPLETED':return renderRestart(ev, 'completed');
-      case 'SERVICE_RESTART_FAILED':   return renderRestart(ev, 'failed');
-      case 'SERVICE_HEALTH_CHECK':     return renderHealthCheck(ev);
-      case 'DEPLOY_COMPLETE':          return renderDeployComplete(ev);
-      case 'FLAG_PLANTED':             return renderFlagPlanted(ev);
-      case 'FLAG_SUBMITTED':           return renderFlagSubmitted(ev);
-      default: return; // unknown event types are silently ignored
+    if (FOLLOW) {
+      TIMELINE.scrollLeft = TIMELINE.scrollWidth;
     }
   }
 
-  function renderRoundStart(ev) {
-    $('round-num').textContent = ev.round_id;
+  function showTooltip(evt, e) {
+    const colored = COLOR[e.category] || '#fff';
+    TOOLTIP.innerHTML = `
+      <span class="tt-cat" style="color:${colored}">[${e.category}]</span>
+      <span style="color:#fff;font-weight:600">${escapeHtml(e.type)}</span>
+      <span class="tt-ts"> · t+${e.offset_s.toFixed(2)}s</span>
+      <span class="tt-actor">${escapeHtml(e.actor)}</span>
+      <span class="tt-meta">${escapeHtml(e.msg || '')}</span>
+    `;
+    TOOLTIP.classList.add('show');
+    moveTooltip(evt);
   }
-  function renderRoundStop(ev) {
-    // visual nudge — could grey something out, but round_num already updated
+  function moveTooltip(ev) {
+    const pad = 14;
+    let x = ev.clientX + pad, y = ev.clientY + pad;
+    const r = TOOLTIP.getBoundingClientRect();
+    if (x + r.width  > window.innerWidth)  x = ev.clientX - r.width  - pad;
+    if (y + r.height > window.innerHeight) y = ev.clientY - r.height - pad;
+    TOOLTIP.style.left = x + 'px';
+    TOOLTIP.style.top  = y + 'px';
   }
-  function renderPhaseChange(ev) {
-    const p = $('phase');
-    p.textContent = ev.phase;
-    p.dataset.phase = ev.phase;
+  function hideTooltip() { TOOLTIP.classList.remove('show'); }
 
-    const band = el('span', 'band', `r${ev.round_id || 0} ${ev.phase}`);
-    band.dataset.phase = ev.phase;
-    band.appendChild(el('span', 'ts', fmtTs(ev.ts)));
-    $('phase-strip').appendChild(band);
-  }
-  function renderServiceDeployed(ev) {
-    const pl = ev.payload || {};
-    // Map container name back to a team for the chip's lane.
-    // SERVICE_DEPLOYED's team_id is null (it's a global event), so we
-    // route by the container name suffix.
-    const teamId = (pl.container || '').replace(/_prod$/, '').replace(/_dev$/, '');
-    const lane = getLane(teamId);
-    const chip = el('span', 'chip chip-deploy');
-    chip.append(
-      el('span', 'mark', '▸'),
-      document.createTextNode(`deploy ${pl.service || '?'}:${pl.port || '?'}`),
-      el('span', 'ts', fmtTs(ev.ts)),
-    );
-    attachChip(lane, chip, ev);
-  }
-  function renderAgentInstalled(ev) {
-    const lane = getLane(ev.team_id);
-    const chip = el('span', 'chip chip-agent');
-    chip.append(
-      el('span', 'mark', '◆'),
-      document.createTextNode('agent installed'),
-      el('span', 'ts', fmtTs(ev.ts)),
-    );
-    attachChip(lane, chip, ev);
-  }
-  function renderDryRun(ev, kind) {
-    const lane = getLane(ev.team_id);
-    const pl = ev.payload || {};
-    const cls = kind === 'ok' ? 'chip-ready'
-              : kind === 'failed' ? 'chip-reject'
-              : 'chip-kickoff';
-    const mark = kind === 'ok' ? '✓'
-               : kind === 'failed' ? '✗'
-               : '↗';
-    const err = pl.error ? ` — ${pl.error}` : '';
-    const chip = el('span', `chip ${cls}`);
-    chip.append(
-      el('span', 'mark', mark),
-      document.createTextNode(`dry-run ${kind}${err}`),
-      el('span', 'ts', fmtTs(ev.ts)),
-    );
-    attachChip(lane, chip, ev);
-  }
-  function renderAgentReady(ev) {
-    const lane = getLane(ev.team_id);
-    const chip = el('span', 'chip chip-ready');
-    chip.append(
-      el('span', 'mark', '✓'),
-      document.createTextNode('agent ready'),
-      el('span', 'ts', fmtTs(ev.ts)),
-    );
-    attachChip(lane, chip, ev);
-  }
-  function renderKickoff(ev, mode) {
-    const lane = getLane(ev.team_id);
-    const pl = ev.payload || {};
-    const chip = el('span', 'chip chip-kickoff');
-    const label = mode === 'defense'
-      ? `defense kickoff ${pl.service || ''}`
-      : `attack kickoff`;
-    chip.append(
-      el('span', 'mark', '⚡'),
-      document.createTextNode(label),
-      el('span', 'ts', fmtTs(ev.ts)),
-    );
-    attachChip(lane, chip, ev);
-  }
-  function renderPromptSent(ev) {
-    const lane = getLane(ev.team_id);
-    const pl = ev.payload || {};
-    const chip = el('span', 'chip chip-prompt');
-    const flag = pl.is_first ? ' (first)' : '';
-    const phase = ev.phase ? `${ev.phase} ` : '';
-    chip.append(
-      el('span', 'mark', '✎'),
-      document.createTextNode(`${phase}prompt sent${flag}`),
-      el('span', 'ts', fmtTs(ev.ts)),
-    );
-    attachChip(lane, chip, ev);
-  }
-  function renderAgentDone(ev, kind) {
-    const lane = getLane(ev.team_id);
-    const pl = ev.payload || {};
-    const cls = kind === 'completed' ? 'chip-ready'
-              : kind === 'timeout' ? 'chip-reject'
-              : 'chip-reject';
-    const mark = kind === 'completed' ? '✓'
-               : kind === 'timeout' ? '⏱'
-               : '✗';
-    const dur = pl.duration_ms != null ? ` ${pl.duration_ms}ms` : '';
-    const err = pl.error_excerpt || pl.error;
-    const errTail = err ? ` — ${err}` : '';
-    const chip = el('span', `chip ${cls}`);
-    const phase = ev.phase ? `${ev.phase} ` : '';
-    // For AGENT_TIMEOUT, the event's `ts` is when the process actually
-    // settled (which can lag the phase boundary by tens of seconds).
-    // pkilled_at is when the phase boundary fired the kill — that's
-    // what the panel should display so the timeline reads in true
-    // chronological order alongside the next phase's events.
-    const displayTs = (pl.pkilled_at != null) ? pl.pkilled_at : ev.ts;
-    chip.append(
-      el('span', 'mark', mark),
-      document.createTextNode(`${phase}agent ${kind}${dur}${errTail}`),
-      el('span', 'ts', fmtTs(displayTs)),
-    );
-    attachChip(lane, chip, ev);
-  }
-  function renderRestart(ev, kind) {
-    const lane = getLane(ev.team_id);
-    const pl = ev.payload || {};
-    const cls = kind === 'failed' ? 'chip-reject' : 'chip-restart';
-    const mark = kind === 'started' ? '↻' : (kind === 'completed' ? '✓' : '✗');
-    const dur = pl.duration_ms != null ? ` ${pl.duration_ms}ms` : '';
-    const err = pl.error ? ` — ${pl.error}` : '';
-    const chip = el('span', 'chip ' + cls);
-    chip.append(
-      el('span', 'mark', mark),
-      document.createTextNode(`restart ${kind}${dur}${err}`),
-      el('span', 'ts', fmtTs(ev.ts)),
-    );
-    attachChip(lane, chip, ev);
-  }
-  function renderHealthCheck(ev) {
-    const lane = getLane(ev.team_id);
-    const pl = ev.payload || {};
-    const ok = pl.passed === true;
-    const cls = ok ? 'chip-health-ok' : 'chip-health-no';
-    const chip = el('span', 'chip ' + cls);
-    chip.append(
-      el('span', 'mark', ok ? '✓' : '✗'),
-      document.createTextNode(`health/${pl.level || '?'}`),
-      el('span', 'ts', fmtTs(ev.ts)),
-    );
-    attachChip(lane, chip, ev);
-  }
-  function renderDeployComplete(ev) {
-    const lane = getLane(ev.team_id);
-    const pl = ev.payload || {};
-    const dur = pl.duration_ms != null ? ` ${pl.duration_ms}ms` : '';
-    const chip = el('span', 'chip chip-deploy-done');
-    chip.append(
-      el('span', 'mark', '✓'),
-      document.createTextNode(`deploy_complete${dur}`),
-      el('span', 'ts', fmtTs(ev.ts)),
-    );
-    attachChip(lane, chip, ev);
-  }
-  function renderFlagPlanted(ev) {
-    const lane = getLane(ev.team_id);
-    const pl = ev.payload || {};
-    const chip = el('span', 'chip chip-plant');
-    chip.append(
-      el('span', 'mark', '🚩'),
-      document.createTextNode(`plant ${pl.service || ''} r${ev.round_id || 0}`),
-      el('span', 'ts', fmtTs(ev.ts)),
-    );
-    attachChip(lane, chip, ev);
-  }
-  function renderFlagSubmitted(ev) {
-    const pl = ev.payload || {};
-    const lane = getLane(pl.submitter_team_id || ev.team_id);
-    const ok = !!pl.accepted;
-    const chip = el('span', 'chip ' + (ok ? 'chip-accept' : 'chip-reject'));
-    const victim = pl.victim_team_id ? ` ← ${pl.victim_team_id}` : '';
-    const svc = pl.service ? `/${pl.service}` : '';
-    chip.append(
-      el('span', 'mark', ok ? '✓' : '✗'),
-      document.createTextNode(`submit ${pl.reason}${victim}${svc}`),
-      el('span', 'ts', fmtTs(ev.ts)),
-    );
-    attachChip(lane, chip, ev);
-
-    const key = ok ? 'accepted' : 'rejected';
-    lane[key] += 1;
-    lane.lane.querySelector(`[data-stat=${key}]`).textContent = lane[key];
+  // ── controls (category toggles) ──────────────────────────────
+  const CONTROLS = $('controls');
+  function buildControls() {
+    CONTROLS.innerHTML = '';
+    for (const c of CATEGORIES) {
+      const count = state.events.reduce((n, e) => n + (e.category === c.key ? 1 : 0), 0);
+      const el = document.createElement('div');
+      el.className = 'cat-toggle' + (VISIBLE[c.key] ? '' : ' off');
+      el.innerHTML = `<span class="swatch" style="background:${c.color}"></span>${c.label} (${count})`;
+      el.addEventListener('click', () => {
+        VISIBLE[c.key] = !VISIBLE[c.key];
+        el.classList.toggle('off', !VISIBLE[c.key]);
+        render();
+      });
+      CONTROLS.appendChild(el);
+    }
+    // Lane-summary mirrors the discovered lanes so the footer stays
+    // honest about which actors the timeline is actually showing.
+    const summary = $('lane-summary');
+    if (summary) summary.textContent = actors().join(' · ');
   }
 
-  // ── data sources ─────────────────────────────────────────
+  const zoom = $('zoom'), zoomVal = $('zoom-val');
+  zoom.addEventListener('input', () => {
+    DENSITY = Number(zoom.value);
+    zoomVal.textContent = DENSITY;
+    render();
+  });
+  $('follow').addEventListener('change', e => { FOLLOW = e.target.checked; });
+
+  // ── live WS feed + snapshot mode ────────────────────────────
   async function backfill() {
     try {
-      const r = await fetch('/game/events');
-      if (!r.ok) return;
-      const events = await r.json();
-      // Pre-seed both teams so they appear in canonical order even if no
-      // events for one of them have arrived yet.
-      ensureTeamsOrdered(['team1', 'team2']);
-      for (const ev of events) render(ev);
-      // Pull current status for total_rounds (and current round/phase).
-      const s = await fetch('/game/status').then(x => x.json()).catch(() => null);
-      if (s) {
-        if (s.total_rounds != null) $('round-total').textContent = s.total_rounds;
-        if (s.round != null && +s.round > +$('round-num').textContent) {
-          $('round-num').textContent = s.round;
-        }
-        if (s.phase) {
-          $('phase').textContent = s.phase;
-          $('phase').dataset.phase = s.phase;
-        }
-      }
-    } catch (e) { /* backfill is best-effort */ }
+      const res = await fetch('/game/events');
+      if (!res.ok) return;
+      const body = await res.json();
+      // /game/events returns {events: [...], cursor: int} — replay just
+      // the events list. Cursor isn't useful here because the WS keeps
+      // us live after the initial drain.
+      const arr = Array.isArray(body) ? body : (body.events || []);
+      let added = 0;
+      for (const ev of arr) if (ingest(ev)) added++;
+      if (added) { buildControls(); render(); }
+    } catch (e) { /* best-effort */ }
   }
 
   function wsUrl() {
@@ -559,18 +589,19 @@
     conn.querySelector('.text').textContent = 'connecting…';
 
     let ws;
-    try {
-      ws = new WebSocket(wsUrl());
-    } catch (e) {
-      scheduleReconnect(); return;
-    }
+    try { ws = new WebSocket(wsUrl()); }
+    catch (e) { scheduleReconnect(); return; }
+
     ws.onopen = () => {
       backoff = 500;
       conn.dataset.state = 'ok';
       conn.querySelector('.text').textContent = 'connected';
     };
     ws.onmessage = (m) => {
-      try { render(JSON.parse(m.data)); } catch (e) {}
+      try {
+        const ev = JSON.parse(m.data);
+        if (ingest(ev)) { buildControls(); render(); }
+      } catch (e) {}
     };
     ws.onclose = () => {
       conn.dataset.state = 'lost';
@@ -584,21 +615,25 @@
     backoff = Math.min(backoff * 2, 30000);
   }
 
-  // ── boot ────────────────────────────────────────────────
-  ensureTeamsOrdered(['team1', 'team2']);
-  if (Array.isArray(window.INITIAL_EVENTS)) {
-    // Snapshot mode: events were embedded at build time by
-    // gamemgr/panel_snapshot.py. No live connection, no /game/status
-    // backfill — just replay the events and stop.
-    const conn = $('conn');
-    conn.dataset.state = 'snapshot';
-    conn.querySelector('.text').textContent = 'snapshot';
-    for (const ev of window.INITIAL_EVENTS) {
-      try { render(ev); } catch (e) { /* keep going on bad event */ }
+  // ── boot ─────────────────────────────────────────────────────
+  // Defer until DOMContentLoaded so any later <script> tags (notably the
+  // INITIAL_EVENTS block panel_snapshot.py injects right before the
+  // closing body tag) have finished executing.
+  document.addEventListener('DOMContentLoaded', () => {
+    buildControls();
+    render();
+    window.addEventListener('resize', render);
+
+    if (Array.isArray(window.INITIAL_EVENTS)) {
+      const conn = $('conn');
+      conn.dataset.state = 'snapshot';
+      conn.querySelector('.text').textContent = 'snapshot';
+      for (const ev of window.INITIAL_EVENTS) ingest(ev);
+      buildControls(); render();
+    } else {
+      backfill().then(connect);
     }
-  } else {
-    backfill().then(connect);
-  }
+  });
 </script>
 </body>
 </html>
