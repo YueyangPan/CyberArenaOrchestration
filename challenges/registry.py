@@ -1,27 +1,57 @@
-"""Challenge registry — discovery via ChallengeSource list (DEFCON framework).
+"""Challenge registry — name → Challenge instance.
 
-The pre-DEFCON registry was a hardcoded `dict[type_str, Service class]`.
-With the framework, sources become the discovery primitive: each
-`ChallengeSource` enumerates its own `ChallengeSpec`s and knows how
-to materialize them.
+The v2 registry is a small dict mapping `Challenge.name` → factory. Adding
+a new challenge is two lines: import the class, register the name.
 
-Back-compat: the legacy `build(type_, **kwargs)` shim still works for
-M5/M5.5/M5.6 call sites that pass a service type string (e.g. "notes").
-It looks up the matching Service class via the source list and
-instantiates it. Once the topology refactor migrates everything to
-spec-driven deploy, the shim can retire.
+Legacy v1 surfaces (`default_sources`, `sources_for`, `build_all_images`,
+`build`, `REGISTRY`) still live below; Stage 8 deletes them once
+GameMgr.deploy_challenges has moved fully to the v2 path.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
+from challenges.interface import Challenge
+from challenges.nautilus_ico import IcoChallenge
+from challenges.notes import BuiltinNotesSource, NotesChallenge, NotesService
 from orchestrator.service import Service
-
-from challenges.notes import BuiltinNotesSource, NotesService
 
 if TYPE_CHECKING:
     from challenges.source import ChallengeSource
+
+
+# ── v2 challenge registry ─────────────────────────────────────────────
+
+
+# Name → zero-arg factory. Factories instead of pre-built instances so
+# imports stay lazy (`IcoChallenge.vulbox` shells out to `git rev-parse`
+# inside the vendor checkout; we don't want that running at module import).
+_CHALLENGE_FACTORIES: dict[str, Callable[[], Challenge]] = {
+    "notes": NotesChallenge,
+    "nautilus-ico": IcoChallenge,
+}
+
+
+def build_challenge(name: str) -> Challenge:
+    """Instantiate the Challenge registered under `name`. Raises KeyError
+    when the name isn't registered."""
+    factory = _CHALLENGE_FACTORIES.get(name)
+    if factory is None:
+        raise KeyError(
+            f"unknown challenge: {name!r}; "
+            f"known: {sorted(_CHALLENGE_FACTORIES)}"
+        )
+    return factory()
+
+
+def known_challenge_names() -> list[str]:
+    """Stable sorted list of registered challenge names. Used by tests
+    and the panel's challenge-picker."""
+    return sorted(_CHALLENGE_FACTORIES)
+
+
+# ── Legacy v1 helpers (Stage 8 deletes these) ─────────────────────────
 
 
 # Default in-tree sources. External CTF adapters (nautilus, picoCTF, …)

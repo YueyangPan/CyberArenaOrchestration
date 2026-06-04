@@ -24,7 +24,7 @@ from orchestrator.service import ContainerHandle, Service
 from agents.prompts import build_attack_prompt, build_defense_prompt
 from challenges.interface import Challenge, VulboxTarget
 from challenges.notes import BuiltinNotesSource
-from challenges.registry import build as build_challenge
+from challenges.registry import build as build_service, build_challenge
 from challenges.source import ChallengeSpec, FlagMechanism
 from models.agent import AgentConfig
 from typing import Awaitable, Callable
@@ -48,21 +48,6 @@ from health.checker import HealthChecker, leaves
 from health.poller import HealthPoller, build_targets
 
 log = logging.getLogger(__name__)
-
-
-def _build_challenge_v2(chal_name: str) -> Challenge:
-    """Inline factory: chcfg.name -> Challenge instance. Stage 7 moves
-    this into `challenges/registry.py` (string -> class lookup with
-    plugin entry-point support). Until then a hardcoded switch keeps
-    the v2 wiring isolated to GameMgr.deploy_challenges.
-    """
-    if chal_name == "notes":
-        from challenges.notes import NotesChallenge
-        return NotesChallenge()
-    if chal_name == "nautilus-ico":
-        from challenges.nautilus_ico import IcoChallenge
-        return IcoChallenge()
-    raise KeyError(f"unknown challenge name for v2 factory: {chal_name!r}")
 
 
 class GameMgr:
@@ -216,7 +201,7 @@ class GameMgr:
             # Stage 5 restart can dispatch to ch.flag_handler / .
             # functionality_test / .restart_handler. Stage 7 promotes
             # this inline factory to challenges/registry.py.
-            challenge = _build_challenge_v2(chcfg.name)
+            challenge = build_challenge(chcfg.name)
 
             if mechanism == FlagMechanism.FILE_AT_PATH:
                 # Image-bundled service. Trigger the framework restart_cmd
@@ -245,7 +230,7 @@ class GameMgr:
                 continue
 
             # SERVICE_PROTOCOL path (legacy notes-style adapter).
-            service = build_challenge(chcfg.type, port=chcfg.port)
+            service = build_service(chcfg.type, port=chcfg.port)
             handles: list[ContainerHandle] = []
             for team_id in chcfg.deploy_on:
                 cname = team_to_prod.get(team_id)
@@ -335,7 +320,7 @@ class GameMgr:
         targets = build_targets(
             challenges=self.config.challenges,
             teams_by_id=teams_by_id,
-            challenge_by_name=_build_challenge_v2,
+            challenge_by_name=build_challenge,
             target_factory=self.target_for,
             resolve_spec=self._resolve_spec,
         )
@@ -1064,7 +1049,7 @@ class GameMgr:
         """
         # 1. Challenge lookup (v2: restart goes through challenge.restart_handler).
         try:
-            challenge = _build_challenge_v2(service)
+            challenge = build_challenge(service)
         except KeyError:
             raise ValueError(f"unknown service: {service!r}")
         if challenge.restart_handler is None:
