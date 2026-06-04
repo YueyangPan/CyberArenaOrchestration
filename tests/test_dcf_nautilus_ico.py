@@ -1,12 +1,12 @@
 """DEFCON: end-to-end smoke of the nautilus-ico image.
 
-Verifies what the NautilusSource adapter ships:
+Verifies what `challenges/nautilus_ico/build.py` ships:
 - image builds and tags as `cyberarena/chal-nautilus-ico:<pin>`
 - the running container has the layout the framework expects
   (/srv/challenge/ico writable to arena_agent; /arena read-only;
   /opt/challenge_src baked + root-owned)
 - /arena/restart.sh actually launches the ico binary and port 4265 listens
-- file_at_path flag mechanism: writing /flag works, ico reads it
+- FILE_AT_PATH flag handler: writing /flag works, ico reads it
 
 Skips when docker isn't installed (see conftest.docker_required).
 """

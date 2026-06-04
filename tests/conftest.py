@@ -56,15 +56,12 @@ def dcf_ico_image(docker_required) -> str:
     The image build is ~70s cold / ~1s cache-warm. Session scope keeps
     that out of every test.
     """
-    from challenges.nautilus import NautilusSource
+    from challenges.nautilus_ico.build import build_image
 
-    src = NautilusSource(include=["ico"])
     try:
-        specs = src.list_challenges()
+        return build_image()
     except FileNotFoundError as e:
         pytest.skip(f"nautilus vendor not synced: {e}")
-    ico_spec = next(s for s in specs if s.name == "nautilus-ico")
-    return src.build_image(ico_spec)
 
 
 @pytest.fixture

@@ -40,7 +40,7 @@ from gamemgr.events import EventType
 from gamemgr.game_mgr import GameMgr
 from models.agent import AgentConfig
 from models.topology import Team, TopologyGraph
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 
 # ── FakeTransport: in-memory AgentTransport for the runner tests ──────
@@ -74,7 +74,10 @@ class _FakeTransport(AgentTransport):
         return self.files.get(remote_path, b"")
 
     def kill_process(self, handle, pattern):
-        self.kill_calls.append((handle.name, pattern))
+        self.kill_calls.append((handle.name, "process", pattern))
+
+    def kill_session(self, handle, session_marker):
+        self.kill_calls.append((handle.name, "session", session_marker))
 
 
 def _handle(name: str = "team1_dev") -> ContainerHandle:
@@ -103,20 +106,17 @@ def test_phase_command_contains_continue_workdir_envfile_and_stdin_redirect():
     assert "< " in shell  # stdin redirect
 
 
-def test_phase_command_default_model_falls_back_to_env_var():
-    """No `model=` → shell sources $CLAUDE_MODEL (which agent.env exports)."""
+def test_phase_command_model_default_vs_explicit_override():
+    """Default: shell sources $CLAUDE_MODEL (from agent.env).
+    Explicit `model=` injects a literal `--model <name>` and drops the env-var fallback."""
     mgr = ClaudeAgentManager(transport=_FakeTransport(), client=None)
-    shell = mgr.phase_command()[2]
-    assert '--model "$CLAUDE_MODEL"' in shell
 
+    default_shell = mgr.phase_command()[2]
+    assert '--model "$CLAUDE_MODEL"' in default_shell
 
-def test_phase_command_explicit_model_overrides_env_var():
-    """Passing `model=` injects --model literal into the argv,
-    overriding $CLAUDE_MODEL. Useful for tests + model-A/B runs."""
-    mgr = ClaudeAgentManager(transport=_FakeTransport(), client=None)
-    shell = mgr.phase_command(model="claude-haiku-4-5")[2]
-    assert "--model claude-haiku-4-5" in shell or "--model 'claude-haiku-4-5'" in shell
-    assert "$CLAUDE_MODEL" not in shell
+    override_shell = mgr.phase_command(model="claude-haiku-4-5")[2]
+    assert "--model claude-haiku-4-5" in override_shell or "--model 'claude-haiku-4-5'" in override_shell
+    assert "$CLAUDE_MODEL" not in override_shell
 
 
 def test_prompt_path_and_kill_pattern_match_abc_contract():
@@ -141,12 +141,19 @@ def test_runner_writes_prompt_then_invokes_phase_command():
 
     # Prompt was written to PROMPT_PATH.
     assert transport.files[PROMPT_PATH] == b"do the thing"
-    # The shell argv passed to run_command came from mgr.phase_command().
+    # The shell argv passed to run_command came from mgr.phase_command()
+    # with a per-invocation session marker baked into the bash wrapper.
+    # The marker is random; assert the shape (setsid wrapper + pidfile)
+    # rather than literal equality with the default phase_command().
     assert len(transport.run_calls) == 1
     container_name, cmd, timeout = transport.run_calls[0]
     assert container_name == "team1_dev"
     assert timeout == 10
-    assert cmd == mgr.phase_command()
+    assert cmd[0] == "bash" and cmd[1] == "-c"
+    shell = cmd[2]
+    assert "setsid -w bash -c" in shell, shell
+    assert "/tmp/cyberarena_phase_" in shell and ".pid" in shell, shell
+    assert "claude -p --continue" in shell
 
 
 def test_runner_returns_raw_command_result():
@@ -174,10 +181,11 @@ def test_runner_returns_raw_command_result():
     assert result.timed_out is False
 
 
-def test_runner_timeout_fires_kill_process_with_class_pattern():
-    """On timeout the runner calls transport.kill_process with
-    mgr.PHASE_KILL_PATTERN — the belt-and-suspenders SIGKILL inside the
-    container if docker exec's SIGTERM didn't propagate."""
+def test_runner_timeout_fires_kill_session_with_invocation_marker():
+    """On timeout the runner calls transport.kill_session with the
+    per-invocation session marker — precision SIGKILL on the timed-out
+    claude's process group (not a pattern that would race with a
+    sibling claude started by the next phase)."""
     transport = _FakeTransport(
         next_result=CommandResult(
             exit_code=-1, stdout=b"partial\n", stderr=b"", timed_out=True,
@@ -192,7 +200,15 @@ def test_runner_timeout_fires_kill_process_with_class_pattern():
     result = asyncio.run(go())
 
     assert result.timed_out is True
-    assert transport.kill_calls == [("team2_dev", "claude -p")]
+    assert len(transport.kill_calls) == 1
+    container, kind, marker = transport.kill_calls[0]
+    assert container == "team2_dev"
+    assert kind == "session"
+    # secrets.token_hex(6) → 12 hex chars
+    assert len(marker) == 12 and all(c in "0123456789abcdef" for c in marker)
+    # The same marker must have been baked into phase_command's shell.
+    shell = transport.run_calls[0][1][2]
+    assert marker in shell, f"marker {marker!r} not found in shell {shell!r}"
 
 
 def test_runner_no_kill_on_clean_exit():
@@ -269,7 +285,7 @@ def test_record_phase_done_emits_agent_completed_on_clean_exit(tmp_path):
         )
     asyncio.run(go())
 
-    events = [e for e in game.bus.history() if e.team_id == "team1"]
+    events = [e for e in game.timeline.history() if e.team_id == "team1"]
     assert any(e.type == EventType.AGENT_COMPLETED.value for e in events), events
     assert not any(e.type in (EventType.AGENT_TIMEOUT.value, EventType.AGENT_FAILED.value) for e in events)
 
@@ -285,7 +301,7 @@ def test_record_phase_done_emits_agent_timeout_when_timed_out(tmp_path):
         )
     asyncio.run(go())
 
-    events = [e for e in game.bus.history()]
+    events = [e for e in game.timeline.history()]
     timeouts = [e for e in events if e.type == EventType.AGENT_TIMEOUT.value]
     assert len(timeouts) == 1
     assert timeouts[0].payload["duration_ms"] == 120000
@@ -303,7 +319,7 @@ def test_record_phase_done_emits_agent_failed_on_nonzero_exit(tmp_path):
         )
     asyncio.run(go())
 
-    failed = [e for e in game.bus.history() if e.type == EventType.AGENT_FAILED.value]
+    failed = [e for e in game.timeline.history() if e.type == EventType.AGENT_FAILED.value]
     assert len(failed) == 1
     assert "non-zero exit 137" in failed[0].payload.get("error_excerpt", "")
 
@@ -326,5 +342,5 @@ def test_record_phase_done_artifact_write_failure_still_emits_event(tmp_path):
         )
     asyncio.run(go())
 
-    completed = [e for e in game.bus.history() if e.type == EventType.AGENT_COMPLETED.value]
+    completed = [e for e in game.timeline.history() if e.type == EventType.AGENT_COMPLETED.value]
     assert len(completed) == 1, "event must publish even when artifact write failed"

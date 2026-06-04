@@ -5,15 +5,15 @@ attack recipe SSH-pivots through own prod and runs a one-liner that
 LISTs + GETs every stored note from the opposing prod, then submits any
 FLAG{...} string it finds.
 
-Notes is not defense-capable (no `restart_cmd` in spec metadata) — the
-DEFENSE_KICKOFF subscriber skips it. So we only export an attack prompt.
+Notes is attack-only (`Challenge.restart_handler` returns None) — the
+DEFENSE_KICKOFF dispatch skips it. So we only export `build_attack_prompt`.
 """
 
 from __future__ import annotations
 
 from models.agent import AgentConfig
 
-from . import submit_block
+from agents.prompts._helpers import submit_block
 
 
 def build_attack_prompt(cfg: AgentConfig) -> str:

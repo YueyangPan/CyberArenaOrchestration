@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 
 # AgentHandle is opaque to the manager; each transport interprets it.
@@ -30,12 +30,20 @@ AgentHandle = ContainerHandle
 class CommandResult:
     """Returned by AgentTransport.run_command. `timed_out=True` means
     the backend already escalated SIGTERM → SIGKILL; stdout/stderr
-    are whatever was captured up to that point."""
+    are whatever was captured up to that point.
+
+    `pkilled_at`: when the timeout actually fired and SIGTERM was issued
+    (wall-clock seconds, time.time()). None when the process exited
+    cleanly. Surfaces "when the phase boundary really hit this agent"
+    separately from "when the subprocess finally settled" — useful for
+    panel ordering, since the latter can lag by tens of seconds while
+    docker exec propagates the signal."""
 
     exit_code: int
     stdout: bytes
     stderr: bytes
     timed_out: bool
+    pkilled_at: float | None = None
 
 
 class AgentTransport(Protocol):
@@ -76,7 +84,23 @@ class AgentTransport(Protocol):
         ...
 
     def kill_process(self, handle: AgentHandle, pattern: str) -> None:
-        """Force-kill processes matching pattern (pgrep-style). Used
-        after a run_command timeout if SIGTERM didn't propagate cleanly
-        (e.g. through `docker exec`). Best-effort: never raises."""
+        """Force-kill processes matching pattern (pgrep-style). Used by
+        teardown paths (e.g. ClaudeAgentManager.kill) that don't have a
+        specific PID. Best-effort: never raises.
+
+        Prefer `kill_session` from the per-phase runner — `kill_process`
+        races when the same container hosts multiple phases in sequence
+        (a freshly-started next-phase claude matches the same pattern).
+        """
+        ...
+
+    def kill_session(self, handle: AgentHandle, session_marker: str) -> None:
+        """Kill the specific process whose PID was written to
+        `/tmp/cyberarena_phase_<marker>.pid` by phase_command's bash
+        wrapper. No-op (best-effort) when the file is missing or empty.
+
+        Replaces the racy pattern-based `kill_process` for the runner's
+        on-timeout pkill: targets exactly the claude instance started
+        under this session marker, not a sibling that just started in
+        the next phase."""
         ...

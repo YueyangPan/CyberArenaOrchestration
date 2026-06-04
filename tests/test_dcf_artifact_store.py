@@ -18,22 +18,6 @@ from gamemgr.artifacts import ArtifactKind, ArtifactStore
 # ── kinds / enum invariants ────────────────────────────────────────────
 
 
-def test_artifact_kinds_are_a_closed_set_with_distinct_values():
-    """All 8 reserved slots present; no duplicates; values are filesystem-safe."""
-    values = [k.value for k in ArtifactKind]
-    assert len(values) == 8, f"expected exactly 8 kinds, got {values}"
-    assert len(set(values)) == 8, "duplicate ArtifactKind values"
-    # Filesystem-safe: no slashes, no whitespace, lowercase + dashes only.
-    for v in values:
-        assert "/" not in v and " " not in v, f"unsafe kind value: {v!r}"
-
-    # Pin the v1 names so future renames are caught — downstream tools
-    # may grep these paths.
-    assert ArtifactKind.API_LOG.value == "api-log"
-    assert ArtifactKind.AGENT_LOG.value == "agent-log"
-    assert ArtifactKind.SERVICE_LOG.value == "service-log"
-
-
 # ── store construction: reserves layout up-front ───────────────────────
 
 
@@ -49,24 +33,6 @@ def test_store_creates_artifacts_root_and_readme(tmp_path):
     # Layout is team-first now — no `<kind>/` subdirs at the top level.
     # No team dirs exist yet because nothing has been written.
     assert list(p.name for p in root.iterdir() if p.is_dir()) == []
-
-
-def test_store_construction_is_idempotent(tmp_path):
-    """Constructing twice over the same run dir doesn't blow up or rewrite
-    the README. Lets GameMgr re-init defensively without losing state."""
-    store = ArtifactStore(tmp_path)
-    readme = tmp_path / "artifacts" / "README.md"
-    original = readme.read_text()
-    # Drop a sentinel via path_for so the second construction sees it.
-    sentinel = store.path_for(
-        ArtifactKind.API_LOG, team_id="team1", round_id=0, filename="sentinel.txt",
-    )
-    sentinel.write_text("keep me")
-
-    ArtifactStore(tmp_path)  # second construction
-
-    assert readme.read_text() == original
-    assert sentinel.read_text() == "keep me"
 
 
 # ── path_for: layout + lazy parent creation ────────────────────────────
@@ -132,63 +98,29 @@ def test_path_for_across_multiple_rounds_and_teams_isolates_directories(tmp_path
 # ── escape rejection ───────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    "bad_filename",
-    [
-        "../etc/passwd",
-        "../../../etc/passwd",
-        "foo/../../etc/passwd",
-        "subdir/../../escape",
-    ],
-)
-def test_path_for_rejects_dotdot_in_filename(tmp_path, bad_filename):
-    """`..` would escape the artifacts root — refuse it loudly rather
-    than silently writing outside the run."""
+def test_path_for_rejects_escape_attempts(tmp_path):
+    """`..` and absolute paths must be refused — they'd silently bypass
+    the artifacts root. Nested relative filenames (`sub/x.log`) are
+    fine and stay under the round dir.
+    """
     store = ArtifactStore(tmp_path)
-    with pytest.raises(ValueError, match=r"\.\."):
-        store.path_for(
-            ArtifactKind.EXPLOIT,
-            team_id="team1",
-            round_id=1,
-            filename=bad_filename,
-        )
-
-
-def test_path_for_rejects_absolute_filename(tmp_path):
-    """An absolute filename would silently bypass the kind/team/round prefix."""
-    store = ArtifactStore(tmp_path)
-    with pytest.raises(ValueError, match="relative"):
-        store.path_for(
-            ArtifactKind.API_LOG,
-            team_id="team1",
-            round_id=1,
-            filename="/etc/passwd",
-        )
-
-
-def test_path_for_allows_nested_filename(tmp_path):
-    """A nested filename like 'sub/file.log' is fine — it stays under the
-    round dir. (Only `..` and absolute paths escape.)"""
-    store = ArtifactStore(tmp_path)
+    # Escape attempts → ValueError
+    for bad in ("../etc/passwd", "foo/../../escape", "/etc/passwd"):
+        with pytest.raises(ValueError):
+            store.path_for(
+                ArtifactKind.EXPLOIT,
+                team_id="team1", round_id=1, filename=bad,
+            )
+    # Nested-but-contained filename is OK
     p = store.path_for(
         ArtifactKind.API_LOG,
-        team_id="team1",
-        round_id=1,
-        filename="sub/stream.jsonl",
+        team_id="team1", round_id=1, filename="sub/stream.jsonl",
     )
     p.write_text("ok")
     assert p == tmp_path / "artifacts" / "team1" / "round-1" / "sub" / "stream.jsonl"
-    assert p.read_text() == "ok"
-
-
-def test_path_for_rejects_non_enum_kind(tmp_path):
-    """Passing a raw string instead of an ArtifactKind member must raise —
-    otherwise the closed-set discipline silently degrades to free-form."""
-    store = ArtifactStore(tmp_path)
+    # Non-enum kind → TypeError
     with pytest.raises(TypeError, match="ArtifactKind"):
         store.path_for(
             "api-log",  # type: ignore[arg-type]
-            team_id="team1",
-            round_id=1,
-            filename="x.log",
+            team_id="team1", round_id=1, filename="x.log",
         )

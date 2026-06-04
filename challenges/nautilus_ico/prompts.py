@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from models.agent import AgentConfig
 
-from . import submit_block
+from agents.prompts._helpers import submit_block
 
 
 def build_attack_prompt(cfg: AgentConfig) -> str:
@@ -231,7 +231,7 @@ DEFENSE RECIPE
 6. Report:
 
    Tool: mcp__cyberarena__report_deploy_complete
-   Args: {{"service": "{service_name}", "duration_ms": <ms_elapsed>}}
+   Args: {{"service": "{service_name}"}}
 
 NOTES
 - fpc errors are noisy but the first line is the file + line + msg. If

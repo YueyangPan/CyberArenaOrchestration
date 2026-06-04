@@ -45,7 +45,7 @@ from typing import Callable, ClassVar
 import docker
 
 from models.agent import AgentConfig, AgentLogs, AgentState, AgentStatus
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 from .manager import AgentManager
 from .transport import AgentHandle, AgentTransport
@@ -168,7 +168,12 @@ class ClaudeAgentManager(AgentManager):
         if on_installed is not None and cfg.team_id:
             on_installed(cfg.team_id)
 
-    def phase_command(self, *, model: str | None = None) -> list[str]:
+    def phase_command(
+        self,
+        *,
+        model: str | None = None,
+        session_marker: str | None = None,
+    ) -> list[str]:
         """Shell argv that drives one phase of Claude Code.
 
         Wraps the actual claude invocation in `bash -c` so we can:
@@ -182,22 +187,42 @@ class ClaudeAgentManager(AgentManager):
         `model` overrides `$CLAUDE_MODEL` (which agent.env exports from
         cfg.model). Production leaves it None; tests pass it explicitly
         when the test mock client doesn't ship a model env var.
+
+        `session_marker` (optional, set by the runner per-invocation):
+        when given, claude is launched under `setsid -w bash -c …` so it
+        gets its own process group. The inner bash writes its PID (=PGID,
+        because it's the session leader) to
+        `/tmp/cyberarena_phase_<marker>.pid` and then `exec`s claude in
+        place (same PID/PGID). Any subprocesses claude spawns (exploits,
+        background jobs) inherit that PGID, so the runner's on-timeout
+        `kill_session` does `kill -KILL -- -<pgid>` and reaps the whole
+        group — no orphans, no race with a sibling claude that the next
+        phase just started in the same container.
         """
         model_arg = (
             f"--model {shlex.quote(model)} "
             if model
             else '--model "$CLAUDE_MODEL" '
         )
-        return [
-            "bash", "-c",
-            f"cd {shlex.quote(WORKDIR)} && "
-            f"set -a && . {shlex.quote(ENV_PATH)} && set +a && "
+        claude_argv = (
             "claude -p --continue "
             "--output-format stream-json --verbose "
             "--dangerously-skip-permissions "
             + model_arg
             + f"--mcp-config {shlex.quote(MCP_CONFIG_PATH)} "
-            f"< {shlex.quote(self.PROMPT_PATH)}",
+            f"< {shlex.quote(self.PROMPT_PATH)}"
+        )
+        if session_marker:
+            pid_file = f"/tmp/cyberarena_phase_{session_marker}.pid"
+            inner = f"echo $$ > {shlex.quote(pid_file)} && exec {claude_argv}"
+            launch = f"exec setsid -w bash -c {shlex.quote(inner)}"
+        else:
+            launch = claude_argv
+        return [
+            "bash", "-c",
+            f"cd {shlex.quote(WORKDIR)} && "
+            f"set -a && . {shlex.quote(ENV_PATH)} && set +a && "
+            + launch,
         ]
 
     # ── concrete-only convenience methods (NOT on the ABC) ─────────────

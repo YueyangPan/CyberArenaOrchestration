@@ -42,12 +42,12 @@ def arena(client):
     game.deploy_challenges()
 
     # wait until notes is alive on every prod container
-    for service, handles in game._deployed:
-        for h in handles:
-            for _ in range(50):
-                if service.is_alive(h):
-                    break
-                time.sleep(0.1)
+    for (team_id, _svc), challenge in game._challenge_by_owner.items():
+        target = game.target_for(team_id, challenge)
+        for _ in range(50):
+            if challenge.functionality_test.run(target).passed:
+                break
+            time.sleep(0.1)
 
     yield orch, game
 
@@ -103,33 +103,27 @@ def test_reconnect_restores_cross_team_prod(client, arena):
     assert _wait_reachable(client, "team1_prod", "team2_prod", 5000)
 
 
-def test_idempotent_disconnect(client, arena):
+def test_idempotent_toggles(client, arena):
+    """Calling set_cross_team_network with the same value twice must
+    not raise, and the network state must be what the last call asked for."""
     orch, _ = arena
     orch.network.set_cross_team_network(False)
-    orch.network.set_cross_team_network(False)  # must not raise
+    orch.network.set_cross_team_network(False)
     assert not _can_connect(client, "team1_prod", "team2_prod", 5000)
-
-
-def test_idempotent_connect(client, arena):
-    orch, _ = arena
     orch.network.set_cross_team_network(True)
-    orch.network.set_cross_team_network(True)  # must not raise
+    orch.network.set_cross_team_network(True)
     assert _wait_reachable(client, "team1_prod", "team2_prod", 5000)
 
 
-def test_cross_team_dev_blocked_in_attack(client, arena):
-    """dev must never reach the opponent's prod, even in ATTACK."""
+def test_cross_team_dev_blocked_in_every_phase(client, arena):
+    """dev must never reach the opponent's prod — same in ATTACK and DEFENSE."""
     orch, _ = arena
-    orch.network.set_cross_team_network(True)
-    assert not _can_connect(client, "team1_dev", "team2_prod", 5000)
-    assert not _can_connect(client, "team2_dev", "team1_prod", 5000)
-
-
-def test_cross_team_dev_blocked_in_defense(client, arena):
-    orch, _ = arena
-    orch.network.set_cross_team_network(False)
-    assert not _can_connect(client, "team1_dev", "team2_prod", 5000)
-    assert not _can_connect(client, "team2_dev", "team1_prod", 5000)
+    for allow in (True, False):
+        orch.network.set_cross_team_network(allow)
+        assert not _can_connect(client, "team1_dev", "team2_prod", 5000), \
+            f"team1_dev reached team2_prod with allow={allow}"
+        assert not _can_connect(client, "team2_dev", "team1_prod", 5000), \
+            f"team2_dev reached team1_prod with allow={allow}"
 
 
 def test_intra_team_dev_to_prod_unaffected_by_phase(client, arena):

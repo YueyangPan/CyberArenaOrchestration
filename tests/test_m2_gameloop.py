@@ -54,26 +54,26 @@ def test_full_lifecycle(client, cfg, tmp_path):
         game.deploy_challenges()
 
         # notes should respond on both prod containers (poll up to ~5s)
-        for service, handles in game._deployed:
-            for h in handles:
-                alive = False
-                for _ in range(50):
-                    if service.is_alive(h):
-                        alive = True
-                        break
-                    time.sleep(0.1)
-                assert alive, f"{service.name} not alive on {h.name}"
+        for (team_id, svc_name), challenge in game._challenge_by_owner.items():
+            target = game.target_for(team_id, challenge)
+            alive = False
+            for _ in range(50):
+                if challenge.functionality_test.run(target).passed:
+                    alive = True
+                    break
+                time.sleep(0.1)
+            assert alive, f"{svc_name} not alive on {target.host}"
 
         run_dir = tmp_path / "run01"
         asyncio.run(game.start(run_dir=run_dir))
 
-        types = [e.type for e in game.bus.history()]
+        types = [e.type for e in game.timeline.history()]
         assert "SERVICE_DEPLOYED" in types
         assert "ROUND_START" in types
         assert "PHASE_CHANGE" in types
         assert "ROUND_STOP" in types
         # 2 rounds * (ROUND_START + 2 PHASE_CHANGE + ROUND_STOP) + 2 SERVICE_DEPLOYED = 10 events
-        assert len(game.bus.history()) >= 10
+        assert len(game.timeline.history()) >= 10
 
         events_file = run_dir / "events.jsonl"
         assert events_file.exists()

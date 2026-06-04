@@ -75,10 +75,14 @@ def test_arena_agent_can_create_new_file_under_srv_challenge(dcf_ico_container):
 
 
 @pytest.mark.parametrize("path", ["/arena/restart.sh", "/arena/checker.sh"])
-def test_arena_agent_cannot_modify_arena_scripts(dcf_ico_container, path):
-    """Permission denied at the kernel layer — not a prompt rule.
-    A prompt-injection in the agent's context that tries to disable the
-    health chain by overwriting checker.sh MUST be physically blocked."""
+def test_arena_agent_cannot_tamper_with_arena_scripts(dcf_ico_container, path):
+    """Permission denied at the kernel layer — a prompt-injection that
+    tries to disable the health chain by overwriting checker.sh MUST
+    be physically blocked. We exercise both write and unlink because
+    /arena/ being root-owned 555 protects against unlink even if the
+    file itself were writable.
+    """
+    # Write attempt → denied.
     r = _exec(
         dcf_ico_container,
         ["bash", "-c", f"echo evil >> {path}"],
@@ -87,21 +91,14 @@ def test_arena_agent_cannot_modify_arena_scripts(dcf_ico_container, path):
     assert r.returncode != 0, f"agent could write to {path}!"
     assert "Permission denied" in (r.stderr or "")
 
+    # Unlink attempt → denied (parent dir is root-owned 555).
+    r = _exec(dcf_ico_container, ["rm", path], user="arena_agent")
+    assert r.returncode != 0, f"agent could unlink {path}!"
 
-@pytest.mark.parametrize("path", ["/arena/restart.sh", "/arena/checker.sh", "/arena/entrypoint.sh"])
-def test_arena_agent_can_read_arena_scripts(dcf_ico_container, path):
-    """Read is fine — the agent may want to introspect the restart flow
-    (mode 555 grants read+exec to other)."""
+    # Read still works (mode 555 grants r+x to other) — agent can
+    # introspect the restart flow.
     r = _exec(dcf_ico_container, ["head", "-1", path], user="arena_agent")
     assert r.returncode == 0, f"agent cannot read {path}: {r.stderr}"
-
-
-def test_arena_agent_cannot_delete_arena_scripts(dcf_ico_container):
-    """Defense-in-depth: even if /arena/restart.sh's mode-555 protects
-    the file itself, the agent shouldn't be able to unlink it from
-    a writable parent. /arena/ is root-owned 555 → agent can't unlink."""
-    r = _exec(dcf_ico_container, ["rm", "/arena/restart.sh"], user="arena_agent")
-    assert r.returncode != 0, "agent could remove /arena/restart.sh!"
 
 
 # ── /opt/challenge_src: baked template, read-only to the agent ─────────

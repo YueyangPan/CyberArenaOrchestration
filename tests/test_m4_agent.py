@@ -28,25 +28,26 @@ from agents.registry import build as build_agent_manager
 from gamemgr.config import _expand_env_vars, load as load_game_config
 from models.agent import AgentConfig, AgentStatus
 from orchestrator.orchestrator import Orchestrator
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 
 # ── unit tests: ${VAR} expansion ───────────────────────────────────────
 
 
-def test_expand_env_vars_substitutes(monkeypatch):
+def test_expand_env_vars_three_branches(monkeypatch):
+    """Three behaviors in one test:
+      * `${FOO}` → substituted (recurses into list values)
+      * missing var → ValueError naming the var
+      * cyclic reference → ValueError mentioning 'cyclic'
+    """
     monkeypatch.setenv("FOO", "bar")
     out = _expand_env_vars({"k": "prefix-${FOO}-suffix", "lst": ["${FOO}"]})
     assert out == {"k": "prefix-bar-suffix", "lst": ["bar"]}
 
-
-def test_expand_env_vars_missing_fails_fast(monkeypatch):
     monkeypatch.delenv("DOES_NOT_EXIST", raising=False)
     with pytest.raises(ValueError, match="DOES_NOT_EXIST"):
         _expand_env_vars({"k": "${DOES_NOT_EXIST}"})
 
-
-def test_expand_env_vars_cycle_detected(monkeypatch):
     monkeypatch.setenv("A", "${B}")
     monkeypatch.setenv("B", "${A}")
     with pytest.raises(ValueError, match="cyclic"):

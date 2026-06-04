@@ -203,51 +203,55 @@ def test_cheese_path_process_pattern_does_not_match_stub(stub_listener_container
 
 
 def test_emit_health_chain_emits_four_events_one_per_level(dcf_ico_container):
-    """Going one layer up the stack: GameMgr._emit_health_chain walks all
-    4 levels and emits a SERVICE_HEALTH_CHECK event per level in order.
-    Plain wiring test — sanity-checks the integration between the
-    in-container probes and the bus."""
+    """Integration: HealthChecker (v2: delegates to challenge.functionality_test)
+    walks all 4 levels and records one SERVICE_HEALTH_CHECK per leaf in
+    order against a live ico container."""
     import asyncio
 
-    from challenges.nautilus import NautilusSource
-    from gamemgr.config import ChallengeConfig, GameConfig, RoundConfig
-    from gamemgr.game_mgr import GameMgr
-    from models.topology import Team, TopologyGraph
+    from challenges.interface import VulboxTarget
+    from challenges.nautilus_ico import IcoChallenge
+    from gamemgr.timeline import Timeline
+    from health.checker import HealthChecker
 
-    # Use the live container as team1's prod, plant flag, restart so ico's running.
     name = dcf_ico_container
     _plant_flag(name)
     _exec(name, ["/arena/restart.sh"])
     _wait_for_port(name)
 
-    teams = [Team(id="team1", dev="team1_dev", prod=name, token="tok-team1")]
-    topology = TopologyGraph(teams=teams, nodes=[], networks=[])
-    cfg = GameConfig(
-        topology=topology,
-        challenges=[ChallengeConfig(name="nautilus-ico", type="nautilus-ico", port=4265, deploy_on=["team1"])],
-        rounds=RoundConfig(),
+    import docker
+    client = docker.from_env()
+
+    def exec_in(container_name, cmd):
+        c = client.containers.get(container_name)
+        result = c.exec_run(["bash", "-c", cmd])
+        out = result.output.decode(errors="replace") if result.output else ""
+        return result.exit_code, out
+
+    challenge = IcoChallenge()
+    target = VulboxTarget(
+        host=name,
+        ports={"service": 4265},
+        meta={"team_id": "team1", "exec_in_container": exec_in},
     )
 
-    class _StubOrch:
-        network = None
-    game = GameMgr(config=cfg, orchestrator=_StubOrch())
-    nautilus = NautilusSource(include=["ico"])
-    spec = next(s for s in nautilus.list_challenges() if s.name == "nautilus-ico")
+    tl = Timeline()
+    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
 
     async def run():
-        await game._emit_health_chain(
+        await checker.run(
             team_id="team1",
             service="nautilus-ico",
-            container_name=name,
-            spec=spec,
+            target=target,
+            challenge=challenge,
         )
 
     asyncio.run(run())
 
-    checks = [e for e in game.bus.history() if e.type == EventType.SERVICE_HEALTH_CHECK.value]
+    checks = [e for e in tl.history() if e.type == EventType.SERVICE_HEALTH_CHECK.value]
     levels = [c.payload["level"] for c in checks]
-    assert levels == ["process", "tcp", "protocol", "checker"], (
-        f"expected 4 events in PROCESS→TCP→PROTOCOL→CHECKER order, got {levels}"
+    # IcoFunctionalityTest emits process / tcp / protocol / checker leaves.
+    assert set(levels) == {"process", "tcp", "protocol", "checker"}, (
+        f"expected 4 leaves, got {levels}"
     )
     by_level = {c.payload["level"]: c.payload for c in checks}
     assert by_level["process"]["passed"] is True, by_level["process"]

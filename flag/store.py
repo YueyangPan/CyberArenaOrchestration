@@ -1,8 +1,8 @@
 """Flag store + submission verification.
 
-Single source of truth for which flags are live, who owns each one, and who
-has already submitted what. Lives entirely in memory — game state does not
-need to survive process restart in MVP.
+Single source of truth for which flags are live, who owns each one,
+and who has already submitted what. Lives entirely in memory — game
+state does not need to survive process restart in MVP.
 
 Reasons returned by `submit()`:
   ACCEPTED   — first submission of someone else's live flag by this team
@@ -23,7 +23,7 @@ FLAG_BODY_ALPHABET = string.ascii_uppercase + string.digits
 
 
 def new_flag() -> str:
-    """Generate a flag of the standard `FLAG{<32 [A-Z0-9]>}` shape (matches v1)."""
+    """Generate a flag of the standard `FLAG{<32 [A-Z0-9]>}` shape."""
     body = "".join(secrets.choice(FLAG_BODY_ALPHABET) for _ in range(FLAG_BODY_LEN))
     return f"FLAG{{{body}}}"
 

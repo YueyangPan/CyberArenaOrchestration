@@ -110,5 +110,13 @@ class NetworkManager:
                     net.connect(container)
                     log.info("connected %s to %s", name, net_name)
                 elif not allow and attached:
-                    net.disconnect(container)
-                    log.info("disconnected %s from %s", name, net_name)
+                    # force=True asks docker to drop the endpoint even if
+                    # in-flight TCP state is messy. Doesn't actively kill
+                    # established TCP connections — kernel sockets can
+                    # linger until conntrack times out — but is strictly
+                    # more aggressive than the default. Per the DEFCON
+                    # live-run finding: existing TCP attack connections
+                    # may still drain a bit, but new connections fail
+                    # immediately, which is the design goal here.
+                    net.disconnect(container, force=True)
+                    log.info("disconnected %s from %s (force)", name, net_name)

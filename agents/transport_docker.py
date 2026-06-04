@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import shlex
+import time
 
 import docker
 
@@ -101,10 +102,16 @@ class DockerExecBackend(AgentTransport):
                 proc.stdin.close()
 
         timed_out = False
+        pkilled_at: float | None = None
         try:
             await asyncio.wait_for(proc.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             timed_out = True
+            # Stamp the moment the phase boundary hit this agent. The
+            # subprocess settling can lag by tens of seconds while
+            # docker exec propagates the signal — pkilled_at is what
+            # the panel should use for ordering, not the event ts.
+            pkilled_at = time.time()
             # SIGTERM the docker exec subprocess (may or may not propagate
             # to the in-container child; kill_process is the safety net).
             proc.terminate()
@@ -124,6 +131,7 @@ class DockerExecBackend(AgentTransport):
             stdout=b"".join(stdout_chunks),
             stderr=b"".join(stderr_chunks),
             timed_out=timed_out,
+            pkilled_at=pkilled_at,
         )
 
     def write_file(
@@ -171,14 +179,46 @@ class DockerExecBackend(AgentTransport):
             return f.read() if f else b""
 
     def kill_process(self, handle: AgentHandle, pattern: str) -> None:
-        """Best-effort pkill inside the container. Used after a
-        run_command timeout if SIGTERM didn't propagate through
-        docker exec to the actual claude child process."""
+        """Best-effort pkill inside the container. Used by teardown
+        paths (e.g. ClaudeAgentManager.kill) that don't have a specific
+        PID. Per-phase runners should use `kill_session` to avoid
+        racing concurrent claude instances in the same container."""
         try:
             c = self._client.containers.get(handle.name)
             c.exec_run(["pkill", "-KILL", "-f", pattern])
         except Exception:
             log.exception("kill_process failed on %s pattern=%r", handle.name, pattern)
+
+    def kill_session(self, handle: AgentHandle, session_marker: str) -> None:
+        """Read /tmp/cyberarena_phase_<marker>.pid (the PGID written by
+        phase_command's `setsid -w` wrapper) and SIGKILL the whole
+        process group. Reaps claude + any subprocesses it spawned
+        (exploits, background jobs, subshells) without touching a
+        sibling claude in another session.
+
+        Best-effort: missing/stale pidfile is a no-op. The pidfile is
+        removed after the kill so a re-entry under the same marker
+        starts fresh.
+        """
+        try:
+            c = self._client.containers.get(handle.name)
+            pidfile = f"/tmp/cyberarena_phase_{session_marker}.pid"
+            # `kill -KILL -- -<pgid>` signals every process in the group.
+            # The leading `--` and negative arg are the standard idiom
+            # for "this is a PGID, not a PID". Errors are swallowed:
+            # the process group may already be dead by the time we get
+            # here (clean claude exit between timeout decision and kill).
+            c.exec_run([
+                "sh", "-c",
+                f"pgid=$(cat {pidfile} 2>/dev/null); "
+                f"[ -n \"$pgid\" ] && kill -KILL -- -\"$pgid\" 2>/dev/null; "
+                f"rm -f {pidfile}",
+            ])
+        except Exception:
+            log.exception(
+                "kill_session failed on %s marker=%r",
+                handle.name, session_marker,
+            )
 
     # ── internals ───────────────────────────────────────────────────────
 

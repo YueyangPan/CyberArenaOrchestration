@@ -67,19 +67,16 @@ def test_attack_dispatch_nautilus_ico_uses_binary_protocol():
     assert "HIGH confidence" in p
 
 
-def test_attack_dispatch_unknown_falls_back_to_notes():
-    """An unrecognized service_name falls back to the notes recipe
-    (M5.6 back-compat: callers that don't pass service_name keep working)."""
-    p_unknown = build_attack_prompt(_cfg(), service_name="picoctf-foo")
+def test_attack_dispatch_unknown_and_none_fall_back_to_notes():
+    """Both None and an unrecognized service_name fall back to the notes
+    recipe (M5.6 back-compat: callers that don't pass service_name keep
+    working)."""
     p_notes = build_attack_prompt(_cfg(), service_name="notes")
-    # Same recipe shape (both reference LIST).
-    assert 'Send: "LIST' in p_unknown
+    p_unknown = build_attack_prompt(_cfg(), service_name="picoctf-foo")
+    p_none = build_attack_prompt(_cfg(), service_name=None)
+    for p in (p_unknown, p_none):
+        assert 'Send: "LIST' in p, "fallback path must reach the notes recipe"
     assert 'Send: "LIST' in p_notes
-
-
-def test_attack_dispatch_none_service_name_falls_back_to_notes():
-    p = build_attack_prompt(_cfg(), service_name=None)
-    assert 'Send: "LIST' in p
 
 
 # ── Defense dispatch ───────────────────────────────────────────────────

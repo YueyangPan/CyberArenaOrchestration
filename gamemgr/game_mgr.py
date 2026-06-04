@@ -19,14 +19,12 @@ from pathlib import Path
 import docker
 
 from orchestrator.orchestrator import Orchestrator
-from orchestrator.service import ContainerHandle, Service
+from orchestrator.handle import ContainerHandle
 
 from agents.prompts import build_attack_prompt, build_defense_prompt
-from challenges.notes import BuiltinNotesSource
-from challenges.registry import build as build_challenge
-from challenges.source import ChallengeSpec, FlagMechanism, HealthLevel
+from challenges.interface import Challenge, VulboxTarget
+from challenges.registry import build_challenge, health_interval_secs, initial_start
 from models.agent import AgentConfig
-import shlex
 from typing import Awaitable, Callable
 
 from .artifacts import ArtifactKind, ArtifactStore
@@ -39,9 +37,13 @@ from .artifacts import ArtifactKind, ArtifactStore
 PhaseKickoffHandler = Callable[[str, AgentConfig, int, str, bool], Awaitable[None]]
 
 from .config import ChallengeConfig, GameConfig
-from .events import EventBus, EventType, FileSink, new_event, new_run_dir
-from .flag import FlagStore, SubmitResult, new_flag
+from .events import EventType, new_event, new_run_dir
 from .round import Phase, RoundLoop
+from .timeline import Timeline
+
+from flag import FlagServer, SubmitResult
+from health.checker import HealthChecker, leaves
+from health.poller import HealthPoller, build_targets
 
 log = logging.getLogger(__name__)
 
@@ -50,26 +52,31 @@ class GameMgr:
     def __init__(self, config: GameConfig, orchestrator: Orchestrator) -> None:
         self.config = config
         self.orchestrator = orchestrator
-        self.bus = EventBus()
+        # Timeline replaces the legacy EventBus. It is observation-only:
+        # FileSink + WebSocket consume; nothing internal subscribes.
+        # Internal control flow (phase transitions, deploy_complete handling,
+        # dry-run gating) goes through direct method calls on GameMgr.
+        self.timeline = Timeline()
         self.round_loop: RoundLoop | None = None
         self.run_dir: Path | None = None
-        self._file_sink: FileSink | None = None
-        self._deployed: list[tuple[Service, list[ContainerHandle]]] = []
-        self.flags = FlagStore()
-        # (team_id, service_name) -> Service instance, populated by deploy_challenges
-        # so plant_initial_flags can find the right adapter per (team, service).
-        # Only SERVICE_PROTOCOL challenges (notes) populate this map; FILE_AT_PATH
-        # challenges (nautilus-ico) ship the service as part of the image and
-        # plant flags via direct docker-exec writes — they go in _spec_by_owner.
-        self._service_by_owner: dict[tuple[str, str], Service] = {}
-        # (team_id, service_name) -> ChallengeSpec, populated by deploy_challenges
-        # for FILE_AT_PATH challenges. plant_flags walks this for direct
-        # flag-file writes; emit_setup_events emits SERVICE_DEPLOYED for them.
-        self._spec_by_owner: dict[tuple[str, str], ChallengeSpec] = {}
-        # Container names that hosted FILE_AT_PATH challenge deploys — kept
-        # so emit_setup_events can emit SERVICE_DEPLOYED uniformly.
-        self._deployed_file_at_path: list[tuple[ChallengeSpec, list[str]]] = []
-        self._last_planted_round: int = -1
+        # (team_id, service_name) -> Challenge instance. Populated by
+        # deploy_challenges; read by FlagServer (plant), HealthChecker
+        # (functionality_test), restart_service (restart_handler) and
+        # emit_setup_events. Mutable dict — passed by reference to the
+        # facilities at construction so they see deploy mutations.
+        self._challenge_by_owner: dict[tuple[str, str], Challenge] = {}
+        # FlagServer owns all flag mechanics (planting, rotation, submission
+        # verification). GameMgr keeps the public method shapes
+        # (plant_initial_flags / plant_flags / submit_flag / flags) but
+        # delegates the work. Built here because the dicts above are passed
+        # by reference — deploy_challenges populates them later, and the
+        # FlagServer sees those mutations naturally.
+        self.flag_server = FlagServer(
+            self.timeline,
+            challenge_by_owner=self._challenge_by_owner,
+            target_factory=self.target_for,
+            status_resolver=self.status,
+        )
         # token -> team_id, populated from config; lookup for API auth.
         self._token_to_team: dict[str, str] = {
             t.token: t.id for t in config.topology.teams if t.token
@@ -114,6 +121,12 @@ class GameMgr:
         # Idempotency keys per round so a re-fire of PHASE_CHANGE doesn't
         # spawn duplicate work.
         self._defense_kickoff_done: set[tuple[int, str, str]] = set()
+        # Per (round_id, team_id, service) timestamp of DEFENSE_KICKOFF.
+        # `record_deploy_complete` reads this to compute duration_ms
+        # server-side — the agent's self-reported value over MCP was
+        # unreliable (observed dur=196ms / 175ms in live runs where the
+        # agent had actually worked for tens of seconds).
+        self._defense_kickoff_ts: dict[tuple[int, str, str], float] = {}
         self._attack_kickoff_done: set[tuple[int, str]] = set()
         # Tracks team_ids that have already seen at least one kickoff.
         # Used to set the `is_first` flag on subsequent kickoffs — first
@@ -127,186 +140,88 @@ class GameMgr:
         # team×round directory; GameMgr only owns end-of-round service-log
         # snapshots (docker logs).
         self.artifacts: ArtifactStore | None = None
-        # Defense-phase early-end tracking. On every DEFENSE_KICKOFF we add
-        # (team_id, service) to the set for that round; DEPLOY_COMPLETE
+        # Defense-phase early-end tracking. On every defense kickoff we add
+        # (team_id, service) to the set for that round; on_deploy_complete
         # drains it; when the set is empty the round loop is signalled to
         # cut DEFENSE short without waiting for the timer.
         self._defense_pending: dict[int, set[tuple[str, str]]] = {}
-        # Subscribe at construction time (not start()): the subscribers
-        # have no file-sink dependency and tests routinely drive
-        # PHASE_CHANGE events directly onto the bus without the round loop.
-        # ORDER MATTERS — `bus.publish` awaits each subscriber sequentially,
-        # so anything subscribed *after* `_on_defense_kickoff` gets blocked
-        # for the entire DEFENSE phase (the kickoff awaits asyncio.gather
-        # over all team handlers, which awaits run_phase). Keep rotation
-        # FIRST so /flag flips at DEFENSE entry, not at DEFENSE exit.
-        #   _on_persist_service_logs     — ROUND_STOP only; phase-independent
-        #   _on_defense_end_health_check — fires on PHASE_CHANGE → ATTACK
-        #   _on_rotation_event           — rotate /flag at DEFENSE entry (MUST be before kickoff)
-        #   _on_defense_kickoff          — long-running; only on DEFENSE
-        #   _on_attack_kickoff           — long-running; only on ATTACK
-        #   _on_deploy_complete          — drains _defense_pending, may
-        #                                  signal RoundLoop early-end
-        self.bus.subscribe(self._on_persist_service_logs)
-        self.bus.subscribe(self._on_defense_end_health_check)
-        self.bus.subscribe(self._on_rotation_event)
-        self.bus.subscribe(self._on_defense_kickoff)
-        self.bus.subscribe(self._on_attack_kickoff)
-        self.bus.subscribe(self._on_deploy_complete)
+        # Per-team AGENT_READY gating for dry-run. Populated by
+        # dry_run_all_agents at start; set by record_agent_ready when MCP
+        # report_ready arrives. Replaces the old transient bus subscriber.
+        self._ready_events: dict[str, asyncio.Event] = {}
+        # HealthChecker + HealthPoller are constructed lazily in start()
+        # because they bind to the timeline and need the running event
+        # loop for their tasks.
+        self.health_checker: HealthChecker | None = None
+        self.health_poller: HealthPoller | None = None
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
     def deploy_challenges(self) -> None:
-        """Install + start every challenge on its target containers.
+        """Install + first-start every challenge on its target containers.
         Runs synchronously before the round loop starts.
 
-        Two deploy paths depending on `spec.flag_mechanism`:
-        - SERVICE_PROTOCOL (e.g. notes): legacy Service-based install/start.
-          The Service class ships the binary into the container at deploy
-          time and plant_flag delivers the flag via the service's own
-          protocol (e.g. PUT for notes).
-        - FILE_AT_PATH (e.g. nautilus-ico): the service is already baked
-          into the image; the entrypoint built it and started sshd. We
-          just trigger `spec.metadata.restart_cmd` so the service binary
-          is running with the (initial) source. The flag is written
-          directly as a file by plant_flags.
+        v2 deploy is uniform across challenges:
+          1. Instantiate the Challenge via the registry.
+          2. Build a privileged VulboxTarget per team via `target_for`.
+          3. Invoke `registry.initial_start` — per-challenge dispatch
+             that handles the once-per-game setup (notes ships its
+             python daemon + spawns; ico kicks /arena/restart.sh;
+             image-baked challenges with a self-starting entrypoint
+             leave the hook unregistered for a no-op).
+          4. Register (team, service) -> Challenge in
+             `_challenge_by_owner` so FlagServer / HealthChecker /
+             restart_service can dispatch later.
         """
-
-        team_to_prod = {t.id: t.prod for t in self.config.topology.teams}
-
         for chcfg in self.config.challenges:
-            spec = self._resolve_spec(chcfg.name)
-            mechanism = spec.flag_mechanism if spec is not None else FlagMechanism.SERVICE_PROTOCOL
-
-            if mechanism == FlagMechanism.FILE_AT_PATH:
-                # Image-bundled service. Trigger the framework restart_cmd
-                # (e.g. /arena/restart.sh) so the service binary is running.
-                restart_cmd = (spec.metadata or {}).get("restart_cmd")
-                cnames: list[str] = []
-                for team_id in chcfg.deploy_on:
-                    cname = team_to_prod.get(team_id)
-                    if cname is None:
-                        raise KeyError(f"challenge {chcfg.name!r}: unknown team_id {team_id!r}")
-                    log.info(
-                        "deploying challenge %s -> %s (FILE_AT_PATH, port %d)",
-                        chcfg.name, cname, chcfg.port,
-                    )
-                    if restart_cmd:
-                        rc, out = self._exec_in_container(cname, restart_cmd)
-                        if rc != 0:
-                            log.warning(
-                                "initial restart_cmd failed on %s rc=%d out=%r",
-                                cname, rc, out[-200:] if out else "",
-                            )
-                    self._spec_by_owner[(team_id, chcfg.name)] = spec
-                    cnames.append(cname)
-                self._deployed_file_at_path.append((spec, cnames))
-                continue
-
-            # SERVICE_PROTOCOL path (legacy notes-style adapter).
-            service = build_challenge(chcfg.type, port=chcfg.port)
-            handles: list[ContainerHandle] = []
+            challenge = build_challenge(chcfg.name)
             for team_id in chcfg.deploy_on:
-                cname = team_to_prod.get(team_id)
-                if cname is None:
-                    raise KeyError(f"challenge {chcfg.name!r}: unknown team_id {team_id!r}")
-                handle = self.handle_for(cname)
-                log.info("deploying challenge %s -> %s (port %d)", chcfg.name, cname, chcfg.port)
-                service.install(handle)
-                service.start(handle)
-                handles.append(handle)
-                self._service_by_owner[(team_id, service.name)] = service
-            self._deployed.append((service, handles))
+                target = self.target_for(team_id, challenge)
+                log.info(
+                    "deploying challenge %s -> team=%s host=%s port=%d",
+                    chcfg.name, team_id, target.host, chcfg.port,
+                )
+                initial_start(challenge, target, self._exec_in_container)
+                self._challenge_by_owner[(team_id, chcfg.name)] = challenge
+
+    # ── flag mechanics — thin delegates to FlagServer ──────────────────
+
+    @property
+    def flags(self):
+        """Backward-compat access to the FlagStore. Callers that need to
+        introspect / mutate state directly (tests, scripts) go through
+        `game.flags.planted` / `.submissions` / `.plant()` etc. The
+        real owner is `self.flag_server.store`."""
+        return self.flag_server.store
 
     def plant_initial_flags(self) -> list[tuple[str, str, str]]:
-        """Pre-game plant (round_id=0). Same as `plant_flags(0)`; kept under
-        its own name because main.py and the M5 tests call it before the
-        round loop starts."""
-        return self.plant_flags(round_id=0)
+        return self.flag_server.plant_initial_flags()
 
     def plant_flags(self, round_id: int) -> list[tuple[str, str, str]]:
-        """Re-plant one fresh flag per (team, deployed service).
-
-        Called once at pre-game (round_id=0) by main.py, then again at the
-        start of every DEFENSE phase by the rotation subscriber installed in
-        `start()`. `FlagStore.plant()` drops the prior flag from the inverted
-        index so it can no longer be submitted — rotation invalidates stale
-        flags immediately, by construction.
-
-        Returns the list of (team_id, service_name, flag) planted (handy
-        for tests). Per-round rotation is the M5.5 addition; the design
-        kept this one-shot in M5 but the store API was already shaped for it.
-        """
-        planted: list[tuple[str, str, str]] = []
-        team_to_prod = {t.id: t.prod for t in self.config.topology.teams}
-
-        # SERVICE_PROTOCOL plants (notes: PUT over its own TCP socket).
-        for (team_id, service_name), service in self._service_by_owner.items():
-            cname = team_to_prod[team_id]
-            handle = self.handle_for(cname)
-            flag = new_flag()
-            log.info("planting flag on %s/%s (round=%d, SERVICE_PROTOCOL)", team_id, service_name, round_id)
-            service.plant_flag(handle, flag)
-            self.flags.plant(team_id, service_name, flag)
-            planted.append((team_id, service_name, flag))
-
-        # FILE_AT_PATH plants (nautilus-ico: docker-exec write to /flag).
-        for (team_id, service_name), spec in self._spec_by_owner.items():
-            cname = team_to_prod[team_id]
-            flag = new_flag()
-            flag_path = (spec.metadata or {}).get("flag_path", "/flag")
-            log.info(
-                "planting flag on %s/%s -> %s (round=%d, FILE_AT_PATH)",
-                team_id, service_name, flag_path, round_id,
-            )
-            self._plant_file_at_path(cname, flag_path, flag)
-            self.flags.plant(team_id, service_name, flag)
-            planted.append((team_id, service_name, flag))
-
-        self._last_planted_round = round_id
-        return planted
-
-    def _plant_file_at_path(self, container_name: str, flag_path: str, flag: str) -> None:
-        """Write `flag` (no trailing newline) to `flag_path` inside the
-        container as root, mode 644. Raises if the write fails — a missing
-        flag would silently break every CHECKER probe (ico reads /flag on
-        CONNECT) and we want that surfaced loudly at deploy time.
-        """
-        # shlex.quote handles any quote/dollar/backtick in `flag` safely.
-        cmd = (
-            f"sh -c 'printf %s {shlex.quote(flag)} > {shlex.quote(flag_path)} "
-            f"&& chmod 644 {shlex.quote(flag_path)}'"
-        )
-        rc, out = self._exec_in_container(container_name, cmd)
-        if rc != 0:
-            raise RuntimeError(
-                f"FILE_AT_PATH plant failed on {container_name}:{flag_path}: "
-                f"rc={rc}, out={out[-200:]!r}"
-            )
+        return self.flag_server.plant_flags(round_id=round_id)
 
     def teardown_challenges(self) -> None:
-        for service, handles in self._deployed:
-            for h in handles:
-                try:
-                    service.stop(h)
-                except Exception:
-                    log.exception("stop failed for %s on %s", service.name, h.name)
-        self._deployed.clear()
+        """No-op in v2: containers come down with `orchestrator.teardown()`
+        which removes the prod images entirely; per-challenge stop hooks
+        aren't needed. Kept as a method for symmetry with deploy_challenges
+        and to give future challenges (e.g. ones writing to a shared volume)
+        a place to clean up if needed."""
+        self._challenge_by_owner.clear()
 
     # ── round loop ──────────────────────────────────────────────────────
 
     async def start(self, run_dir: Path | None = None) -> None:
         self.run_dir = run_dir or new_run_dir()
-        self._file_sink = FileSink(self.run_dir / "events.jsonl")
-        self.bus.subscribe(self._file_sink)
+        events_path = self.run_dir / "events.jsonl"
+        self.timeline.attach_file_sink(events_path)
         # Artifact persistence under the same run_dir as events.jsonl.
         # Each ArtifactKind gets a reserved subdir (created on construction);
         # api-logs / agent-logs / service-logs get filled as the round loop
         # runs. See gamemgr/artifacts.py for the layout.
         self.artifacts = ArtifactStore(self.run_dir)
-        log.info("game start; events -> %s ; artifacts -> %s", self._file_sink.path, self.artifacts.root)
+        log.info("game start; events -> %s ; artifacts -> %s", events_path, self.artifacts.root)
 
-        await self.emit_setup_events()
+        self.emit_setup_events()
 
         # Persistent-memory v1: one-shot install across all teams BEFORE
         # the round loop ticks. Parallel via asyncio.gather so a 10s npm
@@ -315,72 +230,62 @@ class GameMgr:
         await self.install_all_agents()
 
         # Pre-R1 dry-run readiness probe: spawn a tiny agent run per
-        # team asking it to call `report_ready` via MCP. Watch the bus
-        # for AGENT_READY; emit DRY_RUN_OK or DRY_RUN_FAILED per team.
-        # Best-effort — failures don't halt the round loop.
+        # team asking it to call `report_ready` via MCP. Per-team
+        # asyncio.Event gates the wait; DRY_RUN_OK / FAILED recorded
+        # per outcome. Best-effort — failures don't halt the round loop.
         await self.dry_run_all_agents()
 
-        # NB: _on_rotation_event, _on_defense_kickoff and friends are all
-        # subscribed in __init__ — rotation BEFORE kickoff so /flag flips
-        # at DEFENSE entry, not at DEFENSE exit.
+        # Build HealthChecker + HealthPoller now that the event loop is
+        # running. The poller doesn't start any tasks until enter_attack_phase.
+        self._build_health_facility()
 
-        self.round_loop = RoundLoop(self.bus, self.orchestrator.network, self.config.rounds)
+        # RoundLoop calls back into GameMgr at each phase / round boundary
+        # (enter_defense_phase, enter_attack_phase, on_round_start,
+        # on_round_stop, on_game_end) so dispatch happens via methods, not
+        # event subscriptions.
+        self.round_loop = RoundLoop(self, self.orchestrator.network, self.config.rounds)
         await self.round_loop.run()
 
-    async def emit_setup_events(self) -> None:
-        """Publish one SERVICE_DEPLOYED per challenge-on-container and one
-        FLAG_PLANTED per (team, service) at round_id=0.
+    def _build_health_facility(self) -> None:
+        """Construct HealthChecker + HealthPoller. Pulled out of start()
+        so tests can build them against an in-memory GameMgr without
+        driving the full round loop."""
+        self.health_checker = HealthChecker(
+            self.timeline,
+            status_resolver=self.status,
+        )
+        teams_by_id = {t.id: t for t in self.config.topology.teams}
+        targets = build_targets(
+            challenges=self.config.challenges,
+            teams_by_id=teams_by_id,
+            challenge_by_name=build_challenge,
+            target_factory=self.target_for,
+            interval_lookup=health_interval_secs,
+        )
+        self.health_poller = HealthPoller(self.health_checker, targets)
+
+    def emit_setup_events(self) -> None:
+        """Record one SERVICE_DEPLOYED per (team, service) deployment and
+        one FLAG_PLANTED per planted (team, service) at round_id=0.
 
         Called from start() during normal game lifecycle, but also exposed
         for demos / panel screenshots that don't drive the round loop —
         without this they'd see an empty event stream even though the
         underlying state (deployed services, planted flags) is populated.
         Flag strings are deliberately omitted from FLAG_PLANTED payloads
-        (the bus is broadcast to public observers)."""
-        for service, handles in self._deployed:
-            for h in handles:
-                await self.bus.publish(
-                    new_event(
-                        EventType.SERVICE_DEPLOYED,
-                        payload={"service": service.name, "container": h.name, "port": service.port},
-                    )
-                )
-        for spec, cnames in self._deployed_file_at_path:
-            for cn in cnames:
-                await self.bus.publish(
-                    new_event(
-                        EventType.SERVICE_DEPLOYED,
-                        payload={"service": spec.name, "container": cn, "port": spec.port},
-                    )
-                )
-        for (team_id, service_name) in self.flags.planted.keys():
-            await self.bus.publish(
-                new_event(
-                    EventType.FLAG_PLANTED,
-                    team_id=team_id,
-                    round_id=0,
-                    payload={"service": service_name},
-                )
+        (the timeline is broadcast to public observers)."""
+        team_to_prod = {t.id: t.prod for t in self.config.topology.teams}
+        for (team_id, service_name), challenge in self._challenge_by_owner.items():
+            self.timeline.record(
+                EventType.SERVICE_DEPLOYED,
+                team_id=team_id,
+                payload={
+                    "service": service_name,
+                    "container": team_to_prod.get(team_id, ""),
+                    "port": next(iter(challenge.vulbox.exposed_ports.values()), 0),
+                },
             )
-
-    async def _on_rotation_event(self, event) -> None:
-        """Subscriber: when PHASE_CHANGE → DEFENSE fires, rotate all flags."""
-        if event.type != EventType.PHASE_CHANGE.value:
-            return
-        if event.phase != Phase.DEFENSE.value:
-            return
-        if event.round_id == self._last_planted_round:
-            return  # already planted for this round (defensive against re-fire)
-        planted = self.plant_flags(round_id=event.round_id)
-        for team_id, service_name, _flag in planted:
-            await self.bus.publish(
-                new_event(
-                    EventType.FLAG_PLANTED,
-                    team_id=team_id,
-                    round_id=event.round_id,
-                    payload={"service": service_name},
-                )
-            )
+        self.flag_server.emit_planted_setup()
 
     # ── Persistent-memory v1: pre-loop install hook ─────────────────────
 
@@ -457,18 +362,17 @@ class GameMgr:
     ) -> None:
         """Pre-R1 readiness probe across every team in parallel.
 
-        For each team: emit DRY_RUN_START, invoke the registered handler
+        For each team: record DRY_RUN_START, invoke the registered handler
         (which runs a tiny claude phase asking the agent to call
-        `mcp__cyberarena__report_ready`), then watch the bus for an
-        AGENT_READY event for that team. If AGENT_READY arrives within
-        `timeout_secs`, emit DRY_RUN_OK; otherwise (timeout / handler
-        raised / agent process crashed) emit DRY_RUN_FAILED with a brief
-        reason in the payload.
+        `mcp__cyberarena__report_ready`), then check whether the
+        per-team `_ready_events` flag was set by `record_agent_ready`.
+        If yes, record DRY_RUN_OK; otherwise (timeout / handler raised /
+        agent process crashed) record DRY_RUN_FAILED with a brief reason.
 
         Best-effort: a team that fails dry run still gets to try R1
         (its kickoff will likely also fail with a cleaner AGENT_FAILED).
-        We don't halt — we just surface the failure on the bus so the
-        operator sees it on the panel before the round loop ticks.
+        We don't halt — we just surface the failure on the timeline so
+        the operator sees it on the panel before the round loop ticks.
 
         `timeout_secs` default is the coordinator-side wait; it should
         be slightly larger than main.py's `DRY_RUN_AGENT_TIMEOUT_SECS`
@@ -482,49 +386,40 @@ class GameMgr:
         handler = self._dry_run_handler
         teams = list(self.config.topology.teams)
 
-        # Per-team AGENT_READY watcher.
-        ready_events: dict[str, asyncio.Event] = {t.id: asyncio.Event() for t in teams}
+        # Reset per-team gates so a previous dry-run can't satisfy this one.
+        for t in teams:
+            self._ready_events[t.id] = asyncio.Event()
 
-        async def _watch(event):
-            if event.type == EventType.AGENT_READY.value:
-                tid = event.team_id
-                if tid in ready_events:
-                    ready_events[tid].set()
+        async def _one(team_id: str) -> None:
+            self.timeline.record(
+                EventType.DRY_RUN_START,
+                team_id=team_id,
+                payload={"team_id": team_id, "ts": time.time()},
+            )
+            handler_error: str | None = None
+            try:
+                await asyncio.wait_for(handler(team_id), timeout=timeout_secs)
+            except asyncio.TimeoutError:
+                handler_error = f"handler exceeded {timeout_secs}s"
+            except Exception as e:
+                log.exception("dry_run: handler raised for %s", team_id)
+                handler_error = f"{type(e).__name__}: {e}"[:200]
 
-        self.bus.subscribe(_watch)
-        try:
-            async def _one(team_id: str) -> None:
-                await self.bus.publish(new_event(
-                    EventType.DRY_RUN_START,
+            if self._ready_events[team_id].is_set():
+                self.timeline.record(
+                    EventType.DRY_RUN_OK,
                     team_id=team_id,
                     payload={"team_id": team_id, "ts": time.time()},
-                ))
-                handler_error: str | None = None
-                try:
-                    await asyncio.wait_for(handler(team_id), timeout=timeout_secs)
-                except asyncio.TimeoutError:
-                    handler_error = f"handler exceeded {timeout_secs}s"
-                except Exception as e:
-                    log.exception("dry_run: handler raised for %s", team_id)
-                    handler_error = f"{type(e).__name__}: {e}"[:200]
+                )
+            else:
+                reason = handler_error or "AGENT_READY not received"
+                self.timeline.record(
+                    EventType.DRY_RUN_FAILED,
+                    team_id=team_id,
+                    payload={"team_id": team_id, "error": reason, "ts": time.time()},
+                )
 
-                if ready_events[team_id].is_set():
-                    await self.bus.publish(new_event(
-                        EventType.DRY_RUN_OK,
-                        team_id=team_id,
-                        payload={"team_id": team_id, "ts": time.time()},
-                    ))
-                else:
-                    reason = handler_error or "AGENT_READY not received"
-                    await self.bus.publish(new_event(
-                        EventType.DRY_RUN_FAILED,
-                        team_id=team_id,
-                        payload={"team_id": team_id, "error": reason, "ts": time.time()},
-                    ))
-
-            await asyncio.gather(*(_one(t.id) for t in teams))
-        finally:
-            self.bus.unsubscribe(_watch)
+        await asyncio.gather(*(_one(t.id) for t in teams))
 
     # ── DEFCON: defense kickoff on PHASE_CHANGE → DEFENSE ───────────────
 
@@ -551,53 +446,43 @@ class GameMgr:
         """
         self._defense_kickoff_handler = handler
 
-    async def _on_defense_kickoff(self, event) -> None:
-        """Subscriber: on every DEFENSE entry, emit DEFENSE_KICKOFF per
-        (team, defense-capable service) and invoke the registered handler.
+    def _spawn_defense_kickoff(self, round_id: int) -> list[asyncio.Task]:
+        """Per-team-per-service defense kickoff for one DEFENSE entry.
 
-        A challenge is "defense-capable" iff its spec carries a restart_cmd
-        in metadata (i.e. it can be rebuilt in-place). Toy challenges
-        without that — notes today — don't get a defense agent; this keeps
-        the kickoff signal honest with respect to what the framework can
-        actually defend.
+        Replaces the old `_on_defense_kickoff` bus subscriber. Records
+        DEFENSE_KICKOFF, populates `_defense_pending` for early-end
+        tracking, and spawns per-team handler tasks (fire-and-forget;
+        returned for tests to await).
+
+        A challenge is "defense-capable" iff its Challenge subclass
+        exposes a `restart_handler` (not None). Attack-only challenges
+        like notes leave it None; we skip them here so kickoff signals
+        only fire for things the framework can actually defend.
         """
-        if event.type != EventType.PHASE_CHANGE.value:
-            return
-        if event.phase != Phase.DEFENSE.value:
-            return
-
-        # Collect handler invocations, then run them concurrently so per-team
-        # work doesn't serialize across teams. is_first is decided AT
-        # collection time (sync) so the prompt-builder inside
-        # defense_agent_config_for emits a short cue when the team has
-        # already been briefed earlier in the game.
-        pending: list[tuple[str, str, AgentConfig, bool]] = []
+        kickoffs: list[tuple[str, str, AgentConfig, bool]] = []
         for chcfg in self.config.challenges:
-            spec = self._resolve_spec(chcfg.name)
-            if spec is None:
+            challenge = build_challenge(chcfg.name)
+            if challenge.restart_handler is None:
                 continue
-            if not (spec.metadata or {}).get("restart_cmd"):
-                continue  # not defense-capable
 
             for team_id in chcfg.deploy_on:
-                key = (event.round_id, team_id, chcfg.name)
+                key = (round_id, team_id, chcfg.name)
                 if key in self._defense_kickoff_done:
                     continue
                 self._defense_kickoff_done.add(key)
+                self._defense_kickoff_ts[key] = time.time()
 
-                await self.bus.publish(
-                    new_event(
-                        EventType.DEFENSE_KICKOFF,
-                        team_id=team_id,
-                        round_id=event.round_id,
-                        phase=event.phase,
-                        payload={"service": chcfg.name},
-                    )
+                self.timeline.record(
+                    EventType.DEFENSE_KICKOFF,
+                    team_id=team_id,
+                    round_id=round_id,
+                    phase=Phase.DEFENSE.value,
+                    payload={"service": chcfg.name},
                 )
-                # Track expected DEPLOY_COMPLETE. _on_deploy_complete drains
-                # this; when empty for the current round we cut the
-                # DEFENSE timer short.
-                self._defense_pending.setdefault(event.round_id, set()).add(
+                # Track expected DEPLOY_COMPLETE; on_deploy_complete
+                # drains this. When empty for the current round we cut
+                # the DEFENSE timer short.
+                self._defense_pending.setdefault(round_id, set()).add(
                     (team_id, chcfg.name)
                 )
 
@@ -619,20 +504,26 @@ class GameMgr:
                         team_id, chcfg.name,
                     )
                     continue
-                pending.append((team_id, chcfg.name, cfg, is_first))
+                kickoffs.append((team_id, chcfg.name, cfg, is_first))
 
-        if pending and self._defense_kickoff_handler is not None:
-            handler = self._defense_kickoff_handler
-            round_id = event.round_id
-            async def _safe(team_id: str, service_name: str, cfg: AgentConfig, is_first: bool) -> None:
-                try:
-                    await handler(team_id, cfg, round_id, "defense", is_first)
-                except Exception:
-                    log.exception(
-                        "defense kickoff handler raised for (%s, %s); skipping",
-                        team_id, service_name,
-                    )
-            await asyncio.gather(*(_safe(t, s, c, f) for t, s, c, f in pending))
+        if not kickoffs or self._defense_kickoff_handler is None:
+            return []
+
+        handler = self._defense_kickoff_handler
+
+        async def _safe(team_id: str, service_name: str, cfg: AgentConfig, is_first: bool) -> None:
+            try:
+                await handler(team_id, cfg, round_id, "defense", is_first)
+            except Exception:
+                log.exception(
+                    "defense kickoff handler raised for (%s, %s); skipping",
+                    team_id, service_name,
+                )
+
+        return [
+            asyncio.create_task(_safe(t, s, c, f))
+            for t, s, c, f in kickoffs
+        ]
 
     # ── DEFCON: attack kickoff on PHASE_CHANGE → ATTACK ─────────────────
 
@@ -648,35 +539,31 @@ class GameMgr:
         """
         self._attack_kickoff_handler = handler
 
-    async def _on_attack_kickoff(self, event) -> None:
-        """Subscriber: on every ATTACK entry, emit ATTACK_KICKOFF per team
-        and invoke the registered handler.
+    def _spawn_attack_kickoff(self, round_id: int) -> list[asyncio.Task]:
+        """Per-team attack kickoff for one ATTACK entry.
 
-        Per team (not per-team-per-service) because the M5.6 attack prompt
-        walks every opposing prod from a single install. Idempotent per
-        (round_id, team_id) so a re-fire of PHASE_CHANGE in the same round
-        doesn't double-spawn.
+        Replaces the old `_on_attack_kickoff` bus subscriber. Records
+        ATTACK_KICKOFF and spawns per-team handler tasks (fire-and-forget;
+        returned for tests to await).
+
+        Per team (not per-team-per-service) because the M5.6 attack
+        prompt walks every opposing prod from a single install.
+        Idempotent per (round_id, team_id) so a re-entry in the same
+        round doesn't double-spawn.
         """
-        if event.type != EventType.PHASE_CHANGE.value:
-            return
-        if event.phase != Phase.ATTACK.value:
-            return
-
-        pending: list[tuple[str, AgentConfig, bool]] = []
+        kickoffs: list[tuple[str, AgentConfig, bool]] = []
         for team in self.config.topology.teams:
-            key = (event.round_id, team.id)
+            key = (round_id, team.id)
             if key in self._attack_kickoff_done:
                 continue
             self._attack_kickoff_done.add(key)
 
-            await self.bus.publish(
-                new_event(
-                    EventType.ATTACK_KICKOFF,
-                    team_id=team.id,
-                    round_id=event.round_id,
-                    phase=event.phase,
-                    payload={},
-                )
+            self.timeline.record(
+                EventType.ATTACK_KICKOFF,
+                team_id=team.id,
+                round_id=round_id,
+                phase=Phase.ATTACK.value,
+                payload={},
             )
 
             if self._attack_kickoff_handler is None:
@@ -690,37 +577,28 @@ class GameMgr:
             except Exception:
                 log.exception("agent_config_for failed for %s; skipping attack kickoff", team.id)
                 continue
-            pending.append((team.id, cfg, is_first))
+            kickoffs.append((team.id, cfg, is_first))
 
-        if pending and self._attack_kickoff_handler is not None:
-            handler = self._attack_kickoff_handler
-            round_id = event.round_id
-            async def _safe(team_id: str, cfg: AgentConfig, is_first: bool) -> None:
-                try:
-                    await handler(team_id, cfg, round_id, "attack", is_first)
-                except Exception:
-                    log.exception(
-                        "attack kickoff handler raised for %s; skipping",
-                        team_id,
-                    )
-            await asyncio.gather(*(_safe(t, c, f) for t, c, f in pending))
+        if not kickoffs or self._attack_kickoff_handler is None:
+            return []
+
+        handler = self._attack_kickoff_handler
+
+        async def _safe(team_id: str, cfg: AgentConfig, is_first: bool) -> None:
+            try:
+                await handler(team_id, cfg, round_id, "attack", is_first)
+            except Exception:
+                log.exception(
+                    "attack kickoff handler raised for %s; skipping",
+                    team_id,
+                )
+
+        return [
+            asyncio.create_task(_safe(t, c, f))
+            for t, c, f in kickoffs
+        ]
 
     # ── DEFCON: end-of-round service-log snapshots ──────────────────────
-
-    async def _on_persist_service_logs(self, event) -> None:
-        """At ROUND_STOP, snapshot every team's prod container `docker logs`
-        to service-logs.
-
-        Per-phase agent transcripts (stream-{phase}.jsonl / agent-{phase}.log
-        / metadata-{phase}.json) are written directly by
-        ClaudeAgentManager.run_phase into the team×round artifact dir — no
-        GameMgr subscriber needed for that path.
-        """
-        if self.artifacts is None:
-            return
-        if event.type != EventType.ROUND_STOP.value:
-            return
-        await self._persist_service_logs(event.round_id)
 
     async def _persist_service_logs(self, round_id: int) -> None:
         """Snapshot `docker logs <team{N}_prod>` for every team. End-of-round
@@ -753,81 +631,77 @@ class GameMgr:
                     team.id, round_id,
                 )
 
-    # ── DEFCON: defense-phase early-end + end-of-defense health check ───
+    # ── DEFCON: defense-phase early-end ─────────────────────────────────
 
-    async def _on_deploy_complete(self, event) -> None:
-        """When an agent self-reports DEPLOY_COMPLETE for the current round,
-        drain `_defense_pending`. If every defense-capable (team, service)
-        is done, tell the round loop to cut the DEFENSE timer short.
+    # Note: end-of-defense health check is now driven by HealthPoller on
+    # ATTACK entry (see enter_attack_phase). The legacy
+    # `_on_defense_end_health_check` subscriber is removed alongside the
+    # event-bus migration.
 
-        Note: DEPLOY_COMPLETE arrives via MCP from the agent (see
-        gamemgr/mcp_server.py:report_deploy_complete). The host doesn't
-        cross-check that the agent actually succeeded — it trusts the
-        report. The end-of-defense health check in `_on_defense_end_health_check`
-        is the host's independent verification.
+    # ── RoundLoop dispatch — direct method calls, no pub-sub ────────────
+
+    def on_round_start(self, round_id: int, phase: str) -> None:
+        """RoundLoop callback: record ROUND_START. No side effects."""
+        self.timeline.record(
+            EventType.ROUND_START, round_id=round_id, phase=phase,
+        )
+
+    def enter_defense_phase(self, round_id: int) -> list[asyncio.Task]:
+        """RoundLoop callback: enter DEFENSE for `round_id`.
+
+        Records PHASE_CHANGE, stops the HealthPoller (it's ATTACK-only),
+        rotates flags, then spawns per-team defense kickoff tasks.
+        Returns the spawned tasks so tests can await them.
         """
-        if event.type != EventType.DEPLOY_COMPLETE.value:
-            return
-        team_id = event.team_id
-        service = (event.payload or {}).get("service")
-        if team_id is None or service is None:
-            return
-        pending = self._defense_pending.get(event.round_id)
-        if pending is None:
-            return  # no defense kickoff was recorded for this round
-        pending.discard((team_id, service))
-        if not pending and self.round_loop is not None:
-            log.info(
-                "all defense-capable teams reported DEPLOY_COMPLETE for round %d; "
-                "ending DEFENSE phase early",
-                event.round_id,
-            )
-            self.round_loop.end_phase_early()
+        self.timeline.record(
+            EventType.PHASE_CHANGE, round_id=round_id, phase=Phase.DEFENSE.value,
+        )
+        if self.health_poller is not None:
+            self.health_poller.on_attack_exit()
+        self.flag_server.rotate(round_id)
+        return self._spawn_defense_kickoff(round_id)
 
-    async def _on_defense_end_health_check(self, event) -> None:
-        """At the DEFENSE→ATTACK transition, run a final 4-level health
-        chain for every (team, defense-capable service) — independent of
-        whether the team called restart_service this round.
+    def enter_attack_phase(self, round_id: int) -> list[asyncio.Task]:
+        """RoundLoop callback: enter ATTACK for `round_id`.
 
-        Two reasons to do this:
-        1. A team that skipped restart_service entirely still gets a
-           CHECKER probe — catches "defense by inaction" attempts.
-        2. The DEPLOY_COMPLETE-driven early-end above trusts the agent's
-           report. The independent health check is the verification:
-           passed=true at level=checker confirms the patch holds; failed
-           tells the operator the agent's claim was hollow.
+        Records PHASE_CHANGE, starts the HealthPoller (immediate probe
+        per target + periodic loop), then spawns per-team attack
+        kickoff tasks.
         """
-        if event.type != EventType.PHASE_CHANGE.value:
-            return
-        if event.phase != Phase.ATTACK.value:
-            return  # we want the DEFENSE→ATTACK edge
+        self.timeline.record(
+            EventType.PHASE_CHANGE, round_id=round_id, phase=Phase.ATTACK.value,
+        )
+        if self.health_poller is not None:
+            self.health_poller.on_attack_enter(round_id)
+        return self._spawn_attack_kickoff(round_id)
 
-        tasks = []
-        for chcfg in self.config.challenges:
-            spec = self._resolve_spec(chcfg.name)
-            if spec is None:
-                continue
-            if not (spec.metadata or {}).get("restart_cmd"):
-                continue
-            for team_id in chcfg.deploy_on:
-                team = next((t for t in self.config.topology.teams if t.id == team_id), None)
-                if team is None or not team.prod:
-                    continue
-                tasks.append(self._emit_health_chain(
-                    team_id=team_id,
-                    service=chcfg.name,
-                    container_name=team.prod,
-                    spec=spec,
-                ))
-        if tasks:
-            await asyncio.gather(*tasks)
+    async def on_round_stop(self, round_id: int, phase: str) -> None:
+        """RoundLoop callback: record ROUND_STOP + persist service logs.
+
+        Async because `_persist_service_logs` does blocking docker IO
+        wrapped in `run_in_executor` and the caller awaits this so the
+        next round doesn't start before logs are flushed.
+        """
+        self.timeline.record(
+            EventType.ROUND_STOP, round_id=round_id, phase=phase,
+        )
+        if self.artifacts is not None:
+            await self._persist_service_logs(round_id)
+
+    def on_game_end(self, round_id: int, phase: str, payload: dict) -> None:
+        """RoundLoop callback: record GAME_END (fired in RoundLoop.run's
+        finally block, so the timeline carries the terminal event even
+        on exception)."""
+        self.timeline.record(
+            EventType.GAME_END, round_id=round_id, phase=phase, payload=payload,
+        )
 
     async def stop(self) -> None:
         if self.round_loop is not None:
             self.round_loop.stop()
-        if self._file_sink is not None:
-            self._file_sink.close()
-            self._file_sink = None
+        if self.health_poller is not None:
+            await self.health_poller.stop()
+        self.timeline.close()
 
     # ── read-only views ─────────────────────────────────────────────────
 
@@ -841,37 +715,10 @@ class GameMgr:
         }
 
     async def submit_flag(self, team_id: str, flag: str) -> SubmitResult:
-        """Verify a flag submission and emit FLAG_SUBMITTED.
-
-        Any phase is accepted (DEFENSE submissions just can't reach the
-        target service over the network, so this rarely matters in practice).
-        The phase is carried in the event payload so consumers (panel,
-        scoreboard) can render / weight it however they like.
-
-        The flag string itself is never written to the event — the bus is
-        fanned out to the public panel WebSocket and persisted to a JSONL
-        log; leaking flags there would give every observer an
-        attack-for-free.
-        """
-        result = self.flags.submit(team_id, flag)
-        st = self.status()
-        await self.bus.publish(
-            new_event(
-                EventType.FLAG_SUBMITTED,
-                team_id=team_id,
-                round_id=st.get("round", 0),
-                phase=st.get("phase", ""),
-                payload={
-                    "accepted": result.accepted,
-                    "reason": result.reason,
-                    "submitter_team_id": team_id,
-                    "victim_team_id": result.victim_team_id,
-                    "service": result.service,
-                    "phase": st.get("phase", ""),
-                },
-            )
-        )
-        return result
+        """Thin delegate to FlagServer.submit. Kept `async` for caller
+        compatibility (FastAPI / MCP handlers `await` this); the body is
+        sync because FlagServer.submit is sync."""
+        return self.flag_server.submit(team_id, flag)
 
     # ── M4.5: lifecycle / report emitters ───────────────────────────────
 
@@ -886,14 +733,16 @@ class GameMgr:
         return name in self._known_services
 
     async def record_agent_installed(self, team_id: str) -> None:
-        """Host emit: install preparation finished (files / env / mcp.json /
-        ssh ready), supervisor NOT yet launched."""
-        await self.bus.publish(
-            new_event(
-                EventType.AGENT_INSTALLED,
-                team_id=team_id,
-                payload={"team_id": team_id, "ts": time.time()},
-            )
+        """Host record: install preparation finished (files / env /
+        mcp.json / ssh ready), supervisor NOT yet launched.
+
+        Kept `async` for caller-compatibility; body is sync since
+        timeline.record is sync.
+        """
+        self.timeline.record(
+            EventType.AGENT_INSTALLED,
+            team_id=team_id,
+            payload={"team_id": team_id, "ts": time.time()},
         )
 
     async def record_phase_started(
@@ -911,17 +760,15 @@ class GameMgr:
         of the prompt + `is_first` flag so panel observers can show
         whether this is the long briefing or a short continuation cue.
         """
-        await self.bus.publish(
-            new_event(
-                EventType.AGENT_PROMPT_SENT,
-                team_id=team_id,
-                round_id=round_id,
-                phase=phase,
-                payload={
-                    "prompt_first_line": (prompt.splitlines()[0] if prompt else ""),
-                    "is_first": is_first,
-                },
-            )
+        self.timeline.record(
+            EventType.AGENT_PROMPT_SENT,
+            team_id=team_id,
+            round_id=round_id,
+            phase=phase,
+            payload={
+                "prompt_first_line": (prompt.splitlines()[0] if prompt else ""),
+                "is_first": is_first,
+            },
         )
 
     async def record_phase_done(
@@ -984,6 +831,15 @@ class GameMgr:
             "started_at": started_at,
             "ended_at": ended_at,
         }
+        # pkilled_at: when the phase boundary actually hit this agent
+        # (SIGTERM was issued). The subprocess can take tens of seconds
+        # to settle through docker exec; the event ts (recorded just
+        # below) is when that settling completed, which can lag the
+        # next phase's events on the panel. Surfacing pkilled_at lets
+        # the panel render this event at the right relative position
+        # without changing the canonical event ts.
+        if result.pkilled_at is not None:
+            payload["pkilled_at"] = result.pkilled_at
         if result.timed_out:
             event_type = EventType.AGENT_TIMEOUT
         elif result.exit_code == 0:
@@ -992,91 +848,88 @@ class GameMgr:
             event_type = EventType.AGENT_FAILED
             payload["error_excerpt"] = f"non-zero exit {result.exit_code}"
 
-        await self.bus.publish(
-            new_event(
-                event_type,
-                team_id=team_id, round_id=round_id, phase=phase,
-                payload=payload,
-            )
+        self.timeline.record(
+            event_type,
+            team_id=team_id, round_id=round_id, phase=phase,
+            payload=payload,
         )
 
     async def record_agent_ready(self, team_id: str) -> None:
-        """MCP-driven emit: LLM successfully called `report_ready`. Confirms
-        the MCP channel works end-to-end. Best-effort — never load-bearing."""
-        await self.bus.publish(
-            new_event(
-                EventType.AGENT_READY,
-                team_id=team_id,
-                payload={"team_id": team_id, "ts": time.time()},
-            )
+        """MCP-driven: LLM successfully called `report_ready`. Records to
+        timeline and trips the per-team gate used by dry_run_all_agents.
+        Best-effort — never load-bearing for the round loop itself."""
+        self.timeline.record(
+            EventType.AGENT_READY,
+            team_id=team_id,
+            payload={"team_id": team_id, "ts": time.time()},
         )
+        ev = self._ready_events.get(team_id)
+        if ev is not None:
+            ev.set()
 
     async def record_deploy_complete(
-        self, team_id: str, service: str, duration_ms: int | None
+        self, team_id: str, service: str
     ) -> None:
-        """MCP-driven emit: agent finished its defense deploy. Overwrite-per-
-        (team, service) in deploy_reports; emit `DEPLOY_COMPLETE` event.
+        """MCP-driven: agent finished its defense deploy.
 
-        Caller must have already validated `service` via `is_known_service()`.
+        Overwrite-per-(team, service) in `deploy_reports`, record
+        DEPLOY_COMPLETE on the timeline, then drain `_defense_pending`
+        for the current round (DEFENSE phase only — see phase gate
+        below). Caller must have validated `service` via
+        `is_known_service()`.
+
+        `duration_ms` is computed server-side as (now - DEFENSE_KICKOFF
+        ts for this round/team/service). The agent's self-reported
+        value over MCP was unreliable — observed garbage values like
+        dur=196ms / 175ms in live runs where the agent had actually
+        worked tens of seconds. Anchoring duration to the kickoff
+        timestamp the host already controls gives a trustworthy number.
         """
         completed_at = time.time()
+        st = self.status()
+        round_id = st.get("round", 0)
+        kickoff_ts = self._defense_kickoff_ts.get((round_id, team_id, service))
+        duration_ms = int((completed_at - kickoff_ts) * 1000) if kickoff_ts is not None else None
         self.deploy_reports.setdefault(team_id, {})[service] = {
             "duration_ms": duration_ms,
             "completed_at": completed_at,
         }
-        st = self.status()
-        await self.bus.publish(
-            new_event(
-                EventType.DEPLOY_COMPLETE,
-                team_id=team_id,
-                round_id=st.get("round", 0),
-                phase=st.get("phase", ""),
-                payload={
-                    "team_id": team_id,
-                    "service": service,
-                    "duration_ms": duration_ms,
-                    "completed_at": completed_at,
-                },
-            )
+        self.timeline.record(
+            EventType.DEPLOY_COMPLETE,
+            team_id=team_id,
+            round_id=round_id,
+            phase=st.get("phase", ""),
+            payload={
+                "team_id": team_id,
+                "service": service,
+                "duration_ms": duration_ms,
+                "completed_at": completed_at,
+            },
         )
 
+        # Drain defense-pending; signal DEFENSE early-end when set empties.
+        # ONLY effective during the DEFENSE phase. A late DEPLOY_COMPLETE
+        # arriving after ATTACK has started (e.g. a slow agent's
+        # report_deploy_complete that flushed past the phase boundary)
+        # must NOT touch pending or signal end_phase_early — the
+        # early-end signal is phase-agnostic and would otherwise cut
+        # ATTACK short. The report is still recorded above for the
+        # operator/panel; only the round-loop coupling is gated.
+        if st.get("phase") != Phase.DEFENSE.value:
+            return
+        pending = self._defense_pending.get(round_id)
+        if pending is None:
+            return  # no defense kickoff was recorded for this round
+        pending.discard((team_id, service))
+        if not pending and self.round_loop is not None:
+            log.info(
+                "all defense-capable teams reported DEPLOY_COMPLETE for round %d; "
+                "ending DEFENSE phase early",
+                round_id,
+            )
+            self.round_loop.end_phase_early()
+
     # ── DEFCON: restart_service + health checks ─────────────────────────
-
-    def _resolve_spec(self, service_name: str) -> ChallengeSpec | None:
-        """Look up the ChallengeSpec by name from the configured sources.
-
-        Lazy-cached on first call so subsequent restarts don't re-enumerate.
-        Sources are discovered as needed:
-          - BuiltinNotesSource is always present (notes is the toy challenge)
-          - NautilusSource is attached if vendor/nautilus-finals-2025 exists
-            and includes the matching upstream dir (inferred from any
-            non-notes ChallengeConfig in game.yaml).
-        """
-        cache = getattr(self, "_spec_cache", None)
-        if cache is None:
-            cache = {}
-            # Notes is always available.
-            for spec in BuiltinNotesSource().list_challenges():
-                cache[spec.name] = spec
-            # Nautilus: instantiate only if at least one configured challenge
-            # name starts with "nautilus-". (We don't speculatively pull the
-            # vendor repo just to enumerate.)
-            nautilus_names = [
-                c.name[len("nautilus-"):]
-                for c in self.config.challenges
-                if c.name.startswith("nautilus-")
-            ]
-            if nautilus_names:
-                # Lazy import to avoid pulling docker SDK during config-only flows.
-                from challenges.nautilus import NautilusSource
-
-                try:
-                    for spec in NautilusSource(include=nautilus_names).list_challenges():
-                        cache[spec.name] = spec
-                except FileNotFoundError as e:
-                    log.warning("nautilus source unavailable: %s", e)
-            self._spec_cache = cache
-        return cache.get(service_name)
 
     async def restart_service(
         self,
@@ -1089,18 +942,18 @@ class GameMgr:
         background task that emits SERVICE_RESTART_STARTED / _COMPLETED /
         _FAILED + a SERVICE_HEALTH_CHECK per level on the bus.
 
-        Raises ValueError for unknown service, no restart_cmd in spec, or
-        a restart already in flight for this (team, service). The MCP
-        layer translates these into InvalidParams.
+        Raises ValueError for unknown service, attack-only challenge
+        (no restart_handler), or a restart already in flight for this
+        (team, service). The MCP layer translates these into InvalidParams.
         """
-        # 1. Spec lookup + restart_cmd resolution.
-        spec = self._resolve_spec(service)
-        if spec is None:
+        # 1. Challenge lookup (v2: restart goes through challenge.restart_handler).
+        try:
+            challenge = build_challenge(service)
+        except KeyError:
             raise ValueError(f"unknown service: {service!r}")
-        restart_cmd = spec.metadata.get("restart_cmd") if spec.metadata else None
-        if not restart_cmd:
+        if challenge.restart_handler is None:
             raise ValueError(
-                f"service {service!r} has no restart_cmd in spec — not defendable"
+                f"service {service!r} has no restart handler — not defendable"
             )
 
         # 2. Container lookup. M5.6 topology: one team{N}_prod per team.
@@ -1127,19 +980,17 @@ class GameMgr:
             "started_at": started_at, "done": False,
         }
         st = self.status()
-        await self.bus.publish(
-            new_event(
-                EventType.SERVICE_RESTART_STARTED,
-                team_id=team_id,
-                round_id=st.get("round", 0),
-                phase=st.get("phase", ""),
-                payload={
-                    "job_id": job_id,
-                    "team_id": team_id,
-                    "service": service,
-                    "started_at": started_at,
-                },
-            )
+        self.timeline.record(
+            EventType.SERVICE_RESTART_STARTED,
+            team_id=team_id,
+            round_id=st.get("round", 0),
+            phase=st.get("phase", ""),
+            payload={
+                "job_id": job_id,
+                "team_id": team_id,
+                "service": service,
+                "started_at": started_at,
+            },
         )
 
         # Spawn the background restart task on the running event loop.
@@ -1148,9 +999,7 @@ class GameMgr:
                 job_id=job_id,
                 team_id=team_id,
                 service=service,
-                container_name=container_name,
-                restart_cmd=restart_cmd,
-                spec=spec,
+                challenge=challenge,
             )
         )
         return job_id
@@ -1161,67 +1010,35 @@ class GameMgr:
         job_id: str,
         team_id: str,
         service: str,
-        container_name: str,
-        restart_cmd: str,
-        spec: ChallengeSpec,
+        challenge: Challenge,
     ) -> None:
-        """Run restart_cmd inside the team's prod container via docker exec,
-        emit COMPLETED/FAILED with duration_ms, then walk the 4 health levels."""
+        """Run challenge.restart_handler.run(target) in a thread executor,
+        emit COMPLETED/FAILED with duration_ms based on the returned
+        CheckResult, then trigger a post-restart health probe."""
         started_at = self._restart_jobs[job_id]["started_at"]
         st = self.status()
-        # docker exec is blocking; run it in the default thread pool so
-        # we don't block the event loop while make/fpc/etc. runs.
         loop = asyncio.get_running_loop()
+        target = self.target_for(team_id, challenge)
         try:
-            exit_code, output = await loop.run_in_executor(
-                None, self._exec_in_container, container_name, restart_cmd
+            # RestartHandler.run is blocking by contract (docker exec under
+            # the hood); push it off the event loop.
+            result = await loop.run_in_executor(
+                None, challenge.restart_handler.run, target,
             )
             duration_ms = int((time.time() - started_at) * 1000)
-            if exit_code != 0:
-                await self.bus.publish(
-                    new_event(
-                        EventType.SERVICE_RESTART_FAILED,
-                        team_id=team_id,
-                        round_id=st.get("round", 0),
-                        phase=st.get("phase", ""),
-                        payload={
-                            "job_id": job_id,
-                            "team_id": team_id,
-                            "service": service,
-                            "duration_ms": duration_ms,
-                            "error": (output[-200:] if output else f"rc={exit_code}"),
-                        },
-                    )
+            if not result.passed:
+                # Surface the first failed leaf's detail as the error
+                # message — operators want to know WHERE compile/spawn/smoke
+                # broke without expanding the full tree in the panel.
+                failed = next(
+                    (leaf for leaf in leaves(result) if not leaf.passed),
+                    None,
                 )
-                self._restart_jobs[job_id]["done"] = True
-                return
-
-            await self.bus.publish(
-                new_event(
-                    EventType.SERVICE_RESTART_COMPLETED,
-                    team_id=team_id,
-                    round_id=st.get("round", 0),
-                    phase=st.get("phase", ""),
-                    payload={
-                        "job_id": job_id,
-                        "team_id": team_id,
-                        "service": service,
-                        "duration_ms": duration_ms,
-                    },
+                error_detail = (
+                    f"{failed.name}: {failed.detail}" if failed is not None
+                    else (result.detail or "restart failed")
                 )
-            )
-
-            # Health check chain — emit one SERVICE_HEALTH_CHECK per level.
-            await self._emit_health_chain(
-                team_id=team_id,
-                service=service,
-                container_name=container_name,
-                spec=spec,
-            )
-        except Exception as e:
-            duration_ms = int((time.time() - started_at) * 1000)
-            await self.bus.publish(
-                new_event(
+                self.timeline.record(
                     EventType.SERVICE_RESTART_FAILED,
                     team_id=team_id,
                     round_id=st.get("round", 0),
@@ -1231,9 +1048,43 @@ class GameMgr:
                         "team_id": team_id,
                         "service": service,
                         "duration_ms": duration_ms,
-                        "error": f"{type(e).__name__}: {e}"[:200],
+                        "error": error_detail[-200:],
                     },
                 )
+                self._restart_jobs[job_id]["done"] = True
+                return
+
+            self.timeline.record(
+                EventType.SERVICE_RESTART_COMPLETED,
+                team_id=team_id,
+                round_id=st.get("round", 0),
+                phase=st.get("phase", ""),
+                payload={
+                    "job_id": job_id,
+                    "team_id": team_id,
+                    "service": service,
+                    "duration_ms": duration_ms,
+                },
+            )
+
+            # Health probe — delegated to HealthPoller.trigger_now, which
+            # runs challenge.functionality_test via HealthChecker.
+            if self.health_poller is not None:
+                await self.health_poller.trigger_now(team_id, service)
+        except Exception as e:
+            duration_ms = int((time.time() - started_at) * 1000)
+            self.timeline.record(
+                EventType.SERVICE_RESTART_FAILED,
+                team_id=team_id,
+                round_id=st.get("round", 0),
+                phase=st.get("phase", ""),
+                payload={
+                    "job_id": job_id,
+                    "team_id": team_id,
+                    "service": service,
+                    "duration_ms": duration_ms,
+                    "error": f"{type(e).__name__}: {e}"[:200],
+                },
             )
         finally:
             self._restart_jobs[job_id]["done"] = True
@@ -1247,97 +1098,10 @@ class GameMgr:
         out = result.output.decode(errors="replace") if result.output else ""
         return result.exit_code, out
 
-    async def _emit_health_chain(
-        self,
-        *,
-        team_id: str,
-        service: str,
-        container_name: str,
-        spec: ChallengeSpec,
-    ) -> None:
-        """Run PROCESS → TCP → PROTOCOL → CHECKER, emit one event each.
-
-        PROCESS: pgrep against spec.metadata.health_check.process_pattern
-        TCP: orchestrator-side socket connect to spec.port (via docker exec python)
-        PROTOCOL / CHECKER: defer to a Service instance if available; otherwise
-          skip with a "no service adapter wired" detail and passed=False.
-        """
-        st = self.status()
-        hc = (spec.metadata or {}).get("health_check") or {}
-
-        async def _emit(level: HealthLevel, passed: bool, detail: str) -> None:
-            await self.bus.publish(
-                new_event(
-                    EventType.SERVICE_HEALTH_CHECK,
-                    team_id=team_id,
-                    round_id=st.get("round", 0),
-                    phase=st.get("phase", ""),
-                    payload={
-                        "team_id": team_id,
-                        "service": service,
-                        "level": level.value,
-                        "passed": passed,
-                        "detail": detail,
-                    },
-                )
-            )
-
-        loop = asyncio.get_running_loop()
-
-        # PROCESS
-        process_pattern = hc.get("process_pattern")
-        if process_pattern:
-            rc, out = await loop.run_in_executor(
-                None, self._exec_in_container, container_name,
-                f"pgrep -f {process_pattern!r}"
-            )
-            await _emit(HealthLevel.PROCESS, rc == 0, f"pgrep rc={rc}")
-        else:
-            await _emit(HealthLevel.PROCESS, True, "no process_pattern; skipped")
-
-        # TCP
-        tcp_probe = (
-            f"python3 -c \"import socket; s=socket.socket(); s.settimeout(2); "
-            f"s.connect(('127.0.0.1', {spec.port})); s.close()\""
-        )
-        rc, _ = await loop.run_in_executor(
-            None, self._exec_in_container, container_name, tcp_probe
-        )
-        await _emit(HealthLevel.TCP, rc == 0, f"socket-connect rc={rc}")
-
-        # PROTOCOL — defer to Service.is_alive(PROTOCOL) when we have an
-        # adapter wired (deploy_challenges populates _service_by_owner).
-        # If no adapter (e.g. nautilus-ico tested standalone, no Service yet),
-        # fall back to "passed=True with reason" — the deeper CHECKER below
-        # still runs and provides the load-bearing gameplay-correctness signal.
-        proto_ok = True
-        service_obj = self._service_by_owner.get((team_id, service))
-        if service_obj is not None:
-            handle = self.handle_for(container_name)
-            try:
-                proto_ok = await loop.run_in_executor(
-                    None, lambda: service_obj.is_alive(handle, HealthLevel.PROTOCOL)
-                )
-                await _emit(HealthLevel.PROTOCOL, bool(proto_ok), f"is_alive(PROTOCOL)={proto_ok}")
-            except Exception as e:
-                await _emit(HealthLevel.PROTOCOL, False, f"is_alive PROTOCOL raised: {type(e).__name__}")
-                proto_ok = False
-        else:
-            await _emit(HealthLevel.PROTOCOL, True, "no service adapter; deferred to CHECKER")
-
-        # CHECKER — for nautilus challenges, runs the framework-installed
-        # checker.sh inside the container. For notes (no checker_command),
-        # aliases to PROTOCOL — documented honest fallback, no separable
-        # gameplay surface.
-        checker_cmd = hc.get("checker_command")
-        if checker_cmd:
-            rc, out = await loop.run_in_executor(
-                None, self._exec_in_container, container_name, checker_cmd
-            )
-            detail = (out.strip() or f"rc={rc}")[-200:]
-            await _emit(HealthLevel.CHECKER, rc == 0, detail)
-        else:
-            await _emit(HealthLevel.CHECKER, bool(proto_ok), "no checker_command; aliased to PROTOCOL")
+    # Note: the 4-level health-chain primitive lives in
+    # `health.checker.HealthChecker.run_chain`. GameMgr no longer owns
+    # it — restart-post probe goes through `self.health_poller.trigger_now`
+    # and ATTACK-phase periodic polling goes through `self.health_poller`.
 
     # ── agent provisioning (M5.6) ───────────────────────────────────────
 
@@ -1414,9 +1178,9 @@ class GameMgr:
         """Build the per-team AgentConfig for DEFENSE mode (DEFCON Phase 4b).
 
         Mirrors `agent_config_for` but swaps the prompt for the
-        edit→restart→smoke→report recipe via `build_defense_prompt`. Pulls
-        port + source_view from the resolved ChallengeSpec so the prompt
-        points the agent at the right path inside its own prod container.
+        edit→restart→smoke→report recipe via `build_defense_prompt`.
+        Pulls port from the Challenge's VulboxImage so the prompt
+        points the agent at the right port inside its own prod container.
         """
         base = self.config.agents.get(team_id)
         if base is None:
@@ -1427,9 +1191,11 @@ class GameMgr:
             raise KeyError(f"unknown team_id {team_id!r}")
         own_team = teams_by_id[team_id]
 
-        spec = self._resolve_spec(service_name)
-        if spec is None:
+        try:
+            challenge = build_challenge(service_name)
+        except KeyError:
             raise ValueError(f"unknown service: {service_name!r}")
+        port = next(iter(challenge.vulbox.exposed_ports.values()), 0)
 
         from .mcp_server import canonical_endpoint_url
 
@@ -1449,7 +1215,7 @@ class GameMgr:
             system_prompt=build_defense_prompt(
                 cfg,
                 service_name=service_name,
-                port=spec.port,
+                port=port,
                 is_first=is_first,
             ),
         )
@@ -1460,3 +1226,37 @@ class GameMgr:
         node = self.config.topology.node(container_name)
         c = self.orchestrator.containers._client.containers.get(container_name)
         return ContainerHandle(container_id=c.id, name=container_name, networks=list(node.networks))
+
+    def target_for(self, team_id: str, challenge: Challenge) -> VulboxTarget:
+        """Build a privileged VulboxTarget for `team_id`'s deployment of `challenge`.
+
+        Runtime coordinates pulled from topology + the challenge's declared
+        vulbox image:
+          host  — team's prod container name (the docker exec target)
+          ports — copy of challenge.vulbox.exposed_ports (same image, same
+                  ports across teams; per-team variation is only in host)
+          meta  — conventional payload that probes look for:
+                    team_id           — included so probes can log with team
+                                        context without re-threading it
+                    exec_in_container — the docker-exec callable contract
+
+        This is the PRIVILEGED target — own-team docker-exec access. It's
+        what FlagServer.plant uses, what HealthChecker.functionality_test
+        uses, and what restart_service hands to RestartHandler. Cross-team
+        attack agents build their own VulboxTarget pointing at the victim
+        over the public network and don't go through this helper.
+        """
+        host = next(
+            (t.prod for t in self.config.topology.teams if t.id == team_id),
+            None,
+        )
+        if host is None:
+            raise KeyError(f"target_for: unknown team_id {team_id!r}")
+        return VulboxTarget(
+            host=host,
+            ports=dict(challenge.vulbox.exposed_ports),
+            meta={
+                "team_id": team_id,
+                "exec_in_container": self._exec_in_container,
+            },
+        )

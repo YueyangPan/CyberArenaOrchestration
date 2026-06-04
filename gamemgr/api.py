@@ -57,7 +57,7 @@ def build_app(game: GameMgr, shutdown_event: asyncio.Event) -> FastAPI:
 
     @app.get("/game/events")
     async def events(since: float | None = None) -> list[dict[str, Any]]:
-        hist = game.bus.history()
+        hist = game.timeline.history()
         if since is not None:
             hist = [e for e in hist if e.ts >= since]
         return [asdict(e) for e in hist]
@@ -89,14 +89,11 @@ def build_app(game: GameMgr, shutdown_event: asyncio.Event) -> FastAPI:
     @app.websocket("/events/stream")
     async def events_stream(websocket: WebSocket):
         await websocket.accept()
-        queue: asyncio.Queue[Event] = asyncio.Queue()
-
-        async def push(event: Event) -> None:
-            await queue.put(event)
-
-        game.bus.subscribe(push)
+        # attach_stream gives this connection its own queue; record() fans
+        # out via put_nowait so a slow client cannot back-pressure the game.
+        queue = game.timeline.attach_stream()
         try:
-            for past in game.bus.history():
+            for past in game.timeline.history():
                 await websocket.send_json(asdict(past))
             while True:
                 event = await queue.get()
@@ -104,6 +101,6 @@ def build_app(game: GameMgr, shutdown_event: asyncio.Event) -> FastAPI:
         except WebSocketDisconnect:
             pass
         finally:
-            game.bus.unsubscribe(push)
+            game.timeline.detach_stream(queue)
 
     return app
