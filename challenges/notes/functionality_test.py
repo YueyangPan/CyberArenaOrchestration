@@ -16,7 +16,11 @@ import shlex
 
 from challenges.interface import CheckResult, FunctionalityTest, VulboxTarget
 
-from ._server_script import SERVER_SCRIPT_PATH
+# Runtime path the daemon is baked at in the cyberarena/chal-notes
+# image (see challenges/notes/image/Dockerfile). Used by the PROCESS-
+# level pgrep here. Kept inline so the only out-of-tree consumer of the
+# path lives next to the only in-tree consumer.
+SERVER_SCRIPT_PATH = "/opt/cyberarena/notes/server.py"
 
 
 class NotesFunctionalityTest(FunctionalityTest):

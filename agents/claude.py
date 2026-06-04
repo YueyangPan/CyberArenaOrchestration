@@ -370,9 +370,10 @@ class ClaudeAgentManager(AgentManager):
         dev. Ephemeral key per install() — never persisted.
 
         Detects the prod-side SSH user at runtime: `arena_agent` if the
-        target image carries that non-root user (DEFCON framework image,
-        e.g. cyberarena/chal-nautilus-ico), else falls back to root
-        (legacy cyberarena/prod-base used by notes / M5 / M5.6 tests).
+        target image carries that non-root user (every per-challenge
+        image bakes this user — cyberarena/chal-notes,
+        cyberarena/chal-nautilus-ico), else falls back to root for any
+        external/legacy image that doesn't follow the convention.
         """
         prod_name = cfg.own_prod_container_name
         log.info("provisioning ssh pivot %s -> %s", dev_container.name, prod_name)

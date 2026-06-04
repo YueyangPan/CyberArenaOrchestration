@@ -2,12 +2,12 @@
 #
 # Same topology as config/game.yaml but the prod containers run the
 # nautilus-ico image (Pascal HVIF server, port 4265) instead of the
-# generic prod-base + notes service.
+# notes image.
 #
 # Image cyberarena/chal-nautilus-ico:<sha> is built by
-# `python main.py setup -c config/game_ico.yaml` via NautilusSource
-# (in turn driven by challenges.registry.build_all_images). Run
-# `scripts/sync_nautilus.sh` once before that to vendor the upstream
+# `python main.py setup -c config/game_ico.yaml` via
+# `challenges.registry.build_images`. Run `scripts/sync_nautilus.sh`
+# once before that to vendor the upstream
 # source tree.
 
 teams:
