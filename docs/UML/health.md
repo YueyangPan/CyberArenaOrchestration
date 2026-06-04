@@ -2,21 +2,20 @@
 
 `health/` is an independent package consumed by `GameMgr`. Two classes:
 
-- **`HealthChecker`** — pure 4-level probe primitive
-  (PROCESS → TCP → PROTOCOL → CHECKER). Records one
-  `SERVICE_HEALTH_CHECK` per level on the Timeline. Stateless;
-  dependencies (docker exec, Service resolver, container handle
-  resolver, round/phase stamping) are injected at construction so the
-  class is unit-testable without a live game.
+- **`HealthChecker`** — thin wrapper that runs
+  `challenge.functionality_test.run(target)` in a thread executor,
+  walks the returned `CheckResult` tree, and emits one
+  `SERVICE_HEALTH_CHECK` per leaf on the Timeline. Stateless; the
+  status resolver (round + phase stamping) is the only injected dep.
 
 - **`HealthPoller`** — periodic scheduler. Driven by GameMgr at phase
   boundaries; does not subscribe to anything. Owns per-target periodic
   tasks (one per (team, defense-capable service)). Also exposes
   `trigger_now(team, service)` for the restart-post one-shot probe.
 
-The package is pluggable per the `Service` ABC: protocol-level checks
-delegate to `Service.is_alive(handle, level)` when an adapter is
-registered. No demo-service specifics are hardcoded.
+The package is pluggable per the v2 `Challenge` ABC: each PollTarget
+holds a concrete `Challenge` + a pre-built `VulboxTarget`, and the
+checker only knows to call `challenge.functionality_test.run(target)`.
 
 ## Class diagram
 
@@ -24,11 +23,8 @@ registered. No demo-service specifics are hardcoded.
 classDiagram
   class HealthChecker {
     -timeline: Timeline
-    -_exec: ExecFn
-    -_service: ServiceResolver
-    -_handle: HandleResolver
     -_status: StatusResolver
-    +run_chain(*, team_id, service, container_name, spec) None
+    +run(*, team_id, service, target, challenge) CheckResult
   }
 
   class HealthPoller {
@@ -46,8 +42,8 @@ classDiagram
     <<frozen>>
     +team_id: str
     +service: str
-    +container_name: str
-    +spec: ChallengeSpec
+    +challenge: Challenge
+    +target: VulboxTarget
     +interval_secs: float
   }
 
@@ -61,9 +57,9 @@ classDiagram
 
   HealthPoller "1" *-- "1" HealthChecker : uses
   HealthPoller "1" o-- "*" PollTarget : polls
-  HealthChecker ..> HealthLevel : records one event per level
-  HealthChecker ..> Timeline : records SERVICE_HEALTH_CHECK
-  HealthChecker ..> Service : delegates PROTOCOL when adapter present
+  HealthChecker ..> Challenge : runs functionality_test
+  HealthChecker ..> Timeline : records SERVICE_HEALTH_CHECK per leaf
+  HealthChecker ..> HealthLevel : convention for leaf names
 ```
 
 ## State machine — when the poller is running
@@ -72,33 +68,37 @@ classDiagram
 stateDiagram-v2
   [*] --> Idle
   Idle --> Polling : enter_attack_phase\non_attack_enter(round_id)
-  Polling --> Polling : every interval_secs\n→ checker.run_chain
+  Polling --> Polling : every interval_secs\n→ checker.run
   Polling --> Idle : enter_defense_phase\non_attack_exit()
   Polling --> Idle : on_game_end / stop()
   note right of Polling
     immediate probe per target on entry
     then per-target periodic task:
-    while True: sleep(interval); run_chain()
+    while True: sleep(interval); run()
   end note
 ```
 
 `trigger_now` is allowed in **either** state — used by `_run_restart_job`
-in `GameMgr` to surface a fresh chain right after a successful restart,
+in `GameMgr` to surface a fresh check right after a successful restart,
 even during DEFENSE.
 
 ## Configuration
 
-Per-spec under `metadata.health_check`:
-
-| Key | Used by | Default |
-|---|---|---|
-| `process_pattern` | PROCESS level | none → record "skipped" |
-| `checker_command` | CHECKER level | none → alias PROTOCOL outcome |
-| `interval_secs` | HealthPoller periodic loop | `DEFAULT_INTERVAL_SECS` (10s) + warning |
-
-`port` lives on the spec root (TCP probe uses it). Defense-capability
-is determined by `metadata.restart_cmd` — `build_targets` filters out
-services that lack one (e.g. notes is not polled).
+- **Which services get polled:** `build_targets` filters on
+  `challenge.restart_handler is None`. Attack-only challenges (notes)
+  have nothing to defend, so periodic CHECKER probes there would be
+  wasted load.
+- **Per-challenge poll interval:** lives in
+  [`challenges/registry.py::_HEALTH_INTERVAL_SECS`](../../challenges/registry.py).
+  `build_targets` reads it via the `interval_lookup` injected callable
+  (typically `registry.health_interval_secs`) with `DEFAULT_INTERVAL_SECS`
+  (10s) as the fallback.
+- **Leaf names:** the `HealthLevel` enum (PROCESS / TCP / PROTOCOL /
+  CHECKER) is a convention. The framework emits one event per
+  `CheckResult` leaf using `leaf.name` verbatim; both bundled
+  challenges use this convention. A challenge whose `FunctionalityTest`
+  returns a different tree shape (one leaf, nested groups) is free to;
+  no framework code branches on the names.
 
 ## What it does NOT do
 
@@ -114,5 +114,5 @@ services that lack one (e.g. notes is not polled).
 | Path | Role |
 |---|---|
 | `health/__init__.py` | re-exports `HealthChecker`, `HealthPoller`, `PollTarget` |
-| `health/checker.py` | `HealthChecker.run_chain` (PROCESS → TCP → PROTOCOL → CHECKER) |
+| `health/checker.py` | `HealthChecker.run` + `leaves(tree)` tree-walker |
 | `health/poller.py` | `HealthPoller` + `PollTarget` + `build_targets` + `DEFAULT_INTERVAL_SECS` |

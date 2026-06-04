@@ -72,7 +72,7 @@ classDef glue stroke-dasharray:4 4,opacity:0.7
 | **agents.runner** | Glue | One free function: stage prompt → run CLI with timeout → pkill on timeout. Returns raw `CommandResult` to caller. See [agent_manager.md](agent_manager.md) |
 | **FastAPI + MCP** | External surface | REST `/game/flag/submit` etc.; WebSocket `/events/stream` for panel; MCP HTTP `/mcp/` for agent tool calls |
 | **panel.html** | Observer UI | Live mode connects WebSocket; snapshot mode replays `events.jsonl` embedded at game end (`runs/<ts>/panel.html`) |
-| **Challenge** | Pluggable service | `ChallengeSpec` + `Service` adapter; sources are notes (built-in) and nautilus. See [challenges.md](challenges.md) |
+| **Challenge** | Pluggable vulnerable app | `Challenge` ABC composing `vulbox` + `functionality_test` + `flag_handler` + `restart_handler?` + `docs`. Two in tree: notes (attack-only), nautilus-ico (full defense). See [challenges.md](challenges.md) |
 
 ## Game lifecycle (one game, top-down)
 

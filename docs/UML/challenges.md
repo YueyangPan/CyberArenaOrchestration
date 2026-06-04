@@ -14,14 +14,16 @@ drives each independently — no per-mechanism dispatch lives in the
 framework. Two challenges in tree today: built-in `notes` (attack-only)
 and DEFCON `nautilus-ico` (full attack + defense workflow).
 
-> **Migration status**: the v2 abstract interface (`Challenge` ABC +
-> probes) is defined in [`challenges/interface/`](../../challenges/interface/);
-> see [docs/challenge_interface_v2_plan.md](../challenge_interface_v2_plan.md)
-> for the staged plan to retire the v1 `ChallengeSource` / `ChallengeSpec`
-> / `FlagMechanism` layer it replaces. The diagrams below describe the
-> target design.
+> **Status**: live. The v2 abstract interface
+> ([`challenges/interface/`](../../challenges/interface/)) + the two
+> concrete challenges under [`challenges/notes/`](../../challenges/notes/)
+> and [`challenges/nautilus_ico/`](../../challenges/nautilus_ico/) drive
+> all flag / health / restart paths. The v1 `ChallengeSource` /
+> `ChallengeSpec` / `FlagMechanism` / `Service` layer is deleted; see
+> [docs/challenge_interface_v2_plan.md](../challenge_interface_v2_plan.md)
+> for the staged history.
 
-## Class diagram (target)
+## Class diagram
 
 ```mermaid
 classDiagram
@@ -244,7 +246,17 @@ challenges/<new_chal>/
   prompts.py
 ```
 
-Plus one line in `challenges/registry.py` registering the instance.
+Plus four entries in [`challenges/registry.py`](../../challenges/registry.py):
+
+* `_CHALLENGE_FACTORIES["<name>"] = NewChallenge` — required.
+* `_INITIAL_START["<name>"] = <hook>` — only when first-time start
+  needs more than the image's own entrypoint (e.g. notes ships a
+  script, ico kicks `/arena/restart.sh`).
+* `_IMAGE_BUILDERS["<name>"] = <builder>` — only when the image isn't
+  pre-baked (i.e. needs `docker build` at game-start).
+* `_HEALTH_INTERVAL_SECS["<name>"] = N` — only when the default
+  poll interval doesn't fit.
+
 Zero touches to [gamemgr/](../../gamemgr/), [flag/](../../flag/),
 [health/](../../health/), or [agents/prompts/__init__.py](../../agents/prompts/__init__.py).
 
@@ -259,5 +271,6 @@ Zero touches to [gamemgr/](../../gamemgr/), [flag/](../../flag/),
 | `challenges/<name>/functionality_test.py` | `FunctionalityTest` implementation |
 | `challenges/<name>/flag_handler.py` | `FlagHandler` implementation |
 | `challenges/<name>/restart_handler.py` | `RestartHandler` implementation (defense-capable only) |
+| `challenges/<name>/build.py` | `build_image()` for challenges that ship a docker context (e.g. nautilus_ico) |
 | `challenges/<name>/prompts.py` | `build_attack_prompt(cfg)` / `build_defense_prompt(cfg, …)` for the challenge |
-| `challenges/registry.py` | `name → Challenge` lookup, replaces v1's `ChallengeSource` |
+| [`challenges/registry.py`](../../challenges/registry.py) | `build_challenge` + `initial_start` + `build_images` + `health_interval_secs` |

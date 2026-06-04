@@ -134,35 +134,24 @@ sequenceDiagram
   end
 ```
 
-## Service ABC — used at challenge deploy
+## ContainerHandle — opaque pointer to a running container
 
 ```mermaid
 classDiagram
-  class Service {
-    <<abstract>>
+  class ContainerHandle {
+    <<frozen>>
+    +container_id: str
     +name: str
-    +port: int
-    +protocol: str
-    +install(container) None
-    +start(container) None
-    +stop(container) None
-    +is_alive(container, level) bool
-    +plant_flag(container, flag) None
+    +networks: list~str~
   }
-
-  class NotesService {
-    +install(...) None
-    +start(...) None
-    +plant_flag(...) None
-  }
-
-  Service <|-- NotesService
 ```
 
-`Service` is the SERVICE_PROTOCOL adapter used by GameMgr when the
-challenge ships its own runtime (notes). FILE_AT_PATH challenges
-(nautilus-ico) skip this — their service is baked into the image
-and the framework `/arena/restart.sh` cycles it. See
+The agents layer, transport backends, and the flag/health facilities
+pass `ContainerHandle` to identify which container a command targets.
+Decoupled from the legacy `Service` ABC (deleted with the challenge
+interface v2 migration); per-challenge install/start/restart lifecycle
+now lives in the `Challenge` ABC's `flag_handler` / `restart_handler`
+and the `challenges.registry.initial_start` hook. See
 [challenges.md](challenges.md).
 
 ## File map
@@ -172,6 +161,6 @@ and the framework `/arena/restart.sh` cycles it. See
 | `orchestrator/orchestrator.py` | `Orchestrator` (setup / teardown) |
 | `orchestrator/infra/docker.py` | `ContainerManager` |
 | `orchestrator/infra/network.py` | `NetworkManager` |
-| `orchestrator/service.py` | `Service` ABC + `ContainerHandle` |
+| `orchestrator/handle.py` | `ContainerHandle` dataclass |
 | `orchestrator/topology.py` | YAML → `TopologyGraph` |
 | `models/topology.py` | `Team` / `Node` / `Network` / `TopologyGraph` dataclasses |

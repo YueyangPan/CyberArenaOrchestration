@@ -6,16 +6,15 @@
   ACCEPTED/UNKNOWN/OWN/DUPLICATE decision logic. Re-planting a flag
   drops the old one from the inverted index (so it submits as UNKNOWN
   after rotation). No I/O, no timeline, no docker.
-- **`FlagServer`** — orchestration over the store. Plants flags into
-  challenge containers (SERVICE_PROTOCOL via the adapter's
-  `plant_flag(handle, flag)`, FILE_AT_PATH via `docker exec` write),
-  runs per-round rotation, verifies submissions, and records
-  `FLAG_PLANTED` / `FLAG_SUBMITTED` on the Timeline.
+- **`FlagServer`** — orchestration over the store. Plants flags via
+  the per-challenge `FlagHandler.plant(target, flag)`, runs per-round
+  rotation, verifies submissions, and records `FLAG_PLANTED` /
+  `FLAG_SUBMITTED` on the Timeline.
 
 GameMgr keeps the public surface (`plant_initial_flags`, `plant_flags`,
 `submit_flag`, `flags`) and delegates every call to FlagServer.
-Pluggable per `Service` ABC + `FlagMechanism` — no demo-service
-specifics are hardcoded into the facility.
+Pluggable per the v2 `Challenge.flag_handler` contract — no
+mechanism-by-mechanism branching lives in the framework.
 
 ## Class diagram
 
@@ -39,13 +38,11 @@ classDiagram
 
   class FlagServer {
     +timeline: Timeline
-    +topology: TopologyGraph
     +store: FlagStore
-    -_service_by_owner: dict
-    -_spec_by_owner: dict
-    -_handle: HandleResolver
-    -_exec: ExecFn
+    -_challenge_by_owner: dict
+    -_target: TargetFactory
     -_status: StatusResolver
+    -_handles: dict
     -_last_planted_round: int
     +plant_initial_flags() list
     +plant_flags(round_id) list
@@ -54,35 +51,27 @@ classDiagram
     +emit_planted_setup() None
   }
 
-  class FlagMechanism {
-    <<enumeration>>
-    SERVICE_PROTOCOL
-    FILE_AT_PATH
-    ENV_VAR
-    BINARY_PATCH
-  }
-
   FlagServer "1" *-- "1" FlagStore : owns
   FlagStore ..> SubmitResult : returns
-  FlagServer ..> FlagMechanism : dispatches plant by spec.flag_mechanism
+  FlagServer ..> Challenge : delegates to flag_handler
   FlagServer ..> Timeline : records FLAG_PLANTED / FLAG_SUBMITTED
-  FlagServer ..> Service : delegates SERVICE_PROTOCOL plant
 ```
 
 ## Plant dispatch
 
-`plant_flags(round_id)` walks two mutable dicts that GameMgr.deploy_challenges
-populates and FlagServer holds by reference:
+`plant_flags(round_id)` walks a single map populated by
+`GameMgr.deploy_challenges` and held by reference:
 
-| Path | Trigger | Mechanism |
-|---|---|---|
-| `_service_by_owner[(team, svc)] → Service` | spec.flag_mechanism = `SERVICE_PROTOCOL` | `service.plant_flag(handle, flag)` — adapter owns wire protocol (e.g. notes does a PUT) |
-| `_spec_by_owner[(team, svc)] → ChallengeSpec` | spec.flag_mechanism = `FILE_AT_PATH` | `docker exec <prod> sh -c 'printf %s <flag> > <flag_path> && chmod 644 <flag_path>'` |
+| Path | What runs |
+|---|---|
+| `_challenge_by_owner[(team, svc)] → Challenge` | `challenge.flag_handler.plant(target, flag)` where `target = GameMgr.target_for(team_id, challenge)` |
 
-Both paths update `store.plant(team, svc, flag)` so submissions resolve
-correctly afterwards. `ENV_VAR` and `BINARY_PATCH` mechanisms are
-defined in `FlagMechanism` but not yet dispatched here — adding them
-is one switch arm.
+Each challenge's `FlagHandler` owns the wire protocol — notes does a
+PUT over its newline protocol, ico writes `/flag` via docker exec,
+future challenges can write env vars or patch binaries. The framework
+is opaque to the choice. The handle returned by `plant` is stashed in
+`_handles[(team, svc)]` for future `retrieve()` calls (own-team verify,
+or attack agents using the same handler over the public network).
 
 ## Rotation lifecycle
 
@@ -96,14 +85,14 @@ sequenceDiagram
 
   Op->>G: plant_initial_flags()
   G->>FS: plant_initial_flags()
-  FS->>C: plant_flag(handle, flag)<br/>or docker exec write
+  FS->>C: challenge.flag_handler.plant(target, flag)
   FS-->>G: list~(team, svc, flag)~
   Note over FS: emit_planted_setup() in start() records FLAG_PLANTED ×N
 
   loop per round
     G->>FS: rotate(round_id)   «from enter_defense_phase»
     FS->>FS: idempotency guard (skip if same round)
-    FS->>C: plant_flag / docker exec write (per team×svc)
+    FS->>C: challenge.flag_handler.plant(target, flag) (per team×svc)
     FS->>TL: record FLAG_PLANTED ×N
   end
 

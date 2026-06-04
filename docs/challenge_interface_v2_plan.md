@@ -1,13 +1,21 @@
 # Challenge interface v2 — pluggable Challenge ABC
 
-> Status: planned, not yet executed.
-> Driver: extensibility. Adding a new CTF challenge today touches
+> Status: **shipped** (2026-06-03). All 11 stages landed; the v1
+> `ChallengeSource` / `ChallengeSpec` / `FlagMechanism` / `Service`
+> surface is deleted. Adding a new CTF challenge is now a single
+> directory under `challenges/<name>/` plus four registry entries
+> (factory + initial_start + image_builder? + health_interval?). See
+> [docs/UML/challenges.md](UML/challenges.md) for the live design;
+> the document below remains as the staged plan for historical
+> reference.
+>
+> Driver: extensibility. Adding a new CTF challenge previously touched
 > `challenges/source.py` (ChallengeSpec metadata schema), `FlagServer`
 > (per-mechanism plant dispatch), `HealthChecker` (hardcoded 4-level
 > chain reading `spec.metadata.health_check.*`), `agents/prompts/*`
 > (attack/defense prompts), and `orchestrator/service.py` (Service
 > adapter for SERVICE_PROTOCOL plants). Five different files per
-> challenge. v2 collapses all of it into one directory per challenge
+> challenge. v2 collapsed all of it into one directory per challenge
 > behind a single ABC root.
 
 ## Why now
