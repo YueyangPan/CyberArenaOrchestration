@@ -1,186 +1,171 @@
 """HealthChecker unit tests.
 
-Verify the 4-level chain emits one SERVICE_HEALTH_CHECK per level in
-the right order, against a stubbed docker-exec and no Service adapter.
+Stage 4 (challenge interface v2): HealthChecker is a thin wrapper that
+delegates to `challenge.functionality_test.run(target)` and records one
+SERVICE_HEALTH_CHECK per CheckResult leaf. Per-mechanism branching is
+gone from the framework — these tests pin the wrapper contract.
 """
 
 from __future__ import annotations
 
 import asyncio
 
-import pytest
-
-from challenges.source import ChallengeSpec, FlagMechanism, HealthLevel
+from challenges.interface import (
+    Challenge,
+    ChallengeDocs,
+    CheckResult,
+    FlagHandler,
+    FunctionalityTest,
+    VulboxImage,
+    VulboxTarget,
+)
 from gamemgr.events import EventType
 from gamemgr.timeline import Timeline
 from health.checker import HealthChecker
 
 
-def _spec(**overrides) -> ChallengeSpec:
-    md = {
-        "restart_cmd": "echo",
-        "flag_path": "/flag",
-        "health_check": {
-            "process_pattern": "ico",
-            "checker_command": "/arena/checker.sh",
-        },
-    }
-    md.update(overrides.pop("metadata", {}))
-    return ChallengeSpec(
-        name=overrides.get("name", "nautilus-ico"),
-        source="nautilus",
-        port=overrides.get("port", 4265),
-        image_tag="x",
-        flag_mechanism=FlagMechanism.FILE_AT_PATH,
-        metadata=md,
-    )
+class _StubFT(FunctionalityTest):
+    """Returns a pre-built CheckResult tree. Tests configure the tree
+    per scenario."""
+
+    def __init__(self, tree: CheckResult) -> None:
+        self._tree = tree
+
+    @property
+    def name(self) -> str:
+        return "stub-ft"
+
+    def run(self, target: VulboxTarget) -> CheckResult:
+        return self._tree
 
 
-def _checker(timeline: Timeline, exec_results: dict[str, tuple[int, str]]):
-    """Build a checker whose exec returns (rc, output) per command pattern.
-    Keys are matched by substring; first hit wins."""
-    def fake_exec(container, cmd):
-        for pat, result in exec_results.items():
-            if pat in cmd:
-                return result
-        return (0, "ok\n")
+class _StubFH(FlagHandler):
+    @property
+    def name(self) -> str:
+        return "stub-fh"
 
-    return HealthChecker(
-        timeline,
-        exec_in_container=fake_exec,
-        service_resolver=lambda team, svc: None,
-        handle_resolver=lambda name: None,  # not used when service_resolver returns None
-        status_resolver=lambda: {"round": 1, "phase": "ATTACK"},
-    )
+    def plant(self, target, flag):  # pragma: no cover — unused here
+        raise NotImplementedError
+
+    def retrieve(self, target, handle):
+        return None
 
 
-def _checks(timeline: Timeline) -> list:
-    return [e for e in timeline.history() if e.type == EventType.SERVICE_HEALTH_CHECK.value]
+class _StubCh(Challenge):
+    def __init__(self, tree: CheckResult) -> None:
+        self._ft = _StubFT(tree)
+        self._fh = _StubFH()
+
+    @property
+    def name(self) -> str:
+        return "stub"
+
+    @property
+    def vulbox(self) -> VulboxImage:
+        return VulboxImage(reference="stub", exposed_ports={"service": 1})
+
+    @property
+    def functionality_test(self) -> FunctionalityTest:
+        return self._ft
+
+    @property
+    def flag_handler(self) -> FlagHandler:
+        return self._fh
+
+    @property
+    def docs(self) -> ChallengeDocs:
+        return ChallengeDocs(intro="", agent_prompts={}, func_test_spec="")
 
 
-def test_chain_emits_four_events_in_order_all_passing():
+def _target() -> VulboxTarget:
+    return VulboxTarget(host="team1_prod", ports={"service": 1}, meta={})
+
+
+def _checks(tl: Timeline) -> list:
+    return [e for e in tl.history() if e.type == EventType.SERVICE_HEALTH_CHECK.value]
+
+
+def _run(checker, **kwargs):
+    return asyncio.run(checker.run(**kwargs))
+
+
+def test_run_emits_one_event_per_leaf_in_pre_order():
+    """4-leaf tree (the standard process/tcp/protocol/checker shape)
+    yields 4 events whose `level` payload matches the leaf names."""
+    tree = CheckResult(name="root", passed=True, children=[
+        CheckResult(name="process", passed=True, detail="pgrep rc=0"),
+        CheckResult(name="tcp", passed=True, detail="ok"),
+        CheckResult(name="protocol", passed=True, detail="ok"),
+        CheckResult(name="checker", passed=True, detail="checker ok"),
+    ])
     tl = Timeline()
-    checker = _checker(tl, {})  # everything returns (0, "ok")
+    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+    _run(checker, team_id="team1", service="x", target=_target(), challenge=_StubCh(tree))
 
-    async def go():
-        await checker.run_chain(
-            team_id="team1", service="nautilus-ico",
-            container_name="team1_prod", spec=_spec(),
-        )
-
-    asyncio.run(go())
     levels = [e.payload["level"] for e in _checks(tl)]
-    assert levels == [
-        HealthLevel.PROCESS.value,
-        HealthLevel.TCP.value,
-        HealthLevel.PROTOCOL.value,
-        HealthLevel.CHECKER.value,
-    ]
+    assert levels == ["process", "tcp", "protocol", "checker"]
     assert all(e.payload["passed"] for e in _checks(tl))
 
 
-def test_process_fails_when_pgrep_returns_nonzero():
+def test_run_propagates_failure_per_leaf():
+    tree = CheckResult(name="root", passed=False, children=[
+        CheckResult(name="process", passed=True, detail=""),
+        CheckResult(name="tcp", passed=False, detail="connection refused"),
+    ])
     tl = Timeline()
-    checker = _checker(tl, {"pgrep": (1, "")})
+    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+    _run(checker, team_id="team1", service="x", target=_target(), challenge=_StubCh(tree))
 
-    async def go():
-        await checker.run_chain(
-            team_id="team1", service="nautilus-ico",
-            container_name="c", spec=_spec(),
-        )
-
-    asyncio.run(go())
-    by_level = {e.payload["level"]: e.payload["passed"] for e in _checks(tl)}
-    assert by_level[HealthLevel.PROCESS.value] is False
-    assert by_level[HealthLevel.TCP.value] is True  # other levels still run
+    by_level = {e.payload["level"]: e.payload for e in _checks(tl)}
+    assert by_level["process"]["passed"] is True
+    assert by_level["tcp"]["passed"] is False
+    assert "connection refused" in by_level["tcp"]["detail"]
 
 
-def test_tcp_fails_when_socket_connect_nonzero():
+def test_run_returns_root_check_result():
+    tree = CheckResult(name="root", passed=True, children=[
+        CheckResult(name="single", passed=True, detail=""),
+    ])
     tl = Timeline()
-    checker = _checker(tl, {"socket": (1, "")})
-
-    async def go():
-        await checker.run_chain(
-            team_id="team1", service="nautilus-ico",
-            container_name="c", spec=_spec(),
-        )
-
-    asyncio.run(go())
-    by_level = {e.payload["level"]: e.payload["passed"] for e in _checks(tl)}
-    assert by_level[HealthLevel.TCP.value] is False
+    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+    result = _run(checker, team_id="team1", service="x", target=_target(), challenge=_StubCh(tree))
+    assert result is tree
 
 
-def test_checker_fails_when_checker_cmd_nonzero():
+def test_run_handles_single_leaf_tree():
+    """A challenge whose FunctionalityTest returns a single leaf (no
+    children) should still emit one event."""
+    tree = CheckResult(name="alive", passed=True, detail="ok")
     tl = Timeline()
-    checker = _checker(tl, {"checker.sh": (1, "FAIL: vuln gone\n")})
-
-    async def go():
-        await checker.run_chain(
-            team_id="team1", service="nautilus-ico",
-            container_name="c", spec=_spec(),
-        )
-
-    asyncio.run(go())
-    by_level = {e.payload["level"]: (e.payload["passed"], e.payload["detail"]) for e in _checks(tl)}
-    passed, detail = by_level[HealthLevel.CHECKER.value]
-    assert passed is False
-    assert "FAIL" in detail
+    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+    _run(checker, team_id="team1", service="x", target=_target(), challenge=_StubCh(tree))
+    checks = _checks(tl)
+    assert len(checks) == 1
+    assert checks[0].payload["level"] == "alive"
 
 
-def test_no_process_pattern_skipped_as_passing():
-    """spec with no process_pattern → PROCESS passes with "skipped" detail."""
+def test_run_walks_nested_trees():
+    """A deeper tree emits one event per leaf, parent rollups omitted."""
+    tree = CheckResult(name="root", passed=True, children=[
+        CheckResult(name="net", passed=True, children=[
+            CheckResult(name="tcp", passed=True),
+            CheckResult(name="tls", passed=True),
+        ]),
+        CheckResult(name="checker", passed=True),
+    ])
     tl = Timeline()
-    checker = _checker(tl, {})
-    spec = _spec(metadata={"health_check": {"checker_command": "/arena/checker.sh"}})
-
-    async def go():
-        await checker.run_chain(
-            team_id="team1", service="nautilus-ico",
-            container_name="c", spec=spec,
-        )
-
-    asyncio.run(go())
-    process = next(e for e in _checks(tl) if e.payload["level"] == HealthLevel.PROCESS.value)
-    assert process.payload["passed"] is True
-    assert "skipped" in process.payload["detail"]
-
-
-def test_no_checker_cmd_aliases_to_protocol():
-    """spec with no checker_command → CHECKER reuses PROTOCOL outcome."""
-    tl = Timeline()
-    # PROTOCOL has no service adapter → passes with reason; CHECKER inherits.
-    checker = _checker(tl, {})
-    spec = _spec(metadata={"health_check": {"process_pattern": "ico"}})
-
-    async def go():
-        await checker.run_chain(
-            team_id="team1", service="nautilus-ico",
-            container_name="c", spec=spec,
-        )
-
-    asyncio.run(go())
-    chk = next(e for e in _checks(tl) if e.payload["level"] == HealthLevel.CHECKER.value)
-    assert chk.payload["passed"] is True
-    assert "aliased to PROTOCOL" in chk.payload["detail"]
+    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+    _run(checker, team_id="team1", service="x", target=_target(), challenge=_StubCh(tree))
+    levels = [e.payload["level"] for e in _checks(tl)]
+    # No "net" or "root" — those are internal rollups.
+    assert levels == ["tcp", "tls", "checker"]
 
 
 def test_status_resolver_stamps_round_and_phase():
+    tree = CheckResult(name="single", passed=True)
     tl = Timeline()
-    checker = HealthChecker(
-        tl,
-        exec_in_container=lambda c, cmd: (0, ""),
-        service_resolver=lambda t, s: None,
-        handle_resolver=lambda n: None,
-        status_resolver=lambda: {"round": 7, "phase": "ATTACK"},
-    )
-
-    async def go():
-        await checker.run_chain(
-            team_id="team1", service="nautilus-ico",
-            container_name="c", spec=_spec(),
-        )
-
-    asyncio.run(go())
-    for e in _checks(tl):
-        assert e.round_id == 7
-        assert e.phase == "ATTACK"
+    checker = HealthChecker(tl, status_resolver=lambda: {"round": 7, "phase": "ATTACK"})
+    _run(checker, team_id="team1", service="x", target=_target(), challenge=_StubCh(tree))
+    ev = _checks(tl)[0]
+    assert ev.round_id == 7
+    assert ev.phase == "ATTACK"

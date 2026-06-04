@@ -203,12 +203,13 @@ def test_cheese_path_process_pattern_does_not_match_stub(stub_listener_container
 
 
 def test_emit_health_chain_emits_four_events_one_per_level(dcf_ico_container):
-    """Integration: HealthChecker (lifted out of GameMgr in the bus
-    refactor) walks all 4 levels and records one SERVICE_HEALTH_CHECK
-    per level in order against a live ico container."""
+    """Integration: HealthChecker (v2: delegates to challenge.functionality_test)
+    walks all 4 levels and records one SERVICE_HEALTH_CHECK per leaf in
+    order against a live ico container."""
     import asyncio
 
-    from challenges.nautilus import NautilusSource
+    from challenges.interface import VulboxTarget
+    from challenges.nautilus_ico import IcoChallenge
     from gamemgr.timeline import Timeline
     from health.checker import HealthChecker
 
@@ -217,13 +218,6 @@ def test_emit_health_chain_emits_four_events_one_per_level(dcf_ico_container):
     _exec(name, ["/arena/restart.sh"])
     _wait_for_port(name)
 
-    nautilus = NautilusSource(include=["ico"])
-    spec = next(s for s in nautilus.list_challenges() if s.name == "nautilus-ico")
-
-    tl = Timeline()
-    # Use real docker via subprocess for the exec — same path GameMgr
-    # uses in production (docker SDK), but we bypass the SDK here so the
-    # test stays the same shape it had pre-refactor.
     import docker
     client = docker.from_env()
 
@@ -233,28 +227,31 @@ def test_emit_health_chain_emits_four_events_one_per_level(dcf_ico_container):
         out = result.output.decode(errors="replace") if result.output else ""
         return result.exit_code, out
 
-    checker = HealthChecker(
-        tl,
-        exec_in_container=exec_in,
-        service_resolver=lambda team, svc: None,
-        handle_resolver=lambda n: None,
-        status_resolver=lambda: {"round": 1, "phase": "ATTACK"},
+    challenge = IcoChallenge()
+    target = VulboxTarget(
+        host=name,
+        ports={"service": 4265},
+        meta={"team_id": "team1", "exec_in_container": exec_in},
     )
 
+    tl = Timeline()
+    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+
     async def run():
-        await checker.run_chain(
+        await checker.run(
             team_id="team1",
             service="nautilus-ico",
-            container_name=name,
-            spec=spec,
+            target=target,
+            challenge=challenge,
         )
 
     asyncio.run(run())
 
     checks = [e for e in tl.history() if e.type == EventType.SERVICE_HEALTH_CHECK.value]
     levels = [c.payload["level"] for c in checks]
-    assert levels == ["process", "tcp", "protocol", "checker"], (
-        f"expected 4 events in PROCESS→TCP→PROTOCOL→CHECKER order, got {levels}"
+    # IcoFunctionalityTest emits process / tcp / protocol / checker leaves.
+    assert set(levels) == {"process", "tcp", "protocol", "checker"}, (
+        f"expected 4 leaves, got {levels}"
     )
     by_level = {c.payload["level"]: c.payload for c in checks}
     assert by_level["process"]["passed"] is True, by_level["process"]

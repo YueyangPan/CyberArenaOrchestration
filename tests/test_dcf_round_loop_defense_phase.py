@@ -101,18 +101,42 @@ def test_flag_planted_fires_before_defense_kickoff():
             for tid in ("team1", "team2")
         },
     )
-    # Inject a FILE_AT_PATH spec so plant_flags walks the docker-exec
-    # path; stub the FlagServer's docker-exec write so the test doesn't
-    # touch docker.
-    from challenges.source import ChallengeSpec, FlagMechanism
-    spec = ChallengeSpec(
-        name="nautilus-ico", source="nautilus", port=4265,
-        image_tag="x", flag_mechanism=FlagMechanism.FILE_AT_PATH,
-        metadata={"flag_path": "/flag", "restart_cmd": "echo"},
+    # Inject a stub Challenge so plant_flags has work to do but doesn't
+    # touch docker. The stub's flag_handler.plant is a no-op; FlagServer
+    # still records FLAG_PLANTED and updates the store, which is what
+    # this regression test pins.
+    from challenges.interface import (
+        Challenge, ChallengeDocs, FlagHandler, FunctionalityTest, VulboxImage,
     )
-    game._spec_by_owner[("team1", "nautilus-ico")] = spec
-    game._spec_by_owner[("team2", "nautilus-ico")] = spec
-    game.flag_server._plant_file_at_path = lambda *a, **kw: None
+
+    class _StubFH(FlagHandler):
+        @property
+        def name(self): return "stub-fh"
+        def plant(self, target, flag): return "/flag"
+        def retrieve(self, target, handle): return None
+
+    class _StubFT(FunctionalityTest):
+        @property
+        def name(self): return "stub-ft"
+        def run(self, target): raise NotImplementedError
+
+    class _StubCh(Challenge):
+        @property
+        def name(self): return "nautilus-ico"
+        @property
+        def vulbox(self):
+            return VulboxImage(reference="x", exposed_ports={"service": 4265})
+        @property
+        def functionality_test(self): return _StubFT()
+        @property
+        def flag_handler(self): return _StubFH()
+        @property
+        def docs(self):
+            return ChallengeDocs(intro="", agent_prompts={}, func_test_spec="")
+
+    stub = _StubCh()
+    game._challenge_by_owner[("team1", "nautilus-ico")] = stub
+    game._challenge_by_owner[("team2", "nautilus-ico")] = stub
 
     seen_history_at_handler: dict[str, list[str]] = {}
     seen_planted_at_handler: dict[str, dict] = {}

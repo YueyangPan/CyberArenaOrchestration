@@ -5,39 +5,38 @@ Lifted out of `GameMgr` so flag mechanics are an independent facility
 shapes (`plant_initial_flags`, `plant_flags`, `submit_flag`, `flags`)
 but delegates the work here.
 
+Stage 3 (challenge interface v2): the per-mechanism branching is gone.
+FlagServer no longer knows about SERVICE_PROTOCOL vs FILE_AT_PATH —
+plant goes through `Challenge.flag_handler.plant(target, flag)` and the
+challenge owns its transport. The (team, service) -> Challenge map is
+populated by GameMgr.deploy_challenges and passed in by reference.
+
 Dependencies are injected at construction:
   * `timeline`           — for FLAG_PLANTED / FLAG_SUBMITTED records
-  * `topology`           — team_id → prod container name resolution
-  * `service_by_owner`   — (team, service) → Service adapter for
-                           SERVICE_PROTOCOL plants (mutable dict ref;
-                           populated by GameMgr.deploy_challenges)
-  * `spec_by_owner`      — (team, service) → ChallengeSpec for
-                           FILE_AT_PATH plants (mutable dict ref)
-  * `handle_resolver`    — container_name → ContainerHandle
-  * `exec_in_container`  — docker exec for FILE_AT_PATH plant writes
-  * `status_resolver`    — () → {round, phase} for FLAG_SUBMITTED stamping
-
-Pluggable per Service ABC + FlagMechanism — no demo-service specifics
-hardcoded.
+  * `challenge_by_owner` — (team, service) -> Challenge instance
+                           (mutable dict ref; populated by
+                           GameMgr.deploy_challenges)
+  * `target_factory`     — (team_id, challenge) -> VulboxTarget; built
+                           by GameMgr (`GameMgr.target_for`) so flag
+                           handlers see the privileged docker-exec
+                           channel without FlagServer touching topology
+  * `status_resolver`    — () -> {round, phase} for FLAG_SUBMITTED stamping
 """
 
 from __future__ import annotations
 
 import logging
-import shlex
 from typing import Callable
 
-from challenges.source import ChallengeSpec
+from challenges.interface import Challenge, VulboxTarget
 from gamemgr.events import EventType
 from gamemgr.timeline import Timeline
-from orchestrator.service import ContainerHandle, Service
 
 from .store import FlagStore, SubmitResult, new_flag
 
 log = logging.getLogger(__name__)
 
-ExecFn = Callable[[str, str], tuple[int, str]]
-HandleResolver = Callable[[str], ContainerHandle]
+TargetFactory = Callable[[str, Challenge], VulboxTarget]
 StatusResolver = Callable[[], dict]
 
 
@@ -46,21 +45,20 @@ class FlagServer:
         self,
         timeline: Timeline,
         *,
-        topology,
-        service_by_owner: dict[tuple[str, str], Service],
-        spec_by_owner: dict[tuple[str, str], ChallengeSpec],
-        handle_resolver: HandleResolver,
-        exec_in_container: ExecFn,
+        challenge_by_owner: dict[tuple[str, str], Challenge],
+        target_factory: TargetFactory,
         status_resolver: StatusResolver,
     ) -> None:
         self.timeline = timeline
-        self.topology = topology
-        self._service_by_owner = service_by_owner
-        self._spec_by_owner = spec_by_owner
-        self._handle = handle_resolver
-        self._exec = exec_in_container
+        self._challenge_by_owner = challenge_by_owner
+        self._target = target_factory
         self._status = status_resolver
         self.store = FlagStore()
+        # Per-(team, service) handle returned by the most recent plant.
+        # Kept so future retrieve() paths (own-team verify, attack-agent
+        # retrieve over the same handler) can locate the planted flag.
+        # No caller reads this yet in Stage 3.
+        self._handles: dict[tuple[str, str], str] = {}
         # Idempotency guard for rotate(): a re-entry on the same round
         # must not re-plant (defensive against any caller firing twice).
         self._last_planted_round: int = -1
@@ -73,7 +71,7 @@ class FlagServer:
         return self.plant_flags(round_id=0)
 
     def plant_flags(self, round_id: int) -> list[tuple[str, str, str]]:
-        """Re-plant one fresh flag per (team, deployed service).
+        """Re-plant one fresh flag per (team, deployed challenge).
 
         Called once at pre-game (round_id=0) and at every DEFENSE entry
         (via `rotate`). `FlagStore.plant()` drops the prior flag from the
@@ -83,35 +81,17 @@ class FlagServer:
         Returns the list of (team_id, service_name, flag) planted.
         """
         planted: list[tuple[str, str, str]] = []
-        team_to_prod = {t.id: t.prod for t in self.topology.teams}
-
-        # SERVICE_PROTOCOL plants (notes-style: PUT via the service's
-        # own protocol).
-        for (team_id, service_name), service in self._service_by_owner.items():
-            cname = team_to_prod[team_id]
-            handle = self._handle(cname)
+        for (team_id, service_name), challenge in self._challenge_by_owner.items():
+            target = self._target(team_id, challenge)
             flag = new_flag()
             log.info(
-                "planting flag on %s/%s (round=%d, SERVICE_PROTOCOL)",
-                team_id, service_name, round_id,
+                "planting flag on %s/%s (round=%d, handler=%s)",
+                team_id, service_name, round_id, challenge.flag_handler.name,
             )
-            service.plant_flag(handle, flag)
+            handle = challenge.flag_handler.plant(target, flag)
+            self._handles[(team_id, service_name)] = handle
             self.store.plant(team_id, service_name, flag)
             planted.append((team_id, service_name, flag))
-
-        # FILE_AT_PATH plants (nautilus-ico-style: docker exec write).
-        for (team_id, service_name), spec in self._spec_by_owner.items():
-            cname = team_to_prod[team_id]
-            flag = new_flag()
-            flag_path = (spec.metadata or {}).get("flag_path", "/flag")
-            log.info(
-                "planting flag on %s/%s -> %s (round=%d, FILE_AT_PATH)",
-                team_id, service_name, flag_path, round_id,
-            )
-            self._plant_file_at_path(cname, flag_path, flag)
-            self.store.plant(team_id, service_name, flag)
-            planted.append((team_id, service_name, flag))
-
         self._last_planted_round = round_id
         return planted
 
@@ -129,25 +109,6 @@ class FlagServer:
                 team_id=team_id,
                 round_id=round_id,
                 payload={"service": service_name},
-            )
-
-    def _plant_file_at_path(self, container_name: str, flag_path: str, flag: str) -> None:
-        """Write `flag` (no trailing newline) to `flag_path` inside the
-        container as root, mode 644. Raises if the write fails — a
-        missing flag would silently break every CHECKER probe (e.g.
-        ico reads /flag on CONNECT) and we want that surfaced loudly
-        at deploy time.
-        """
-        # shlex.quote handles any quote/dollar/backtick in `flag` safely.
-        cmd = (
-            f"sh -c 'printf %s {shlex.quote(flag)} > {shlex.quote(flag_path)} "
-            f"&& chmod 644 {shlex.quote(flag_path)}'"
-        )
-        rc, out = self._exec(container_name, cmd)
-        if rc != 0:
-            raise RuntimeError(
-                f"FILE_AT_PATH plant failed on {container_name}:{flag_path}: "
-                f"rc={rc}, out={out[-200:]!r}"
             )
 
     # ── submission ──────────────────────────────────────────────────────

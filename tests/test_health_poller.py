@@ -5,15 +5,27 @@ Verify:
   - periodic loop runs at the configured interval
   - on_attack_exit cancels all periodic tasks
   - trigger_now runs one-shot for a specific (team, service)
-  - non-defense-capable services have no target (trigger_now no-ops)
+  - non-defense-capable challenges have no target (trigger_now no-ops)
+
+Stage 4 (challenge interface v2): PollTarget now carries a `Challenge`
++ a pre-built `VulboxTarget`; HealthChecker delegates to
+`challenge.functionality_test.run(target)`.
 """
 
 from __future__ import annotations
 
 import asyncio
 
-import pytest
-
+from challenges.interface import (
+    Challenge,
+    ChallengeDocs,
+    CheckResult,
+    FlagHandler,
+    FunctionalityTest,
+    RestartHandler,
+    VulboxImage,
+    VulboxTarget,
+)
 from challenges.source import ChallengeSpec, FlagMechanism
 from gamemgr.events import EventType
 from gamemgr.timeline import Timeline
@@ -21,37 +33,111 @@ from health.checker import HealthChecker
 from health.poller import DEFAULT_INTERVAL_SECS, HealthPoller, PollTarget, build_targets
 
 
-def _spec(*, restart=True, interval=None) -> ChallengeSpec:
-    md = {"flag_path": "/flag", "health_check": {}}
-    if restart:
-        md["restart_cmd"] = "echo"
-    if interval is not None:
-        md["health_check"]["interval_secs"] = interval
-    return ChallengeSpec(
-        name="nautilus-ico", source="nautilus", port=4265,
-        image_tag="x", flag_mechanism=FlagMechanism.FILE_AT_PATH,
-        metadata=md,
-    )
+# ── stub Challenge with a 4-leaf functionality test ────────────────────
+
+
+class _StubFT(FunctionalityTest):
+    @property
+    def name(self) -> str:
+        return "stub-ft"
+
+    def run(self, target):
+        return CheckResult(name="root", passed=True, children=[
+            CheckResult(name="process", passed=True),
+            CheckResult(name="tcp", passed=True),
+            CheckResult(name="protocol", passed=True),
+            CheckResult(name="checker", passed=True),
+        ])
+
+
+class _StubFH(FlagHandler):
+    @property
+    def name(self) -> str:
+        return "stub-fh"
+
+    def plant(self, target, flag):  # pragma: no cover — unused
+        raise NotImplementedError
+
+    def retrieve(self, target, handle):
+        return None
+
+
+class _StubRH(RestartHandler):
+    @property
+    def name(self) -> str:
+        return "stub-rh"
+
+    def run(self, target):  # pragma: no cover — unused
+        raise NotImplementedError
+
+
+class _DefenseChallenge(Challenge):
+    """Defense-capable: has a restart_handler."""
+    @property
+    def name(self) -> str:
+        return "nautilus-ico"
+
+    @property
+    def vulbox(self) -> VulboxImage:
+        return VulboxImage(reference="x", exposed_ports={"service": 4265})
+
+    @property
+    def functionality_test(self) -> FunctionalityTest:
+        return _StubFT()
+
+    @property
+    def flag_handler(self) -> FlagHandler:
+        return _StubFH()
+
+    @property
+    def restart_handler(self) -> RestartHandler | None:
+        return _StubRH()
+
+    @property
+    def docs(self) -> ChallengeDocs:
+        return ChallengeDocs(intro="", agent_prompts={}, func_test_spec="")
+
+
+class _AttackOnlyChallenge(Challenge):
+    """Attack-only: restart_handler stays default (None)."""
+    @property
+    def name(self) -> str:
+        return "notes"
+
+    @property
+    def vulbox(self) -> VulboxImage:
+        return VulboxImage(reference="x", exposed_ports={"service": 5000})
+
+    @property
+    def functionality_test(self) -> FunctionalityTest:
+        return _StubFT()
+
+    @property
+    def flag_handler(self) -> FlagHandler:
+        return _StubFH()
+
+    @property
+    def docs(self) -> ChallengeDocs:
+        return ChallengeDocs(intro="", agent_prompts={}, func_test_spec="")
 
 
 def _checker(timeline: Timeline) -> HealthChecker:
-    return HealthChecker(
-        timeline,
-        exec_in_container=lambda c, cmd: (0, "ok"),
-        service_resolver=lambda t, s: None,
-        handle_resolver=lambda n: None,
-        status_resolver=lambda: {"round": 1, "phase": "ATTACK"},
-    )
+    return HealthChecker(timeline, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
 
 
 def _checks(timeline: Timeline) -> list:
     return [e for e in timeline.history() if e.type == EventType.SERVICE_HEALTH_CHECK.value]
 
 
-def _target(team: str, *, interval: float) -> PollTarget:
+def _target(team: str, *, interval: float, challenge: Challenge | None = None) -> PollTarget:
+    ch = challenge or _DefenseChallenge()
+    vt = VulboxTarget(host=f"{team}_prod", ports={"service": 4265}, meta={"team_id": team})
     return PollTarget(
-        team_id=team, service="nautilus-ico", container_name=f"{team}_prod",
-        spec=_spec(), interval_secs=interval,
+        team_id=team,
+        service=ch.name,
+        challenge=ch,
+        target=vt,
+        interval_secs=interval,
     )
 
 
@@ -64,10 +150,7 @@ def test_on_attack_enter_fires_immediate_probe_per_target():
 
     async def run():
         immediate = poller.on_attack_enter(round_id=1)
-        # Each target gets a 4-level chain (4 events). Wait for immediate
-        # probes to finish.
         await asyncio.gather(*immediate)
-        # Stop the periodic tasks before they fire.
         poller.on_attack_exit()
 
     asyncio.run(run())
@@ -89,14 +172,11 @@ def test_periodic_loop_runs_at_interval():
     async def run():
         immediate = poller.on_attack_enter(round_id=1)
         await asyncio.gather(*immediate)
-        # 0.2s = ~3 periodic ticks after the immediate.
         await asyncio.sleep(0.2)
         poller.on_attack_exit()
 
     asyncio.run(run())
-
-    # Immediate + at least 2 periodic = ≥ 12 SERVICE_HEALTH_CHECK events.
-    # Use a soft lower bound to tolerate timing jitter.
+    # immediate (4) + ≥2 periodic ticks × 4 leaves = ≥8 events.
     assert len(_checks(tl)) >= 8, f"expected ≥8 checks, got {len(_checks(tl))}"
 
 
@@ -107,7 +187,6 @@ def test_on_attack_exit_cancels_periodic_tasks():
     async def run():
         immediate = poller.on_attack_enter(round_id=1)
         await asyncio.gather(*immediate)
-        # Stop immediately, then sleep — no further probes should land.
         poller.on_attack_exit()
         baseline = len(_checks(tl))
         await asyncio.sleep(0.1)
@@ -145,8 +224,24 @@ def test_trigger_now_is_noop_for_unknown_target():
 # ── build_targets cross-product + filter ──────────────────────────────
 
 
-def test_build_targets_filters_non_defense_capable():
-    """Services without restart_cmd are not pollable."""
+def _spec_with_interval(interval: int | None) -> ChallengeSpec:
+    md = {"flag_path": "/flag", "restart_cmd": "echo", "health_check": {}}
+    if interval is not None:
+        md["health_check"]["interval_secs"] = interval
+    return ChallengeSpec(
+        name="nautilus-ico", source="nautilus", port=4265,
+        image_tag="x", flag_mechanism=FlagMechanism.FILE_AT_PATH,
+        metadata=md,
+    )
+
+
+def _target_factory(team_id, ch):
+    return VulboxTarget(host=f"{team_id}_prod", ports=dict(ch.vulbox.exposed_ports), meta={})
+
+
+def test_build_targets_filters_attack_only_challenges():
+    """Challenges with restart_handler=None aren't pollable — periodic
+    CHECKER probes would be wasted load on attack-only services."""
     from gamemgr.config import ChallengeConfig
     from models.topology import Team
 
@@ -158,13 +253,17 @@ def test_build_targets_filters_non_defense_capable():
         "team1": Team(id="team1", dev="team1_dev", prod="team1_prod", token="t1"),
         "team2": Team(id="team2", dev="team2_dev", prod="team2_prod", token="t2"),
     }
-    specs = {
-        "notes": _spec(restart=False),                  # no restart_cmd
-        "nautilus-ico": _spec(restart=True, interval=5),
+    challenge_by_name = {
+        "notes": _AttackOnlyChallenge(),
+        "nautilus-ico": _DefenseChallenge(),
     }
+    specs = {"nautilus-ico": _spec_with_interval(5)}
+
     targets = build_targets(
         challenges=challenges,
         teams_by_id=teams_by_id,
+        challenge_by_name=challenge_by_name.__getitem__,
+        target_factory=_target_factory,
         resolve_spec=specs.get,
     )
     # notes filtered out; nautilus-ico × 2 teams = 2 targets.
@@ -182,10 +281,14 @@ def test_build_targets_falls_back_to_default_interval(caplog):
         ChallengeConfig(name="nautilus-ico", type="nautilus-ico", port=4265, deploy_on=["team1"]),
     ]
     teams_by_id = {"team1": Team(id="team1", dev="d", prod="p", token="t")}
-    specs = {"nautilus-ico": _spec(restart=True, interval=None)}  # no interval_secs
+    challenge_by_name = {"nautilus-ico": _DefenseChallenge()}
+    specs = {"nautilus-ico": _spec_with_interval(None)}
+
     targets = build_targets(
         challenges=challenges,
         teams_by_id=teams_by_id,
+        challenge_by_name=challenge_by_name.__getitem__,
+        target_factory=_target_factory,
         resolve_spec=specs.get,
     )
     assert len(targets) == 1

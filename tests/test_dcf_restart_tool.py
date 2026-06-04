@@ -76,13 +76,13 @@ def test_restart_service_unknown_service_raises():
     asyncio.run(run())
 
 
-def test_restart_service_notes_has_no_restart_cmd():
-    """The toy `notes` source has no restart_cmd in its spec metadata —
-    restart_service rejects it as not-defendable rather than crashing later."""
+def test_restart_service_notes_has_no_restart_handler():
+    """NotesChallenge is attack-only (restart_handler = None); restart_service
+    rejects it as not-defendable rather than crashing later."""
     game = _make_game(challenge_name="notes")
 
     async def run():
-        with pytest.raises(ValueError, match="no restart_cmd"):
+        with pytest.raises(ValueError, match="no restart handler"):
             await game.restart_service("team1", "notes")
 
     asyncio.run(run())

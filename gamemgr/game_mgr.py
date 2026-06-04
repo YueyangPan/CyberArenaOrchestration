@@ -22,6 +22,7 @@ from orchestrator.orchestrator import Orchestrator
 from orchestrator.service import ContainerHandle, Service
 
 from agents.prompts import build_attack_prompt, build_defense_prompt
+from challenges.interface import Challenge, VulboxTarget
 from challenges.notes import BuiltinNotesSource
 from challenges.registry import build as build_challenge
 from challenges.source import ChallengeSpec, FlagMechanism
@@ -43,10 +44,25 @@ from .round import Phase, RoundLoop
 from .timeline import Timeline
 
 from flag import FlagServer, SubmitResult
-from health.checker import HealthChecker
+from health.checker import HealthChecker, leaves
 from health.poller import HealthPoller, build_targets
 
 log = logging.getLogger(__name__)
+
+
+def _build_challenge_v2(chal_name: str) -> Challenge:
+    """Inline factory: chcfg.name -> Challenge instance. Stage 7 moves
+    this into `challenges/registry.py` (string -> class lookup with
+    plugin entry-point support). Until then a hardcoded switch keeps
+    the v2 wiring isolated to GameMgr.deploy_challenges.
+    """
+    if chal_name == "notes":
+        from challenges.notes import NotesChallenge
+        return NotesChallenge()
+    if chal_name == "nautilus-ico":
+        from challenges.nautilus_ico import IcoChallenge
+        return IcoChallenge()
+    raise KeyError(f"unknown challenge name for v2 factory: {chal_name!r}")
 
 
 class GameMgr:
@@ -68,9 +84,15 @@ class GameMgr:
         # plant flags via direct docker-exec writes — they go in _spec_by_owner.
         self._service_by_owner: dict[tuple[str, str], Service] = {}
         # (team_id, service_name) -> ChallengeSpec, populated by deploy_challenges
-        # for FILE_AT_PATH challenges. The FlagServer walks this for direct
-        # flag-file writes; emit_setup_events emits SERVICE_DEPLOYED for them.
+        # for FILE_AT_PATH challenges. Read by emit_setup_events for the
+        # SERVICE_DEPLOYED snapshot. Flag-plant no longer reads this (v2
+        # plant goes through _challenge_by_owner).
         self._spec_by_owner: dict[tuple[str, str], ChallengeSpec] = {}
+        # (team_id, service_name) -> Challenge instance (v2). The FlagServer
+        # walks this for plant; future stages will also use it for
+        # functionality_test and restart_handler dispatch. Mutable dict —
+        # deploy_challenges populates it during startup.
+        self._challenge_by_owner: dict[tuple[str, str], Challenge] = {}
         # Container names that hosted FILE_AT_PATH challenge deploys — kept
         # so emit_setup_events can emit SERVICE_DEPLOYED uniformly.
         self._deployed_file_at_path: list[tuple[ChallengeSpec, list[str]]] = []
@@ -82,11 +104,8 @@ class GameMgr:
         # FlagServer sees those mutations naturally.
         self.flag_server = FlagServer(
             self.timeline,
-            topology=config.topology,
-            service_by_owner=self._service_by_owner,
-            spec_by_owner=self._spec_by_owner,
-            handle_resolver=self.handle_for,
-            exec_in_container=self._exec_in_container,
+            challenge_by_owner=self._challenge_by_owner,
+            target_factory=self.target_for,
             status_resolver=self.status,
         )
         # token -> team_id, populated from config; lookup for API auth.
@@ -191,6 +210,14 @@ class GameMgr:
             spec = self._resolve_spec(chcfg.name)
             mechanism = spec.flag_mechanism if spec is not None else FlagMechanism.SERVICE_PROTOCOL
 
+            # v2 Challenge instance — shared across all teams (challenges
+            # are stateless per the ABC contract). Populated for every
+            # chcfg so FlagServer.plant_flags / Stage 4 health probe /
+            # Stage 5 restart can dispatch to ch.flag_handler / .
+            # functionality_test / .restart_handler. Stage 7 promotes
+            # this inline factory to challenges/registry.py.
+            challenge = _build_challenge_v2(chcfg.name)
+
             if mechanism == FlagMechanism.FILE_AT_PATH:
                 # Image-bundled service. Trigger the framework restart_cmd
                 # (e.g. /arena/restart.sh) so the service binary is running.
@@ -212,6 +239,7 @@ class GameMgr:
                                 cname, rc, out[-200:] if out else "",
                             )
                     self._spec_by_owner[(team_id, chcfg.name)] = spec
+                    self._challenge_by_owner[(team_id, chcfg.name)] = challenge
                     cnames.append(cname)
                 self._deployed_file_at_path.append((spec, cnames))
                 continue
@@ -229,6 +257,7 @@ class GameMgr:
                 service.start(handle)
                 handles.append(handle)
                 self._service_by_owner[(team_id, service.name)] = service
+                self._challenge_by_owner[(team_id, service.name)] = challenge
             self._deployed.append((service, handles))
 
     # ── flag mechanics — thin delegates to FlagServer ──────────────────
@@ -300,15 +329,14 @@ class GameMgr:
         driving the full round loop."""
         self.health_checker = HealthChecker(
             self.timeline,
-            exec_in_container=self._exec_in_container,
-            service_resolver=lambda team_id, service: self._service_by_owner.get((team_id, service)),
-            handle_resolver=self.handle_for,
             status_resolver=self.status,
         )
         teams_by_id = {t.id: t for t in self.config.topology.teams}
         targets = build_targets(
             challenges=self.config.challenges,
             teams_by_id=teams_by_id,
+            challenge_by_name=_build_challenge_v2,
+            target_factory=self.target_for,
             resolve_spec=self._resolve_spec,
         )
         self.health_poller = HealthPoller(self.health_checker, targets)
@@ -1030,18 +1058,18 @@ class GameMgr:
         background task that emits SERVICE_RESTART_STARTED / _COMPLETED /
         _FAILED + a SERVICE_HEALTH_CHECK per level on the bus.
 
-        Raises ValueError for unknown service, no restart_cmd in spec, or
-        a restart already in flight for this (team, service). The MCP
-        layer translates these into InvalidParams.
+        Raises ValueError for unknown service, attack-only challenge
+        (no restart_handler), or a restart already in flight for this
+        (team, service). The MCP layer translates these into InvalidParams.
         """
-        # 1. Spec lookup + restart_cmd resolution.
-        spec = self._resolve_spec(service)
-        if spec is None:
+        # 1. Challenge lookup (v2: restart goes through challenge.restart_handler).
+        try:
+            challenge = _build_challenge_v2(service)
+        except KeyError:
             raise ValueError(f"unknown service: {service!r}")
-        restart_cmd = spec.metadata.get("restart_cmd") if spec.metadata else None
-        if not restart_cmd:
+        if challenge.restart_handler is None:
             raise ValueError(
-                f"service {service!r} has no restart_cmd in spec — not defendable"
+                f"service {service!r} has no restart handler — not defendable"
             )
 
         # 2. Container lookup. M5.6 topology: one team{N}_prod per team.
@@ -1087,9 +1115,7 @@ class GameMgr:
                 job_id=job_id,
                 team_id=team_id,
                 service=service,
-                container_name=container_name,
-                restart_cmd=restart_cmd,
-                spec=spec,
+                challenge=challenge,
             )
         )
         return job_id
@@ -1100,23 +1126,34 @@ class GameMgr:
         job_id: str,
         team_id: str,
         service: str,
-        container_name: str,
-        restart_cmd: str,
-        spec: ChallengeSpec,
+        challenge: Challenge,
     ) -> None:
-        """Run restart_cmd inside the team's prod container via docker exec,
-        emit COMPLETED/FAILED with duration_ms, then walk the 4 health levels."""
+        """Run challenge.restart_handler.run(target) in a thread executor,
+        emit COMPLETED/FAILED with duration_ms based on the returned
+        CheckResult, then trigger a post-restart health probe."""
         started_at = self._restart_jobs[job_id]["started_at"]
         st = self.status()
-        # docker exec is blocking; run it in the default thread pool so
-        # we don't block the event loop while make/fpc/etc. runs.
         loop = asyncio.get_running_loop()
+        target = self.target_for(team_id, challenge)
         try:
-            exit_code, output = await loop.run_in_executor(
-                None, self._exec_in_container, container_name, restart_cmd
+            # RestartHandler.run is blocking by contract (docker exec under
+            # the hood); push it off the event loop.
+            result = await loop.run_in_executor(
+                None, challenge.restart_handler.run, target,
             )
             duration_ms = int((time.time() - started_at) * 1000)
-            if exit_code != 0:
+            if not result.passed:
+                # Surface the first failed leaf's detail as the error
+                # message — operators want to know WHERE compile/spawn/smoke
+                # broke without expanding the full tree in the panel.
+                failed = next(
+                    (leaf for leaf in leaves(result) if not leaf.passed),
+                    None,
+                )
+                error_detail = (
+                    f"{failed.name}: {failed.detail}" if failed is not None
+                    else (result.detail or "restart failed")
+                )
                 self.timeline.record(
                     EventType.SERVICE_RESTART_FAILED,
                     team_id=team_id,
@@ -1127,7 +1164,7 @@ class GameMgr:
                         "team_id": team_id,
                         "service": service,
                         "duration_ms": duration_ms,
-                        "error": (output[-200:] if output else f"rc={exit_code}"),
+                        "error": error_detail[-200:],
                     },
                 )
                 self._restart_jobs[job_id]["done"] = True
@@ -1146,8 +1183,8 @@ class GameMgr:
                 },
             )
 
-            # Health check chain — delegated to HealthPoller.trigger_now,
-            # which runs the same 4-level probe via HealthChecker.
+            # Health probe — delegated to HealthPoller.trigger_now, which
+            # runs challenge.functionality_test via HealthChecker.
             if self.health_poller is not None:
                 await self.health_poller.trigger_now(team_id, service)
         except Exception as e:
@@ -1303,3 +1340,37 @@ class GameMgr:
         node = self.config.topology.node(container_name)
         c = self.orchestrator.containers._client.containers.get(container_name)
         return ContainerHandle(container_id=c.id, name=container_name, networks=list(node.networks))
+
+    def target_for(self, team_id: str, challenge: Challenge) -> VulboxTarget:
+        """Build a privileged VulboxTarget for `team_id`'s deployment of `challenge`.
+
+        Runtime coordinates pulled from topology + the challenge's declared
+        vulbox image:
+          host  — team's prod container name (the docker exec target)
+          ports — copy of challenge.vulbox.exposed_ports (same image, same
+                  ports across teams; per-team variation is only in host)
+          meta  — conventional payload that probes look for:
+                    team_id           — included so probes can log with team
+                                        context without re-threading it
+                    exec_in_container — the docker-exec callable contract
+
+        This is the PRIVILEGED target — own-team docker-exec access. It's
+        what FlagServer.plant uses, what HealthChecker.functionality_test
+        uses, and what restart_service hands to RestartHandler. Cross-team
+        attack agents build their own VulboxTarget pointing at the victim
+        over the public network and don't go through this helper.
+        """
+        host = next(
+            (t.prod for t in self.config.topology.teams if t.id == team_id),
+            None,
+        )
+        if host is None:
+            raise KeyError(f"target_for: unknown team_id {team_id!r}")
+        return VulboxTarget(
+            host=host,
+            ports=dict(challenge.vulbox.exposed_ports),
+            meta={
+                "team_id": team_id,
+                "exec_in_container": self._exec_in_container,
+            },
+        )
