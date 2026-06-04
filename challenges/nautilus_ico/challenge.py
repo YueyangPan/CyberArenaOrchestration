@@ -1,13 +1,13 @@
 """IcoChallenge — composition root for nautilus-institute/finals-2025 :: ico.
 
 The vulbox is the upstream Pascal binary, built by us from the pin-cloned
-`vendor/nautilus-finals-2025/ico/` source + our framework dir
-(`challenges/nautilus/ico/`: Dockerfile, restart.sh, checker.sh,
-entrypoint.sh, spec.toml). For now the build is still driven by
-`NautilusSource.build_image()` (Stage 9 will move build to this class via
-VulboxImage.build_context); the image tag the orchestrator deploys is
-`cyberarena/chal-nautilus-ico:<pin>` where `<pin>` is the short SHA of
-the vendor checkout.
+`vendor/nautilus-finals-2025/ico/` source + our hand-authored image dir
+(`challenges/nautilus_ico/image/`: Dockerfile, restart.sh, checker.sh,
+entrypoint.sh). The build itself lives in
+`challenges.nautilus_ico.build.build_image()` and is dispatched through
+`challenges.registry.build_images(cfg)`. The image tag the orchestrator
+deploys is `cyberarena/chal-nautilus-ico:<pin>` where `<pin>` is the
+short SHA of the vendor checkout.
 
 Defense-enabled (unlike notes) — `restart_handler` returns an
 IcoRestartHandler so DEFENSE_KICKOFF + MCP `restart_service` route here.
@@ -35,12 +35,12 @@ from .restart_handler import IcoRestartHandler
 
 log = logging.getLogger(__name__)
 
-# Vendor checkout location; same convention as the legacy NautilusSource
-# (vendor/ is sibling to CyberArenaOrchestration/). When the directory or
-# git is unavailable we tag "unpinned" — image caching is by-content via
-# docker layers so the worst case is over-pulling, not correctness.
+# Vendor checkout location; `vendor/` is sibling to CyberArenaOrchestration/.
+# When the directory or git is unavailable we tag "unpinned" — image
+# caching is by-content via docker layers so the worst case is
+# over-pulling, not correctness.
 _VENDOR_DIR = Path(__file__).resolve().parents[2] / "vendor" / "nautilus-finals-2025"
-_BUILD_CONTEXT = Path(__file__).resolve().parents[1] / "nautilus" / "ico"
+_BUILD_CONTEXT = Path(__file__).resolve().parent / "image"
 
 
 def _read_pin() -> str:
@@ -94,11 +94,10 @@ class IcoChallenge(Challenge):
         return VulboxImage(
             reference=f"cyberarena/chal-nautilus-ico:{pin}",
             exposed_ports={"service": 4265},
-            # build_context points at our framework dir; the orchestrator's
-            # build step also needs vendor/nautilus-finals-2025/ico/ copied
-            # alongside (see NautilusSource.build_image for the current
-            # context-assembly logic). Stage 9 will move that assembly into
-            # the orchestrator's VulboxImage build path.
+            # build_context points at the colocated image/ dir. The
+            # actual build (challenges.nautilus_ico.build.build_image)
+            # assembles a tmpdir combining this + vendor/nautilus-finals-2025/ico/
+            # before invoking `docker build`.
             build_context=str(_BUILD_CONTEXT),
         )
 

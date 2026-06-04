@@ -4,13 +4,14 @@ The ico challenge needs a dedicated image (custom Pascal binary +
 framework scripts under /arena/). We assemble the build context from
 two sources:
 
-  challenges/nautilus/ico/   (this repo) — Dockerfile, restart.sh,
-                              checker.sh, entrypoint.sh, spec.toml
+  challenges/nautilus_ico/image/   (this repo, colocated with the
+                              challenge code) — Dockerfile, restart.sh,
+                              checker.sh, entrypoint.sh
   vendor/nautilus-finals-2025/ico/  (upstream pin-clone) — Pascal source
                               under `service/` that the Dockerfile copies
 
-Both directories must exist; the vendor checkout is created by
-`scripts/sync_nautilus.sh` (a one-shot pin clone).
+The vendor checkout is created by `scripts/sync_nautilus.sh` (a one-shot
+pin clone); the `image/` dir is hand-authored alongside the Python code.
 
 Tag is `cyberarena/chal-nautilus-ico:<pin>` where `<pin>` is the short
 SHA of the vendor checkout, baked into the tag so cached images are
@@ -38,7 +39,7 @@ from .challenge import IcoChallenge
 
 log = logging.getLogger(__name__)
 
-_FRAMEWORK_DIR = Path(__file__).resolve().parents[1] / "nautilus" / "ico"
+_FRAMEWORK_DIR = Path(__file__).resolve().parent / "image"
 _VENDOR_DIR = Path(__file__).resolve().parents[2] / "vendor" / "nautilus-finals-2025" / "ico"
 
 

@@ -1,11 +1,13 @@
 """Challenge registry — name → Challenge instance + per-challenge lifecycle hooks.
 
-Three public entry points:
+Public entry points:
 
-  build_challenge(name)              — instantiate the Challenge for `name`
-  initial_start(name, target, exec)  — first-time start hook (deploy step)
-  build_images(cfg)                  — build any image-bearing challenges
-                                       referenced by the game config
+  build_challenge(name)                 — instantiate the Challenge for `name`
+  known_challenge_names()               — sorted list of registered names
+  initial_start(challenge, target, exec) — first-time start hook (deploy step)
+  build_images(cfg)                     — build any image-bearing challenges
+                                          referenced by the game config
+  health_interval_secs(name, default)   — per-challenge poll interval lookup
 
 Adding a new challenge:
   1. Implement it under `challenges/<name>/` (vulbox + functionality_test +
@@ -17,6 +19,8 @@ Adding a new challenge:
      whose Docker entrypoint handles startup.
   4. If the challenge needs a docker image build (rather than a pre-baked
      registry pull), register a builder in `_IMAGE_BUILDERS`.
+  5. If the default health-poll interval (`DEFAULT_INTERVAL_SECS`)
+     doesn't fit, register an override in `_HEALTH_INTERVAL_SECS`.
 """
 
 from __future__ import annotations

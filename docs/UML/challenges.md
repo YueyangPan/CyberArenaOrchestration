@@ -205,9 +205,15 @@ challenges/
     flag_handler.py                # FILE_AT_PATH via docker exec /flag
     restart_handler.py             # docker exec /arena/restart.sh
     prompts.py                     # attack + defense prompts
-    spec.toml                      # vendor pin + image tag
+    build.py                       # docker build of the ico image
+    image/                         # docker build context for the ico image
+      Dockerfile
+      restart.sh
+      checker.sh
+      entrypoint.sh
 
-  registry.py                      # name → Challenge instance lookup
+  registry.py                      # build_challenge + initial_start +
+                                   # build_images + health_interval_secs
 ```
 
 ## VulboxTarget — the only thing that flows at runtime
@@ -272,5 +278,6 @@ Zero touches to [gamemgr/](../../gamemgr/), [flag/](../../flag/),
 | `challenges/<name>/flag_handler.py` | `FlagHandler` implementation |
 | `challenges/<name>/restart_handler.py` | `RestartHandler` implementation (defense-capable only) |
 | `challenges/<name>/build.py` | `build_image()` for challenges that ship a docker context (e.g. nautilus_ico) |
+| `challenges/<name>/image/` | optional: per-challenge docker build context — Dockerfile + startup/restart/checker scripts |
 | `challenges/<name>/prompts.py` | `build_attack_prompt(cfg)` / `build_defense_prompt(cfg, …)` for the challenge |
 | [`challenges/registry.py`](../../challenges/registry.py) | `build_challenge` + `initial_start` + `build_images` + `health_interval_secs` |
