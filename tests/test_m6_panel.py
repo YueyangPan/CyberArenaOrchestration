@@ -38,8 +38,8 @@ def test_panel_html_exists():
     content = PANEL_HTML_PATH.read_text()
     # Anchors the panel JS / report-screenshot pipeline depends on:
     for needle in (
-        'id="round-num"', 'id="phase"', 'id="phase-strip"',
-        'id="lanes"', 'id="conn"',
+        'id="round-num"', 'id="phase"',
+        'id="timeline"', 'id="controls"', 'id="conn"',
         'fetch(\'/game/events\')',     # backfill path
         '/events/stream',              # WS path
         'Cyber Arena',                 # title text
