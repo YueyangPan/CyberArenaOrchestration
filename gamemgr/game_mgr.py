@@ -16,8 +16,6 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-import docker
-
 from orchestrator.orchestrator import Orchestrator
 from orchestrator.handle import ContainerHandle
 
@@ -607,7 +605,7 @@ class GameMgr:
         """
         if self.artifacts is None:
             return
-        client = docker.from_env()
+        client = self.orchestrator.containers._client
         for team in self.config.topology.teams:
             if not team.prod:
                 continue
@@ -1091,9 +1089,12 @@ class GameMgr:
 
     def _exec_in_container(self, container_name: str, cmd: str) -> tuple[int, str]:
         """Run `cmd` inside the container via docker exec (blocking).
-        Called from the thread pool by `_run_restart_job`."""
-        client = docker.from_env()
-        c = client.containers.get(container_name)
+        Called from the thread pool by `_run_restart_job` and on the hot
+        plant/health/restart paths. Reuses the orchestrator's persistent
+        docker client — instantiating fresh `docker.from_env()` here was
+        the source of a 60s `version` probe timeout that killed a live
+        run at end-of-game log persistence."""
+        c = self.orchestrator.containers._client.containers.get(container_name)
         result = c.exec_run(["bash", "-c", cmd])
         out = result.output.decode(errors="replace") if result.output else ""
         return result.exit_code, out

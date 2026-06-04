@@ -19,11 +19,24 @@ from models.topology import Team, TopologyGraph
 from orchestrator.handle import ContainerHandle
 
 
+class _StubContainerManager:
+    """Stand-in for orchestrator.containers; only `_client` is read by
+    GameMgr (`_exec_in_container` + `_persist_service_logs`)."""
+
+    def __init__(self, client) -> None:
+        self._client = client
+
+
 class _StubOrchestrator:
     network = None
 
+    def __init__(self, docker_client=None):
+        # GameMgr reaches for self.orchestrator.containers._client on the
+        # hot docker-exec path; tests that don't drive that path pass None.
+        self.containers = _StubContainerManager(docker_client)
 
-def _make_game() -> GameMgr:
+
+def _make_game(docker_client=None) -> GameMgr:
     teams = [
         Team(id="team1", dev="team1_dev", prod="team1_prod", token="tok-1"),
         Team(id="team2", dev="team2_dev", prod="team2_prod", token="tok-2"),
@@ -37,7 +50,7 @@ def _make_game() -> GameMgr:
         )],
         rounds=RoundConfig(),
     )
-    return GameMgr(config=cfg, orchestrator=_StubOrchestrator())
+    return GameMgr(config=cfg, orchestrator=_StubOrchestrator(docker_client))
 
 
 def _stub_handle(name: str) -> ContainerHandle:
@@ -92,14 +105,10 @@ class _StubDockerClient:
 
 def test_round_stop_writes_service_logs_via_docker_logs(tmp_path, monkeypatch):
     """on_round_stop dumps `docker logs <team{N}_prod>` to service-logs/."""
-    game = _make_game()
+    game = _make_game(docker_client=_StubDockerClient())
     from gamemgr.artifacts import ArtifactStore
     game.artifacts = ArtifactStore(tmp_path)
     monkeypatch.setattr(game, "handle_for", lambda name: _stub_handle(name))
-    monkeypatch.setattr(
-        "gamemgr.game_mgr.docker.from_env",
-        lambda: _StubDockerClient(),
-    )
 
     async def run():
         await game.on_round_stop(round_id=3, phase=Phase.ATTACK.value)
@@ -112,16 +121,12 @@ def test_round_stop_writes_service_logs_via_docker_logs(tmp_path, monkeypatch):
         assert f"docker stdout for {team}_prod" in p.read_text()
 
 
-def test_phase_change_does_not_write_service_logs(tmp_path, monkeypatch):
+def test_phase_change_does_not_write_service_logs(tmp_path):
     """PHASE_CHANGE (any phase) is NOT a service-log snapshot point —
     only on_round_stop triggers `_persist_service_logs`."""
-    game = _make_game()
+    game = _make_game(docker_client=_StubDockerClient())
     from gamemgr.artifacts import ArtifactStore
     game.artifacts = ArtifactStore(tmp_path)
-    monkeypatch.setattr(
-        "gamemgr.game_mgr.docker.from_env",
-        lambda: _StubDockerClient(),
-    )
 
     # Drive several phase entries; none of them should write docker.log.
     game.enter_defense_phase(round_id=1)
