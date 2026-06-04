@@ -126,7 +126,7 @@ DEFENSE PHASE (continuation) — service {service_name!r}.
 Patch a different hotspot in the source than you touched last round.
 Trigger rebuild: mcp__cyberarena__restart_service with
 {{"service": "{service_name}"}}. Verify port {port} answers, then call
-mcp__cyberarena__report_deploy_complete with duration_ms.
+mcp__cyberarena__report_deploy_complete (no args besides service).
 """
 
 
@@ -185,7 +185,7 @@ DEFENSE RECIPE — just run these
 7. Report completion via MCP:
 
    Tool: mcp__cyberarena__report_deploy_complete
-   Args: {{"service": "{service_name}", "duration_ms": <ms_elapsed>}}
+   Args: {{"service": "{service_name}"}}
 
 NOTES
 - Restarting is idempotent in the framework — calling restart_service

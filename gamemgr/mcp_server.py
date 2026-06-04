@@ -131,19 +131,24 @@ def build_mcp_app(game: "GameMgr") -> tuple[FastMCP, "Starlette"]:
     @mcp.tool()
     async def report_deploy_complete(
         service: str,
-        duration_ms: int | None,
         ctx: Context,
     ) -> dict:
         """Agent self-report after defense deploy finishes. Service name
-        is validated against the yaml challenges whitelist before anything
-        gets written — typos / unknown services are rejected here so they
-        never reach adaptive-duration aggregation."""
+        is validated against the yaml challenges whitelist before
+        anything gets written — typos / unknown services are rejected
+        here so they never reach adaptive-duration aggregation.
+
+        `duration_ms` is intentionally NOT a parameter — the host
+        computes it from the DEFENSE_KICKOFF timestamp it already
+        controls. Agents had been self-reporting garbage values over
+        MCP (live-run observations: 196ms / 175ms for runs that took
+        tens of seconds)."""
         team_id = _team_id_from_ctx(ctx)
         if not game.is_known_service(service):
             raise McpError(
                 ErrorData(code=INVALID_PARAMS, message="unknown service")
             )
-        await game.record_deploy_complete(team_id, service, duration_ms)
+        await game.record_deploy_complete(team_id, service)
         return {"ok": True}
 
     @mcp.tool()

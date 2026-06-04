@@ -122,7 +122,7 @@ SERVICE_HEALTH_CHECK      { team_id, service, level=process,  passed, detail }  
 SERVICE_HEALTH_CHECK      { team_id, service, level=tcp,      passed, detail }
 SERVICE_HEALTH_CHECK      { team_id, service, level=protocol, passed, detail }
 SERVICE_HEALTH_CHECK      { team_id, service, level=checker,  passed, detail }
-DEPLOY_COMPLETE           { service, duration_ms }            # agent-emitted via MCP
+DEPLOY_COMPLETE           { service, duration_ms }            # agent-triggered via MCP; duration_ms is host-computed (now - DEFENSE_KICKOFF ts)
 ```
 
 Failure path: `SERVICE_RESTART_FAILED` with `{error, duration_ms}`;

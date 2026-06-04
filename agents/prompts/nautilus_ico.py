@@ -231,7 +231,7 @@ DEFENSE RECIPE
 6. Report:
 
    Tool: mcp__cyberarena__report_deploy_complete
-   Args: {{"service": "{service_name}", "duration_ms": <ms_elapsed>}}
+   Args: {{"service": "{service_name}"}}
 
 NOTES
 - fpc errors are noisy but the first line is the file + line + msg. If

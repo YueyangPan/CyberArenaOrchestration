@@ -133,6 +133,12 @@ class GameMgr:
         # Idempotency keys per round so a re-fire of PHASE_CHANGE doesn't
         # spawn duplicate work.
         self._defense_kickoff_done: set[tuple[int, str, str]] = set()
+        # Per (round_id, team_id, service) timestamp of DEFENSE_KICKOFF.
+        # `record_deploy_complete` reads this to compute duration_ms
+        # server-side — the agent's self-reported value over MCP was
+        # unreliable (observed dur=196ms / 175ms in live runs where the
+        # agent had actually worked for tens of seconds).
+        self._defense_kickoff_ts: dict[tuple[int, str, str], float] = {}
         self._attack_kickoff_done: set[tuple[int, str]] = set()
         # Tracks team_ids that have already seen at least one kickoff.
         # Used to set the `is_first` flag on subsequent kickoffs — first
@@ -516,6 +522,7 @@ class GameMgr:
                 if key in self._defense_kickoff_done:
                     continue
                 self._defense_kickoff_done.add(key)
+                self._defense_kickoff_ts[key] = time.time()
 
                 self.timeline.record(
                     EventType.DEFENSE_KICKOFF,
@@ -913,25 +920,32 @@ class GameMgr:
             ev.set()
 
     async def record_deploy_complete(
-        self, team_id: str, service: str, duration_ms: int | None
+        self, team_id: str, service: str
     ) -> None:
         """MCP-driven: agent finished its defense deploy.
 
         Overwrite-per-(team, service) in `deploy_reports`, record
         DEPLOY_COMPLETE on the timeline, then drain `_defense_pending`
-        for the current round. When the set is empty we signal the
-        round loop to cut DEFENSE short — replaces the legacy
-        `_on_deploy_complete` bus subscriber.
+        for the current round (DEFENSE phase only — see phase gate
+        below). Caller must have validated `service` via
+        `is_known_service()`.
 
-        Caller must have validated `service` via `is_known_service()`.
+        `duration_ms` is computed server-side as (now - DEFENSE_KICKOFF
+        ts for this round/team/service). The agent's self-reported
+        value over MCP was unreliable — observed garbage values like
+        dur=196ms / 175ms in live runs where the agent had actually
+        worked tens of seconds. Anchoring duration to the kickoff
+        timestamp the host already controls gives a trustworthy number.
         """
         completed_at = time.time()
+        st = self.status()
+        round_id = st.get("round", 0)
+        kickoff_ts = self._defense_kickoff_ts.get((round_id, team_id, service))
+        duration_ms = int((completed_at - kickoff_ts) * 1000) if kickoff_ts is not None else None
         self.deploy_reports.setdefault(team_id, {})[service] = {
             "duration_ms": duration_ms,
             "completed_at": completed_at,
         }
-        st = self.status()
-        round_id = st.get("round", 0)
         self.timeline.record(
             EventType.DEPLOY_COMPLETE,
             team_id=team_id,

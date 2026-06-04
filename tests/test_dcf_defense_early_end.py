@@ -62,12 +62,12 @@ def test_deploy_complete_drains_pending_and_ends_phase_when_empty():
         assert game._defense_pending.get(1) == {("team1", "nautilus-ico"), ("team2", "nautilus-ico")}
 
         # team1 reports — still one pending.
-        await game.record_deploy_complete("team1", "nautilus-ico", 1000)
+        await game.record_deploy_complete("team1", "nautilus-ico")
         assert game._defense_pending[1] == {("team2", "nautilus-ico")}
         assert not game.round_loop._phase_early_end_event.is_set()
 
         # team2 reports — now empty, round loop signalled.
-        await game.record_deploy_complete("team2", "nautilus-ico", 1100)
+        await game.record_deploy_complete("team2", "nautilus-ico")
         assert game._defense_pending[1] == set()
         assert game.round_loop._phase_early_end_event.is_set()
 
@@ -83,7 +83,7 @@ def test_one_team_complete_does_not_end_phase():
 
     async def run():
         game.enter_defense_phase(round_id=1)
-        await game.record_deploy_complete("team1", "nautilus-ico", 1000)
+        await game.record_deploy_complete("team1", "nautilus-ico")
         assert not game.round_loop._phase_early_end_event.is_set()
 
     asyncio.run(run())
@@ -111,8 +111,8 @@ def test_deploy_complete_during_attack_does_not_signal_early_end():
         # on the timeline (for the operator/panel), but:
         #   - pending must NOT be drained
         #   - end_phase_early must NOT fire
-        await game.record_deploy_complete("team1", "nautilus-ico", 1000)
-        await game.record_deploy_complete("team2", "nautilus-ico", 1100)
+        await game.record_deploy_complete("team1", "nautilus-ico")
+        await game.record_deploy_complete("team2", "nautilus-ico")
         assert game._defense_pending == baseline, (
             "pending must be untouched when DEPLOY_COMPLETE arrives outside DEFENSE"
         )
@@ -141,7 +141,7 @@ def test_deploy_complete_for_non_defense_capable_service_is_silent():
         game.enter_defense_phase(round_id=1)
         # notes isn't defense-capable, so _defense_pending should be empty.
         assert game._defense_pending.get(1, set()) == set()
-        await game.record_deploy_complete("team1", "notes", 1000)
+        await game.record_deploy_complete("team1", "notes")
         # No early-end signal because nothing was ever pending.
         assert not game.round_loop._phase_early_end_event.is_set()
 

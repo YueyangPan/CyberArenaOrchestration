@@ -145,18 +145,27 @@ def test_report_ready_emits_agent_ready(server, game):
 
 
 def test_report_deploy_complete_writes_and_emits(server, game):
+    """`duration_ms` is host-computed from the DEFENSE_KICKOFF
+    timestamp the orchestrator already controls. The MCP signature no
+    longer accepts it from the agent (was unreliable in live runs).
+    Seed a kickoff_ts so the host has something to subtract from."""
     before = len(game.timeline.history())
+    # Stamp DEFENSE_KICKOFF ~2s ago so the computed duration is positive
+    # and small (the test fixture doesn't run a real round loop).
+    game._defense_kickoff_ts[(0, "team1", "notes")] = time.time() - 2.0
     asyncio.run(
         _call_tool(
             TOKEN_TEAM1,
             "report_deploy_complete",
-            {"service": "notes", "duration_ms": 1234},
+            {"service": "notes"},
         )
     )
     # Whitelist hit → state updated + event emitted.
     report = game.deploy_reports.get("team1", {}).get("notes")
     assert report is not None, f"deploy_reports not written: {game.deploy_reports}"
-    assert report["duration_ms"] == 1234
+    # Duration computed by host from the seeded kickoff_ts (~2000ms).
+    assert report["duration_ms"] is not None
+    assert 1500 <= report["duration_ms"] <= 5000, report["duration_ms"]
     assert abs(report["completed_at"] - time.time()) < 5
 
     new = game.timeline.history()[before:]
@@ -164,7 +173,7 @@ def test_report_deploy_complete_writes_and_emits(server, game):
     assert dc, f"no DEPLOY_COMPLETE event; new events: {[e.type for e in new]}"
     assert dc[-1].team_id == "team1"
     assert dc[-1].payload.get("service") == "notes"
-    assert dc[-1].payload.get("duration_ms") == 1234
+    assert dc[-1].payload.get("duration_ms") == report["duration_ms"]
 
 
 def test_report_deploy_complete_unknown_service_rejected(server, game):
@@ -177,7 +186,7 @@ def test_report_deploy_complete_unknown_service_rejected(server, game):
         _call_tool(
             TOKEN_TEAM1,
             "report_deploy_complete",
-            {"service": "not-a-real-service", "duration_ms": 99},
+            {"service": "not-a-real-service"},
         )
     )
     # Tools may surface as MCP errors via isError flag rather than exceptions.
@@ -232,7 +241,7 @@ def test_bad_token_returns_generic_unauthorized(server, game, tool):
     if tool == "submit_flag":
         args = {"flag": "FLAG{IRRELEVANT00000000000000000000000000}"}
     elif tool == "report_deploy_complete":
-        args = {"service": "notes", "duration_ms": 1}
+        args = {"service": "notes"}
 
     res = asyncio.run(_call_tool("bogus-token-no-such-team", tool, args))
     assert res.isError is True, f"bad token must return isError; got {res}"
