@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 
 # AgentHandle is opaque to the manager; each transport interprets it.

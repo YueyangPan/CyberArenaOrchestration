@@ -43,7 +43,7 @@ from gamemgr.config import load as load_game_config  # noqa: E402
 from gamemgr.events import EventType  # noqa: E402
 from gamemgr.game_mgr import GameMgr  # noqa: E402
 from orchestrator.orchestrator import Orchestrator  # noqa: E402
-from orchestrator.service import ContainerHandle  # noqa: E402
+from orchestrator.handle import ContainerHandle  # noqa: E402
 
 CONFIG = REPO / "config" / "game.yaml"
 SHOTS_DIR = REPO / "docs" / "screenshots" / "m5_6_attack"

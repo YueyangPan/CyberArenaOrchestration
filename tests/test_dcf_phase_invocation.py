@@ -40,7 +40,7 @@ from gamemgr.events import EventType
 from gamemgr.game_mgr import GameMgr
 from models.agent import AgentConfig
 from models.topology import Team, TopologyGraph
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 
 # ── FakeTransport: in-memory AgentTransport for the runner tests ──────

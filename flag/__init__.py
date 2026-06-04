@@ -11,8 +11,8 @@ Two pieces:
 
 GameMgr keeps the public surface (`plant_initial_flags`, `plant_flags`,
 `submit_flag`, `flags` property) but delegates all logic to FlagServer.
-Pluggable per `Service` ABC + `ChallengeSpec.flag_mechanism` — no demo
-service is hardcoded into the facility.
+Pluggable per `Challenge.flag_handler` — no demo service is hardcoded
+into the facility.
 """
 
 from .server import FlagServer

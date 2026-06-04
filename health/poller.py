@@ -137,42 +137,29 @@ def build_targets(
     teams_by_id,
     challenge_by_name,
     target_factory,
-    resolve_spec,
+    interval_lookup,
 ) -> list[PollTarget]:
     """Build the poll-target list from game config.
 
     Cross-product (config.challenges × deploy_on teams) filtered to
-    defense-capable challenges (those whose Challenge.restart_handler
-    is not None). Interval still comes from the v1 ChallengeSpec
-    metadata (`health_check.interval_secs`) as a transitional bridge.
+    defense-capable challenges (those whose `Challenge.restart_handler`
+    is not None — attack-only challenges have nothing the poller can
+    do periodically that the kickoff probe doesn't already cover).
 
     `challenges`        — iterable of ChallengeConfig.
     `teams_by_id`       — dict of team_id -> Team (must expose `.prod`).
     `challenge_by_name` — callable: chcfg.name -> Challenge instance.
     `target_factory`    — callable: (team_id, challenge) -> VulboxTarget;
                           typically `GameMgr.target_for`.
-    `resolve_spec`      — callable: chcfg.name -> ChallengeSpec | None;
-                          used only to read the interval_secs override.
+    `interval_lookup`   — callable: (chcfg.name, default) -> seconds;
+                          typically `challenges.registry.health_interval_secs`.
     """
     targets: list[PollTarget] = []
     for chcfg in challenges:
         challenge = challenge_by_name(chcfg.name)
-        # Only poll defense-capable challenges. Attack-only challenges
-        # (e.g. notes) have restart_handler=None — periodic CHECKER
-        # probes there would be wasted load.
         if challenge.restart_handler is None:
             continue
-
-        spec = resolve_spec(chcfg.name)
-        hc = ((spec.metadata if spec is not None else None) or {}).get("health_check") or {}
-        interval = hc.get("interval_secs")
-        if interval is None:
-            log.warning(
-                "challenge %r has no health_check.interval_secs; defaulting to %ds",
-                chcfg.name, DEFAULT_INTERVAL_SECS,
-            )
-            interval = DEFAULT_INTERVAL_SECS
-
+        interval = float(interval_lookup(chcfg.name, DEFAULT_INTERVAL_SECS))
         for team_id in chcfg.deploy_on:
             team = teams_by_id.get(team_id)
             if team is None or not team.prod:
@@ -183,6 +170,6 @@ def build_targets(
                 service=chcfg.name,
                 challenge=challenge,
                 target=target,
-                interval_secs=float(interval),
+                interval_secs=interval,
             ))
     return targets

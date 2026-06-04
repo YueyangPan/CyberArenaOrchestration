@@ -16,7 +16,7 @@ from gamemgr.config import ChallengeConfig, GameConfig, RoundConfig
 from gamemgr.game_mgr import GameMgr
 from gamemgr.round import Phase
 from models.topology import Team, TopologyGraph
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 
 class _StubOrchestrator:

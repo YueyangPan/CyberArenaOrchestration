@@ -31,7 +31,7 @@ from abc import ABC, abstractmethod
 from typing import ClassVar
 
 from models.agent import AgentConfig
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 
 class AgentManager(ABC):

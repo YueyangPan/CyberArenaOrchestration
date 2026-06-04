@@ -34,7 +34,7 @@ from gamemgr.api import build_app
 from gamemgr.config import load as load_game_config
 from gamemgr.game_mgr import GameMgr
 from orchestrator.orchestrator import Orchestrator
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 CONFIG = Path(__file__).parent.parent / "config" / "game.yaml"
 SUBMIT_PORT = 8000
@@ -70,12 +70,12 @@ def test_live_agent_attacks_and_submits():
     orch.setup()
     try:
         game.deploy_challenges()
-        for service, handles in game._deployed:
-            for h in handles:
-                for _ in range(50):
-                    if service.is_alive(h):
-                        break
-                    time.sleep(0.1)
+        for (team_id, _svc), challenge in game._challenge_by_owner.items():
+            target = game.target_for(team_id, challenge)
+            for _ in range(50):
+                if challenge.functionality_test.run(target).passed:
+                    break
+                time.sleep(0.1)
         game.plant_initial_flags()
 
         server_thread.start()

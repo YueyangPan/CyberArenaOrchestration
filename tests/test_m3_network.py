@@ -42,12 +42,12 @@ def arena(client):
     game.deploy_challenges()
 
     # wait until notes is alive on every prod container
-    for service, handles in game._deployed:
-        for h in handles:
-            for _ in range(50):
-                if service.is_alive(h):
-                    break
-                time.sleep(0.1)
+    for (team_id, _svc), challenge in game._challenge_by_owner.items():
+        target = game.target_for(team_id, challenge)
+        for _ in range(50):
+            if challenge.functionality_test.run(target).passed:
+                break
+            time.sleep(0.1)
 
     yield orch, game
 

@@ -45,7 +45,7 @@ from typing import Callable, ClassVar
 import docker
 
 from models.agent import AgentConfig, AgentLogs, AgentState, AgentStatus
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 from .manager import AgentManager
 from .transport import AgentHandle, AgentTransport

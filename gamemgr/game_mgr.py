@@ -19,13 +19,11 @@ from pathlib import Path
 import docker
 
 from orchestrator.orchestrator import Orchestrator
-from orchestrator.service import ContainerHandle, Service
+from orchestrator.handle import ContainerHandle
 
 from agents.prompts import build_attack_prompt, build_defense_prompt
 from challenges.interface import Challenge, VulboxTarget
-from challenges.notes import BuiltinNotesSource
-from challenges.registry import build as build_service, build_challenge
-from challenges.source import ChallengeSpec, FlagMechanism
+from challenges.registry import build_challenge, health_interval_secs, initial_start
 from models.agent import AgentConfig
 from typing import Awaitable, Callable
 
@@ -61,26 +59,12 @@ class GameMgr:
         self.timeline = Timeline()
         self.round_loop: RoundLoop | None = None
         self.run_dir: Path | None = None
-        self._deployed: list[tuple[Service, list[ContainerHandle]]] = []
-        # (team_id, service_name) -> Service instance, populated by deploy_challenges
-        # so the FlagServer can find the right adapter per (team, service).
-        # Only SERVICE_PROTOCOL challenges (notes) populate this map; FILE_AT_PATH
-        # challenges (nautilus-ico) ship the service as part of the image and
-        # plant flags via direct docker-exec writes — they go in _spec_by_owner.
-        self._service_by_owner: dict[tuple[str, str], Service] = {}
-        # (team_id, service_name) -> ChallengeSpec, populated by deploy_challenges
-        # for FILE_AT_PATH challenges. Read by emit_setup_events for the
-        # SERVICE_DEPLOYED snapshot. Flag-plant no longer reads this (v2
-        # plant goes through _challenge_by_owner).
-        self._spec_by_owner: dict[tuple[str, str], ChallengeSpec] = {}
-        # (team_id, service_name) -> Challenge instance (v2). The FlagServer
-        # walks this for plant; future stages will also use it for
-        # functionality_test and restart_handler dispatch. Mutable dict —
-        # deploy_challenges populates it during startup.
+        # (team_id, service_name) -> Challenge instance. Populated by
+        # deploy_challenges; read by FlagServer (plant), HealthChecker
+        # (functionality_test), restart_service (restart_handler) and
+        # emit_setup_events. Mutable dict — passed by reference to the
+        # facilities at construction so they see deploy mutations.
         self._challenge_by_owner: dict[tuple[str, str], Challenge] = {}
-        # Container names that hosted FILE_AT_PATH challenge deploys — kept
-        # so emit_setup_events can emit SERVICE_DEPLOYED uniformly.
-        self._deployed_file_at_path: list[tuple[ChallengeSpec, list[str]]] = []
         # FlagServer owns all flag mechanics (planting, rotation, submission
         # verification). GameMgr keeps the public method shapes
         # (plant_initial_flags / plant_flags / submit_flag / flags) but
@@ -174,76 +158,31 @@ class GameMgr:
     # ── lifecycle ───────────────────────────────────────────────────────
 
     def deploy_challenges(self) -> None:
-        """Install + start every challenge on its target containers.
+        """Install + first-start every challenge on its target containers.
         Runs synchronously before the round loop starts.
 
-        Two deploy paths depending on `spec.flag_mechanism`:
-        - SERVICE_PROTOCOL (e.g. notes): legacy Service-based install/start.
-          The Service class ships the binary into the container at deploy
-          time and plant_flag delivers the flag via the service's own
-          protocol (e.g. PUT for notes).
-        - FILE_AT_PATH (e.g. nautilus-ico): the service is already baked
-          into the image; the entrypoint built it and started sshd. We
-          just trigger `spec.metadata.restart_cmd` so the service binary
-          is running with the (initial) source. The flag is written
-          directly as a file by plant_flags.
+        v2 deploy is uniform across challenges:
+          1. Instantiate the Challenge via the registry.
+          2. Build a privileged VulboxTarget per team via `target_for`.
+          3. Invoke `registry.initial_start` — per-challenge dispatch
+             that handles the once-per-game setup (notes ships its
+             python daemon + spawns; ico kicks /arena/restart.sh;
+             image-baked challenges with a self-starting entrypoint
+             leave the hook unregistered for a no-op).
+          4. Register (team, service) -> Challenge in
+             `_challenge_by_owner` so FlagServer / HealthChecker /
+             restart_service can dispatch later.
         """
-
-        team_to_prod = {t.id: t.prod for t in self.config.topology.teams}
-
         for chcfg in self.config.challenges:
-            spec = self._resolve_spec(chcfg.name)
-            mechanism = spec.flag_mechanism if spec is not None else FlagMechanism.SERVICE_PROTOCOL
-
-            # v2 Challenge instance — shared across all teams (challenges
-            # are stateless per the ABC contract). Populated for every
-            # chcfg so FlagServer.plant_flags / Stage 4 health probe /
-            # Stage 5 restart can dispatch to ch.flag_handler / .
-            # functionality_test / .restart_handler. Stage 7 promotes
-            # this inline factory to challenges/registry.py.
             challenge = build_challenge(chcfg.name)
-
-            if mechanism == FlagMechanism.FILE_AT_PATH:
-                # Image-bundled service. Trigger the framework restart_cmd
-                # (e.g. /arena/restart.sh) so the service binary is running.
-                restart_cmd = (spec.metadata or {}).get("restart_cmd")
-                cnames: list[str] = []
-                for team_id in chcfg.deploy_on:
-                    cname = team_to_prod.get(team_id)
-                    if cname is None:
-                        raise KeyError(f"challenge {chcfg.name!r}: unknown team_id {team_id!r}")
-                    log.info(
-                        "deploying challenge %s -> %s (FILE_AT_PATH, port %d)",
-                        chcfg.name, cname, chcfg.port,
-                    )
-                    if restart_cmd:
-                        rc, out = self._exec_in_container(cname, restart_cmd)
-                        if rc != 0:
-                            log.warning(
-                                "initial restart_cmd failed on %s rc=%d out=%r",
-                                cname, rc, out[-200:] if out else "",
-                            )
-                    self._spec_by_owner[(team_id, chcfg.name)] = spec
-                    self._challenge_by_owner[(team_id, chcfg.name)] = challenge
-                    cnames.append(cname)
-                self._deployed_file_at_path.append((spec, cnames))
-                continue
-
-            # SERVICE_PROTOCOL path (legacy notes-style adapter).
-            service = build_service(chcfg.type, port=chcfg.port)
-            handles: list[ContainerHandle] = []
             for team_id in chcfg.deploy_on:
-                cname = team_to_prod.get(team_id)
-                if cname is None:
-                    raise KeyError(f"challenge {chcfg.name!r}: unknown team_id {team_id!r}")
-                handle = self.handle_for(cname)
-                log.info("deploying challenge %s -> %s (port %d)", chcfg.name, cname, chcfg.port)
-                service.install(handle)
-                service.start(handle)
-                handles.append(handle)
-                self._service_by_owner[(team_id, service.name)] = service
-                self._challenge_by_owner[(team_id, service.name)] = challenge
-            self._deployed.append((service, handles))
+                target = self.target_for(team_id, challenge)
+                log.info(
+                    "deploying challenge %s -> team=%s host=%s port=%d",
+                    chcfg.name, team_id, target.host, chcfg.port,
+                )
+                initial_start(challenge, target, self._exec_in_container)
+                self._challenge_by_owner[(team_id, chcfg.name)] = challenge
 
     # ── flag mechanics — thin delegates to FlagServer ──────────────────
 
@@ -262,13 +201,12 @@ class GameMgr:
         return self.flag_server.plant_flags(round_id=round_id)
 
     def teardown_challenges(self) -> None:
-        for service, handles in self._deployed:
-            for h in handles:
-                try:
-                    service.stop(h)
-                except Exception:
-                    log.exception("stop failed for %s on %s", service.name, h.name)
-        self._deployed.clear()
+        """No-op in v2: containers come down with `orchestrator.teardown()`
+        which removes the prod images entirely; per-challenge stop hooks
+        aren't needed. Kept as a method for symmetry with deploy_challenges
+        and to give future challenges (e.g. ones writing to a shared volume)
+        a place to clean up if needed."""
+        self._challenge_by_owner.clear()
 
     # ── round loop ──────────────────────────────────────────────────────
 
@@ -322,13 +260,13 @@ class GameMgr:
             teams_by_id=teams_by_id,
             challenge_by_name=build_challenge,
             target_factory=self.target_for,
-            resolve_spec=self._resolve_spec,
+            interval_lookup=health_interval_secs,
         )
         self.health_poller = HealthPoller(self.health_checker, targets)
 
     def emit_setup_events(self) -> None:
-        """Record one SERVICE_DEPLOYED per challenge-on-container and one
-        FLAG_PLANTED per (team, service) at round_id=0.
+        """Record one SERVICE_DEPLOYED per (team, service) deployment and
+        one FLAG_PLANTED per planted (team, service) at round_id=0.
 
         Called from start() during normal game lifecycle, but also exposed
         for demos / panel screenshots that don't drive the round loop —
@@ -336,18 +274,17 @@ class GameMgr:
         underlying state (deployed services, planted flags) is populated.
         Flag strings are deliberately omitted from FLAG_PLANTED payloads
         (the timeline is broadcast to public observers)."""
-        for service, handles in self._deployed:
-            for h in handles:
-                self.timeline.record(
-                    EventType.SERVICE_DEPLOYED,
-                    payload={"service": service.name, "container": h.name, "port": service.port},
-                )
-        for spec, cnames in self._deployed_file_at_path:
-            for cn in cnames:
-                self.timeline.record(
-                    EventType.SERVICE_DEPLOYED,
-                    payload={"service": spec.name, "container": cn, "port": spec.port},
-                )
+        team_to_prod = {t.id: t.prod for t in self.config.topology.teams}
+        for (team_id, service_name), challenge in self._challenge_by_owner.items():
+            self.timeline.record(
+                EventType.SERVICE_DEPLOYED,
+                team_id=team_id,
+                payload={
+                    "service": service_name,
+                    "container": team_to_prod.get(team_id, ""),
+                    "port": next(iter(challenge.vulbox.exposed_ports.values()), 0),
+                },
+            )
         self.flag_server.emit_planted_setup()
 
     # ── Persistent-memory v1: pre-loop install hook ─────────────────────
@@ -517,18 +454,16 @@ class GameMgr:
         tracking, and spawns per-team handler tasks (fire-and-forget;
         returned for tests to await).
 
-        A challenge is "defense-capable" iff its spec carries a
-        restart_cmd in metadata. Toy challenges without that — notes
-        today — don't get a defense agent; this keeps the kickoff
-        signal honest with respect to what the framework can defend.
+        A challenge is "defense-capable" iff its Challenge subclass
+        exposes a `restart_handler` (not None). Attack-only challenges
+        like notes leave it None; we skip them here so kickoff signals
+        only fire for things the framework can actually defend.
         """
         kickoffs: list[tuple[str, str, AgentConfig, bool]] = []
         for chcfg in self.config.challenges:
-            spec = self._resolve_spec(chcfg.name)
-            if spec is None:
+            challenge = build_challenge(chcfg.name)
+            if challenge.restart_handler is None:
                 continue
-            if not (spec.metadata or {}).get("restart_cmd"):
-                continue  # not defense-capable
 
             for team_id in chcfg.deploy_on:
                 key = (round_id, team_id, chcfg.name)
@@ -996,42 +931,6 @@ class GameMgr:
 
     # ── DEFCON: restart_service + health checks ─────────────────────────
 
-    def _resolve_spec(self, service_name: str) -> ChallengeSpec | None:
-        """Look up the ChallengeSpec by name from the configured sources.
-
-        Lazy-cached on first call so subsequent restarts don't re-enumerate.
-        Sources are discovered as needed:
-          - BuiltinNotesSource is always present (notes is the toy challenge)
-          - NautilusSource is attached if vendor/nautilus-finals-2025 exists
-            and includes the matching upstream dir (inferred from any
-            non-notes ChallengeConfig in game.yaml).
-        """
-        cache = getattr(self, "_spec_cache", None)
-        if cache is None:
-            cache = {}
-            # Notes is always available.
-            for spec in BuiltinNotesSource().list_challenges():
-                cache[spec.name] = spec
-            # Nautilus: instantiate only if at least one configured challenge
-            # name starts with "nautilus-". (We don't speculatively pull the
-            # vendor repo just to enumerate.)
-            nautilus_names = [
-                c.name[len("nautilus-"):]
-                for c in self.config.challenges
-                if c.name.startswith("nautilus-")
-            ]
-            if nautilus_names:
-                # Lazy import to avoid pulling docker SDK during config-only flows.
-                from challenges.nautilus import NautilusSource
-
-                try:
-                    for spec in NautilusSource(include=nautilus_names).list_challenges():
-                        cache[spec.name] = spec
-                except FileNotFoundError as e:
-                    log.warning("nautilus source unavailable: %s", e)
-            self._spec_cache = cache
-        return cache.get(service_name)
-
     async def restart_service(
         self,
         team_id: str,
@@ -1279,9 +1178,9 @@ class GameMgr:
         """Build the per-team AgentConfig for DEFENSE mode (DEFCON Phase 4b).
 
         Mirrors `agent_config_for` but swaps the prompt for the
-        edit→restart→smoke→report recipe via `build_defense_prompt`. Pulls
-        port + source_view from the resolved ChallengeSpec so the prompt
-        points the agent at the right path inside its own prod container.
+        edit→restart→smoke→report recipe via `build_defense_prompt`.
+        Pulls port from the Challenge's VulboxImage so the prompt
+        points the agent at the right port inside its own prod container.
         """
         base = self.config.agents.get(team_id)
         if base is None:
@@ -1292,9 +1191,11 @@ class GameMgr:
             raise KeyError(f"unknown team_id {team_id!r}")
         own_team = teams_by_id[team_id]
 
-        spec = self._resolve_spec(service_name)
-        if spec is None:
+        try:
+            challenge = build_challenge(service_name)
+        except KeyError:
             raise ValueError(f"unknown service: {service_name!r}")
+        port = next(iter(challenge.vulbox.exposed_ports.values()), 0)
 
         from .mcp_server import canonical_endpoint_url
 
@@ -1314,7 +1215,7 @@ class GameMgr:
             system_prompt=build_defense_prompt(
                 cfg,
                 service_name=service_name,
-                port=spec.port,
+                port=port,
                 is_first=is_first,
             ),
         )

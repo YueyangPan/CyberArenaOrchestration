@@ -29,7 +29,7 @@ from agents.claude import (
     WRAPPER_PID_PATH,
 )
 from models.agent import AgentConfig
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 
 def _make_mock_client(pid: int = 12345, wrapper_pid: int = 12344) -> MagicMock:

@@ -185,17 +185,16 @@ async def _run_start(args) -> int:
 def _build_challenge_images(config_path: str) -> None:
     """Build every challenge image referenced by `config_path`.
 
-    Delegates to `challenges.registry.build_all_images` — the registry
-    owns the source set, so adding a new adapter (picoCTF, custom git)
-    only needs one branch there, not here.
+    Delegates to `challenges.registry.build_images` — the registry owns
+    the per-challenge image builder map, so adding a new challenge only
+    needs one entry there, not a branch here.
 
-    Idempotent: each source's `build_image` skips when the tag is already
-    present locally.
+    Idempotent: each builder skips when the tag is already present locally.
     """
-    from challenges.registry import build_all_images
+    from challenges.registry import build_images
 
     cfg = load_game_config(config_path)
-    tags = build_all_images(cfg)
+    tags = build_images(cfg)
     if tags:
         log.info("built/cached %d challenge image(s): %s", len(tags), tags)
 

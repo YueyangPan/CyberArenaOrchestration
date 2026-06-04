@@ -28,7 +28,7 @@ from agents.registry import build as build_agent_manager
 from gamemgr.config import _expand_env_vars, load as load_game_config
 from models.agent import AgentConfig, AgentStatus
 from orchestrator.orchestrator import Orchestrator
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 
 # ── unit tests: ${VAR} expansion ───────────────────────────────────────

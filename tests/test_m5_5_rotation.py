@@ -82,12 +82,12 @@ def game(client):
     g = GameMgr(config=cfg, orchestrator=orch)
     orch.setup()
     g.deploy_challenges()
-    for service, handles in g._deployed:
-        for h in handles:
-            for _ in range(50):
-                if service.is_alive(h):
-                    break
-                time.sleep(0.1)
+    for (team_id, _svc), challenge in g._challenge_by_owner.items():
+        target = g.target_for(team_id, challenge)
+        for _ in range(50):
+            if challenge.functionality_test.run(target).passed:
+                break
+            time.sleep(0.1)
     g.plant_initial_flags()
     yield g
     g.teardown_challenges()

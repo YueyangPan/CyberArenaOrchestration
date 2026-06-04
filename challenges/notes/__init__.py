@@ -7,21 +7,10 @@ Composition under `challenges.interface.Challenge`:
   restart_handler    — None (attack-only)
   docs               — intro + func_test_spec; agent_prompts wired in Stage 6
 
-Public surface is the `NotesChallenge` class; callers import it
-through the registry, not directly.
+Public surface is the `NotesChallenge` class; callers import it through
+the registry, not directly.
 """
 
 from .challenge import NotesChallenge
 
-# Legacy v1 surface kept importable until Stage 8 deletes the source.py /
-# ChallengeSource path entirely. `_legacy` was the old top-level
-# `challenges/notes.py`; moved into the package so the directory + module
-# don't shadow each other.
-from ._legacy import (  # noqa: F401
-    REMOTE_DIR,
-    SERVER_SCRIPT,
-    BuiltinNotesSource,
-    NotesService,
-)
-
-__all__ = ["NotesChallenge", "BuiltinNotesSource", "NotesService"]
+__all__ = ["NotesChallenge"]

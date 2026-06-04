@@ -103,12 +103,12 @@ def game(client):
     g.deploy_challenges()
 
     # wait for notes to come up on every prod (port-level + protocol-level)
-    for service, handles in g._deployed:
-        for h in handles:
-            for _ in range(50):
-                if service.is_alive(h):
-                    break
-                time.sleep(0.1)
+    for (team_id, _svc), challenge in g._challenge_by_owner.items():
+        target = g.target_for(team_id, challenge)
+        for _ in range(50):
+            if challenge.functionality_test.run(target).passed:
+                break
+            time.sleep(0.1)
 
     g.plant_initial_flags()
 

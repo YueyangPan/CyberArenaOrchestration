@@ -23,7 +23,7 @@ import pytest
 
 from agents.transport import CommandResult
 from agents.transport_docker import DockerExecBackend
-from orchestrator.service import ContainerHandle
+from orchestrator.handle import ContainerHandle
 
 
 def _handle(name: str = "team1_dev") -> ContainerHandle:

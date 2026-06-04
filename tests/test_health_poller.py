@@ -26,7 +26,6 @@ from challenges.interface import (
     VulboxImage,
     VulboxTarget,
 )
-from challenges.source import ChallengeSpec, FlagMechanism
 from gamemgr.events import EventType
 from gamemgr.timeline import Timeline
 from health.checker import HealthChecker
@@ -224,19 +223,13 @@ def test_trigger_now_is_noop_for_unknown_target():
 # ── build_targets cross-product + filter ──────────────────────────────
 
 
-def _spec_with_interval(interval: int | None) -> ChallengeSpec:
-    md = {"flag_path": "/flag", "restart_cmd": "echo", "health_check": {}}
-    if interval is not None:
-        md["health_check"]["interval_secs"] = interval
-    return ChallengeSpec(
-        name="nautilus-ico", source="nautilus", port=4265,
-        image_tag="x", flag_mechanism=FlagMechanism.FILE_AT_PATH,
-        metadata=md,
-    )
-
-
 def _target_factory(team_id, ch):
     return VulboxTarget(host=f"{team_id}_prod", ports=dict(ch.vulbox.exposed_ports), meta={})
+
+
+def _intervals_with(values: dict[str, float]):
+    """Build an interval_lookup mimicking `registry.health_interval_secs`."""
+    return lambda name, default: values.get(name, default)
 
 
 def test_build_targets_filters_attack_only_challenges():
@@ -257,14 +250,13 @@ def test_build_targets_filters_attack_only_challenges():
         "notes": _AttackOnlyChallenge(),
         "nautilus-ico": _DefenseChallenge(),
     }
-    specs = {"nautilus-ico": _spec_with_interval(5)}
 
     targets = build_targets(
         challenges=challenges,
         teams_by_id=teams_by_id,
         challenge_by_name=challenge_by_name.__getitem__,
         target_factory=_target_factory,
-        resolve_spec=specs.get,
+        interval_lookup=_intervals_with({"nautilus-ico": 5.0}),
     )
     # notes filtered out; nautilus-ico × 2 teams = 2 targets.
     assert len(targets) == 2
@@ -273,7 +265,7 @@ def test_build_targets_filters_attack_only_challenges():
     assert all(t.interval_secs == 5.0 for t in targets)
 
 
-def test_build_targets_falls_back_to_default_interval(caplog):
+def test_build_targets_falls_back_to_default_interval():
     from gamemgr.config import ChallengeConfig
     from models.topology import Team
 
@@ -282,18 +274,16 @@ def test_build_targets_falls_back_to_default_interval(caplog):
     ]
     teams_by_id = {"team1": Team(id="team1", dev="d", prod="p", token="t")}
     challenge_by_name = {"nautilus-ico": _DefenseChallenge()}
-    specs = {"nautilus-ico": _spec_with_interval(None)}
 
     targets = build_targets(
         challenges=challenges,
         teams_by_id=teams_by_id,
         challenge_by_name=challenge_by_name.__getitem__,
         target_factory=_target_factory,
-        resolve_spec=specs.get,
+        interval_lookup=_intervals_with({}),  # no override -> default
     )
     assert len(targets) == 1
     assert targets[0].interval_secs == float(DEFAULT_INTERVAL_SECS)
-    assert any("interval_secs" in rec.message for rec in caplog.records)
 
 
 def test_empty_targets_list_makes_poller_noop():
