@@ -25,7 +25,9 @@ conda create -n cyberarena python=3.11 -y
 conda activate cyberarena
 pip install -r requirements.txt
 
-./scripts/build_images.sh        # builds cyberarena/dev-base + cyberarena/prod-base (~5 min first time)
+./scripts/build_images.sh        # builds cyberarena/dev-base (the agent-runtime infra image)
+# Per-challenge images (cyberarena/chal-notes, cyberarena/chal-nautilus-ico, …)
+# are built on demand by main.py setup / start.
 ```
 
 ## Run
@@ -60,13 +62,15 @@ CyberArenaOrchestration/
 ├── config/
 │   ├── game.yaml                 # match config (teams + nodes + networks + install_list)
 │   └── docker/
-│       ├── Dockerfile.dev        # cyberarena/dev-base (agent runtime + attack/debug tools)
-│       └── Dockerfile.prod       # cyberarena/prod-base (minimal ubuntu + python3 + sshd)
+│       └── Dockerfile.dev        # cyberarena/dev-base (agent runtime + attack/debug tools)
+├── challenges/                   # per-challenge code + image build context
+│   ├── notes/image/              # cyberarena/chal-notes
+│   └── nautilus_ico/image/       # cyberarena/chal-nautilus-ico
 ├── models/                       # dataclasses (TopologyGraph, Node, Network, Team)
 ├── orchestrator/
 │   ├── orchestrator.py           # setup() / teardown() lifecycle
 │   ├── topology.py               # YAML loader
-│   ├── service.py                # Service ABC (concrete impls in M2)
+│   ├── handle.py                 # ContainerHandle dataclass
 │   └── infra/
 │       ├── docker.py             # container lifecycle
 │       └── network.py            # network lifecycle + set_cross_team_network stub (M3)
