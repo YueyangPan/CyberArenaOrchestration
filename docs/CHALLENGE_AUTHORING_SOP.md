@@ -69,7 +69,7 @@ first-class part of the round).
 | `VulboxImage` | inline in `challenge.py` | `reference` (`cyberarena/chal-<kebab-name>:<v>`), `exposed_ports`, `build_context` |
 | `FunctionalityTest.run(target)` | `functionality_test.py` *or* inline in `challenge.py` | Returns a `CheckResult` tree. Recommended 4 leaves: `process`, `tcp`, `protocol`, `checker`. CHECKER must fail when the service's real function is broken — not merely when the port is closed. |
 | `FlagHandler.plant/retrieve(target, ...)` | `flag_handler.py` *or* inline | `plant` writes the flag and returns an opaque handle; `retrieve` reads it back via the same handle. Returns `None` on miss, never raises. |
-| `RestartHandler.run(target)` | `restart_handler.py` *or* inline | Invokes `/arena/restart.sh` via docker exec. Returns a `CheckResult` with three leaves: `compile`, `spawn`, `smoke`. |
+| `RestartHandler.run(target)` | `restart_handler.py` *or* inline | Rebuilds and restarts the service in-place after agent edits. Implementation is challenge-defined and uses whatever execution mechanism `target` provides (today: `target.meta["exec_in_container"]` — docker exec; tomorrow could be SSH / k8s exec / VM agent). Returns a `CheckResult` with three leaves: `compile`, `spawn`, `smoke`. The reference `nautilus_ico/restart_handler.py` invokes `/arena/restart.sh` through that callable. |
 | `build_attack_prompt` + `build_defense_prompt` | `prompts.py` | Both required. The defense prompt **must** explicitly state that submitting a flag during DEFENSE is rejected (`reason=WRONG_PHASE`). Vuln hotspots must be named to file / function level. |
 
 ## 4. Image requirements
@@ -104,11 +104,16 @@ When the agent calls `mcp__cyberarena__restart_service`, the framework
 runs your `restart_handler.run(target)`:
 
 ```
-docker exec /arena/restart.sh
+restart_handler.run(target)
   → recompile from /srv/challenge/<svc>/
   → kill old process, spawn new
   → return CheckResult{ compile, spawn, smoke }
 ```
+
+The handler decides *how* to execute (`target.meta["exec_in_container"]`
+today). The reference implementation invokes `/arena/restart.sh` through
+that callable; other transports can plug in without changing the
+contract.
 
 The agent never invokes `restart.sh` directly. It can read and execute
 `/arena/restart.sh` but cannot modify it; the entire "edit source →

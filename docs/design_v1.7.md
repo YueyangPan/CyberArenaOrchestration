@@ -61,7 +61,9 @@ Agent recipe (per challenge's `build_defense_prompt`):
 1. SSH to own prod as `arena_agent`.
 2. Edit `/srv/challenge/<svc>/` (writable copy of the baked source).
 3. Call MCP `restart_service(service)` → `{job_id}`; the framework
-   runs the challenge's `RestartHandler` via docker exec.
+   delegates to the challenge's `RestartHandler`, which executes
+   via whatever mechanism `VulboxTarget` provides (docker exec
+   today; SSH / k8s exec / VM agent if `target.meta` is swapped).
 4. Probe own port until reachable; call `report_deploy_complete`.
 
 The restart emits `SERVICE_RESTART_STARTED` →
