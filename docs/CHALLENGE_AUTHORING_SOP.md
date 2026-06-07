@@ -1,200 +1,150 @@
 # Challenge Authoring SOP
 
-Spec for packaging a vulnerable application into a CyberArena
-challenge. Deliverable: one self-contained `challenges/<snake_name>/`
-directory. Reference implementation:
+Package a vulnerable application into a CyberArena challenge as one
+self-contained `challenges/<snake_name>/` directory. Reference:
 [`challenges/nautilus_ico/`](../challenges/nautilus_ico/) (DEF CON
-Finals 2025 `ico`). All required interfaces are defined in
+Finals 2025 `ico`). Interface ABCs:
 [`challenges/interface/`](../challenges/interface/).
 
-> `challenges/notes/` is a framework smoke test, not a reference —
-> it intentionally lacks a defense flow.
-
-## 1. Required files
+## 1. Files
 
 ```
 challenges/<snake_name>/
 ├── __init__.py                # must — exports the Challenge class
 ├── challenge.py               # must — composition root
-├── prompts.py                 # must — build_attack_prompt + build_defense_prompt
+├── prompts.py                 # must — attack + defense prompt builders
 ├── build.py                   # must — docker build of the image
 ├── functionality_test.py      # recommended — FunctionalityTest impl
 ├── flag_handler.py            # recommended — FlagHandler impl
 ├── restart_handler.py         # recommended — RestartHandler impl
 └── image/                     # docker build context
     ├── Dockerfile             # must
-    ├── entrypoint.sh          # must — runs at container start
+    ├── entrypoint.sh          # must
     ├── restart.sh             # must — framework-invoked rebuild + respawn
     ├── checker.sh             # recommended — backs the CHECKER probe
-    └── service/               # recommended — source / binaries baked into the image
+    └── service/               # recommended — baked source / binaries
 ```
 
-**Must** files are the ones the framework loads or invokes directly.
-**Recommended** files exist for organizational clarity: their content
-*must* be implemented somewhere (Challenge has to expose
-`functionality_test`, `flag_handler`, `restart_handler` — see §3), but
-small challenges can inline the classes into `challenge.py` instead of
-giving each its own file. The reference (`nautilus_ico`) splits them.
+The "recommended" Python files can be inlined into `challenge.py` for
+small challenges; the surfaces they implement are still required
+(§3).
 
 ## 2. Naming
 
-Two distinct names. They are **not** interchangeable.
-
 | What | Style | Example | Used as |
 |---|---|---|---|
-| Directory name | `snake_case` | `nautilus_ico` | Python package path — `from challenges.nautilus_ico import IcoChallenge`. |
-| `Challenge.name` (the `@property`) | `kebab-case` | `"nautilus-ico"` | Registry key in `challenges/registry.py`, `name:` field under `challenges:` in `game.yaml`, prompt-dispatcher key in `agents/prompts/__init__.py::_PROMPT_MODULES`, event payload `service` field. |
-| Image reference | author's choice (free-form OCI reference) | `cyberarena/chal-nautilus-ico:v1` | What `Challenge.vulbox.reference` returns and what the `image:` field on team prod nodes in `game.yaml` should match. |
+| Directory | `snake_case` | `nautilus_ico` | Python import: `from challenges.nautilus_ico import IcoChallenge` |
+| `Challenge.name` | `kebab-case` | `"nautilus-ico"` | Registry key, `game.yaml` `name:`, prompt-dispatcher key, event `service` field |
+| `VulboxImage.reference` | free-form OCI ref | `cyberarena/chal-nautilus-ico:v1` | Value `Challenge.vulbox.reference` returns; matches `image:` on team prod nodes in `game.yaml` |
 
-Rule of thumb: anything Python imports uses snake_case; anything the
-**operator** types into a YAML, sees in the panel, or matches by string
-uses kebab-case.
-
-The image reference is **not** required to follow the
-`cyberarena/chal-<kebab>:<v>` shape — that's just the convention the
-bundled reference challenges use. Anything Docker would accept as a
-pull spec works (e.g. `ghcr.io/2077ai/challenges/nautilus-ico:v1`,
-`localhost:5000/chal-ico:v1`, …). Keep registry policy out of the
-challenge code.
+Python imports → snake. YAML / panel / wire → kebab. Image reference
+is your call (`ghcr.io/...`, `localhost:5000/...`, etc.) — don't bake
+registry policy into the challenge code.
 
 ## 3. Interface contracts
 
-`Challenge` is a **composition root**: a single instance is the only
-handle the framework needs to deploy + run your challenge. It composes
-five components (defined in
-[`challenges/interface/`](../challenges/interface/)) and exposes them
-as `@property` / `@cached_property` attributes. The framework reads
-those properties; it never constructs the components on its own.
+`Challenge` is the **composition root**: one instance is the only
+handle the framework needs. The framework reads its `@property` /
+`@cached_property` attributes; it never constructs the components.
 
-All five components are mandatory — `restart_handler` returning `None`
-is **not** acceptable for contributed challenges (defense is a
-first-class part of the round).
+All five components are mandatory — `restart_handler = None` is
+**not** acceptable. Defense is part of the round.
 
-| Component | Lives in | Required surface |
+| Component | Lives in | Surface |
 |---|---|---|
 | `Challenge` | `challenge.py` | `name`, `vulbox`, `functionality_test`, `flag_handler`, `restart_handler`, `docs` |
-| `VulboxImage` | inline in `challenge.py` | `reference: str` (free-form OCI image reference, e.g. `cyberarena/chal-nautilus-ico:v1`), `exposed_ports`, `build_context` |
-| `FunctionalityTest.run(target)` | `functionality_test.py` *or* inline in `challenge.py` | Returns a `CheckResult` tree. **Required:** one `checker` leaf that fails when the service's real function is broken (not merely when the port is closed). **Recommended:** at least one transport-level leaf alongside it (`tcp`, `http`, `sql`, …; the bundled `nautilus_ico` reference uses `process` + `tcp` + `protocol` + `checker`). Shape is otherwise free — the framework emits one `SERVICE_HEALTH_CHECK` event per leaf using `leaf.name` verbatim. |
-| `FlagHandler.plant/retrieve(target, ...)` | `flag_handler.py` *or* inline | `plant(target, flag)` writes the flag and returns an opaque handle. `retrieve(target, handle)` reads it back, returning the planted string or `None` on miss (never raises). |
-| `RestartHandler.run(target)` | `restart_handler.py` *or* inline | Rebuilds and restarts the service in-place after agent edits. Implementation is challenge-defined and uses whatever execution mechanism `target` provides (today: `target.meta["exec_in_container"]` — docker exec; tomorrow could be SSH / k8s exec / VM agent). Returns a `CheckResult` tree with at least one leaf that fails when the rebuild produced a broken service (the bundled `nautilus_ico` reference uses `compile` + `spawn` + `smoke`; web/db challenges might prefer `build` + `start` + `smoke`). The reference `nautilus_ico/restart_handler.py` invokes `/arena/restart.sh` through that callable. |
-| `build_attack_prompt` + `build_defense_prompt` | `prompts.py` | Both required. The defense prompt **must** explicitly state that submitting a flag during DEFENSE is rejected (`reason=WRONG_PHASE`). For vulnerabilities you already know about, name the file / function explicitly so the agent isn't burning tokens searching. For challenges where the bug is unknown (legacy app, unaudited code, CTF written for the agent to discover the vuln), supply the most relevant attack-surface guidance you have — entry points, data flow boundaries, untrusted-input paths — instead of pretending to know more than you do. |
+| `VulboxImage` | inline in `challenge.py` | `reference: str`, `exposed_ports`, `build_context` |
+| `FunctionalityTest.run(target)` | `functionality_test.py` *or* inline | Returns a `CheckResult` tree. **Required:** one `checker` leaf that fails when the service's real function is broken (not merely when the port is closed). **Recommended:** at least one transport-level leaf alongside (`tcp` / `http` / `sql` / …). `nautilus_ico` uses `process` + `tcp` + `protocol` + `checker`; framework emits one event per leaf, `leaf.name` verbatim. |
+| `FlagHandler` | `flag_handler.py` *or* inline | `plant(target, flag) → handle` writes the flag and returns an opaque handle. `retrieve(target, handle) → str \| None` reads it back (`None` on miss, never raises). |
+| `RestartHandler.run(target)` | `restart_handler.py` *or* inline | Rebuilds + restarts the service via whatever mechanism `target` provides (`target.meta["exec_in_container"]` today; SSH / k8s exec / VM agent tomorrow). Returns a `CheckResult` tree with at least one leaf that fails when the rebuild produced a broken service. `nautilus_ico` uses `compile` + `spawn` + `smoke`; web / db might prefer `build` + `start` + `smoke`. |
+| `build_attack_prompt` + `build_defense_prompt` | `prompts.py` | Both required. Defense prompt **must** state that submitting a flag during DEFENSE rejects with `reason=WRONG_PHASE`. If you know where the bug is, name file / function. If you don't (legacy / unaudited / discovery-style challenge), give real attack-surface guidance (entry points, untrusted-input boundaries) — don't fabricate. |
 
 ## 4. Image requirements
 
-Below, `<svc>` is the author-chosen service slug used **only** inside
-the image (the reference uses `ico`). It does not need to match
-`<snake>` or `<kebab>`.
+`<svc>` is the in-image service slug (`nautilus_ico` uses `ico`); free
+to differ from `<snake>` and `<kebab>`.
 
-`image/Dockerfile` must:
+**`image/Dockerfile`:**
 
-1. `FROM --platform=linux/amd64 ubuntu:24.04` (or compatible amd64 base).
-2. Install all runtime dependencies — **no network access at container startup**.
-3. Create the `arena_agent` user; disable `PermitRootLogin` in sshd_config.
-4. Bake service source to `/opt/challenge_src/<svc>/` (read-only template).
-5. Place `/arena/restart.sh` (and optionally `/arena/checker.sh`),
-   root-owned, mode 555.
-6. For compiled services: pre-compile the initial binary at build time;
-   leave the artifact under `/opt/challenge_src/<svc>/`. Keep the
-   build toolchain in the runtime image — `restart.sh` rebuilds in-container.
+1. `FROM --platform=linux/amd64 ubuntu:24.04` (or another amd64 base).
+2. Install all runtime deps — **no network at container startup**.
+3. Create `arena_agent` user; `PermitRootLogin no` in sshd_config.
+4. Bake source to `/opt/challenge_src/<svc>/` (read-only template).
+5. Place `/arena/restart.sh` (and optional `/arena/checker.sh`), root-owned mode 555.
+6. Compiled services: pre-compile the initial binary at build time, but keep the toolchain in the runtime image — `restart.sh` rebuilds in-container.
 
-Recommended:
+Recommended: `EXPOSE 22` plus the service port(s).
 
-7. `EXPOSE 22` (sshd) plus the service port(s).
+**`image/entrypoint.sh`:**
 
-`image/entrypoint.sh` must:
-
-1. Generate sshd host keys on first start (`ssh-keygen -A`).
-2. Materialize the writable workdir: `cp -r /opt/challenge_src/<svc>/. /srv/challenge/<svc>/`, chown to `arena_agent`.
+1. `ssh-keygen -A` (sshd host keys on first start).
+2. `cp -r /opt/challenge_src/<svc>/. /srv/challenge/<svc>/`, chown to `arena_agent`.
 3. Launch the service (or leave it to `restart.sh` for compiled services).
 4. `exec /usr/sbin/sshd -D -e` as PID 1.
 
 ## 5. Defense flow contract
 
 When the agent calls `mcp__cyberarena__restart_service`, the framework
-runs your `restart_handler.run(target)`:
+runs `restart_handler.run(target)`:
 
 ```
 restart_handler.run(target)
-  → recompile from /srv/challenge/<svc>/
-  → kill old process, spawn new
-  → return CheckResult{ compile, spawn, smoke }
+  → rebuild from /srv/challenge/<svc>/
+  → kill old, spawn new
+  → return CheckResult{ ... }
 ```
 
-The handler decides *how* to execute (`target.meta["exec_in_container"]`
-today). The reference implementation invokes `/arena/restart.sh` through
-that callable; other transports can plug in without changing the
-contract.
+**The supported restart path is MCP `restart_service`** — not bashing
+`restart.sh` directly. The script is root-owned mode 555 (executable,
+not modifiable), so the filesystem doesn't block a direct invocation
+— but the `STARTED → COMPLETED|FAILED` event chain and the
+post-restart health probe only fire on the MCP path. Defense prompts
+should call MCP and wait for the chain.
 
-**The supported restart path is the MCP `restart_service` tool.**
-`/arena/restart.sh` is root-owned mode 555, so the agent can read and
-execute it but not modify it — meaning a direct invocation isn't
-blocked at the filesystem layer, just unobserved. The `STARTED →
-COMPLETED|FAILED` event chain and the post-restart health probe only
-fire on the MCP-mediated path; bypass it and the round records
-nothing.
-
-Defense prompts should call MCP `restart_service` and wait for the
-event chain, never bash `restart.sh` directly.
-
-After restart, the framework re-runs `functionality_test`. CHECKER must
-pass for the round to count.
+After the restart, the framework re-runs `functionality_test`.
+CHECKER must pass for the round to count.
 
 ## 6. Pipeline integration
 
-In the steps below `<snake>` is your directory name and `<kebab>` is
-`Challenge.name` — see §2.
+`<snake>` = directory name; `<kebab>` = `Challenge.name`.
 
-1. Deliver your `challenges/<snake>/` directory in a PR. **Do not modify
-   any other framework file.**
-2. The maintainers add 2–4 lines to
-   [`challenges/registry.py`](../challenges/registry.py) (all keyed by
-   `<kebab>`, matching `Challenge.name`):
+1. Submit `challenges/<snake>/` as one PR. **Don't modify any other framework file.**
+2. Maintainer adds to [`challenges/registry.py`](../challenges/registry.py):
    ```python
    _CHALLENGE_FACTORIES["<kebab>"] = YourChallenge       # required
    _IMAGE_BUILDERS["<kebab>"]      = _your_build_fn      # required: runs your build.py
-   _INITIAL_START["<kebab>"]       = <post-deploy hook>  # optional: extra setup after container is up (e.g. wait for sshd)
-   _HEALTH_INTERVAL_SECS["<kebab>"] = <seconds>          # optional: override the default 10s poll cadence
+   _INITIAL_START["<kebab>"]       = <post-deploy hook>  # optional: extra setup after start (e.g. wait for sshd)
+   _HEALTH_INTERVAL_SECS["<kebab>"] = <seconds>          # optional: override the 10s poll default
    ```
-3. Reference it from `game.yaml` (or a new `game_<kebab>.yaml`) by
-   setting `image:` on the team prod nodes to the same string your
-   `VulboxImage.reference` returns, and adding a `challenges:` entry
-   with `name: <kebab>`.
-4. `python -m main setup -c config/game_<kebab>.yaml` builds the image
-   via your `build.py`; `python -m main start -c config/game_<kebab>.yaml`
-   runs a full match.
+3. In `game.yaml` (or `game_<kebab>.yaml`): set `image:` on team prod nodes to whatever `VulboxImage.reference` returns; add a `challenges:` entry with `name: <kebab>`.
+4. `python -m main setup -c config/game_<kebab>.yaml`, then `start`.
 
-## 7. Acceptance checks (run before submitting)
+## 7. Acceptance checks
 
-**Build & startup**
-- [ ] `docker build` succeeds and produces the reference `VulboxImage.reference` returns
-- [ ] `docker run` brings the container up; the service is reachable
-      within 5 seconds
-- [ ] `id arena_agent` returns uid > 0; `sshd -t` exits 0
+**Image**
 
-**Flag round-trip**
-- [ ] `plant` followed by `retrieve` returns the exact string planted
+- [ ] `docker build` succeeds; tag matches `VulboxImage.reference`
+- [ ] Container starts; service reachable within 5s; no network needed at startup
+- [ ] `id arena_agent` ok; `sshd -t` exits 0
 
-**Defense flow**
-- [ ] `/arena/restart.sh` exits 0; the new process is pgrep-able; the
-      port accepts connections
-- [ ] Deliberately commenting out a logic line: `restart.sh` still
-      rebuilds (toolchain is complete)
-- [ ] Deliberately injecting a syntax error: `restart.sh` exits non-zero
-      (build errors propagate)
-- [ ] CHECKER passes on a working service AND **fails on a broken
-      service** (not merely on port closure)
+**Flags** — `plant` then `retrieve` returns the exact string.
 
-**Framework hygiene**
-- [ ] No internet required at container startup (no `apt-get` / `pip install` in the entrypoint)
-- [ ] No absolute-path hardcodes outside the image's own fixed paths
-- [ ] `from challenges.<snake> import <Name>Challenge` imports without error
-- [ ] `<Name>Challenge().name` returns the kebab-case string used in `game.yaml`
-- [ ] `<Name>Challenge().restart_handler` is a `RestartHandler` instance, not `None`
+**Defense**
+
+- [ ] Baseline `restart_handler.run(target)` succeeds; CHECKER passes
+- [ ] Inject a syntax error → rebuild fails, errors surface in `CheckResult`
+- [ ] Break the service's real logic → CHECKER fails (not just port closure)
+
+**Wiring**
+
+- [ ] `from challenges.<snake> import <Name>Challenge` imports clean
+- [ ] `<Name>Challenge().name` is the kebab string used in `game.yaml`
+- [ ] `<Name>Challenge().restart_handler` is a `RestartHandler` (not `None`)
 
 ## 8. Reference
 
-| Topic | Source |
-|---|---|
-| Abstract interface (read these first) | [`challenges/interface/challenge.py`](../challenges/interface/challenge.py), [`challenges/interface/probe.py`](../challenges/interface/probe.py) |
-| Canonical example | [`challenges/nautilus_ico/`](../challenges/nautilus_ico/) |
-| Architecture overview | [`docs/UML/challenges.md`](UML/challenges.md) |
+- Interface ABCs: [`challenges/interface/challenge.py`](../challenges/interface/challenge.py), [`challenges/interface/probe.py`](../challenges/interface/probe.py)
+- Canonical example: [`challenges/nautilus_ico/`](../challenges/nautilus_ico/)
+- Architecture: [`docs/UML/challenges.md`](UML/challenges.md)
+
+> `challenges/notes/` is a framework smoke test, not a reference (no defense flow).
