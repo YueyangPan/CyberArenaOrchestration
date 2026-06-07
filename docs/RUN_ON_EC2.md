@@ -1,25 +1,41 @@
-# Running DEF CON ico on a fresh EC2
+# Running DEF CON ico from scratch
 
-Reproducibility check: from a blank Amazon Linux 2023 EC2 to a
-finished 3-round match.
+Reproducibility check: from a blank Linux box (typically an EC2) to a
+finished 3-round match. Distro-agnostic; tested most recently on
+Amazon Linux 2023.
 
-**You need:** an EC2 box (x86_64, ≥ 4 GB disk), the `.pem` for it, a
-`.env` from your local checkout (`ANTHROPIC_API_KEY_TEAM{1,2}` plus
-matching `_BASE_URL_TEAM{1,2}`), and read access to the repo.
+**You need:** a Linux host (x86_64, ≥ 4 GB disk) with sudo, two
+Anthropic API keys (separate keys for TEAM1 and TEAM2 so the agents
+don't share rate limits), and read access to the repo. Everything
+below runs on the box.
 
-## 1. Bootstrap the box
+## 1. Prereqs on the host
+
+You need:
+
+- Docker daemon running, your user in the `docker` group
+- `git`
+- Python **3.10+** with `venv` available (`mcp` package requires 3.10+;
+  bare Amazon Linux 2023 / Ubuntu 22.04 default to 3.9 / 3.10 — install
+  `python3.11` if you have any doubt)
+
+Install via your distro's package manager, for example:
 
 ```bash
-ssh -i <key>.pem ec2-user@<host>
-
+# Amazon Linux 2023
 sudo dnf install -y docker git python3.11 python3.11-pip python3.11-devel
-sudo systemctl enable --now docker
-sudo usermod -aG docker ec2-user
-exit                         # re-SSH so docker group applies
+
+# Debian / Ubuntu
+sudo apt-get install -y docker.io git python3.11 python3.11-venv python3-pip
 ```
 
-Amazon Linux 2023 ships Python 3.9; we install 3.11 because the `mcp`
-package requires 3.10+.
+Then start docker and add yourself to the group:
+
+```bash
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+exit                                   # re-login so docker group applies
+```
 
 ## 2. Auth GitHub (private repo)
 
@@ -39,17 +55,23 @@ pip install --upgrade pip && pip install -r requirements.txt
 bash scripts/sync_nautilus.sh        # pin-clones nautilus-institute/finals-2025 @ 366520c0cc43
 ```
 
-## 4. Copy `.env` from your local checkout
-
-From your laptop (not the EC2):
+## 4. Create `.env` with your own API keys
 
 ```bash
-scp -i <key>.pem .env ec2-user@<host>:~/cyber-arena-orche/.env
+cat > .env <<'EOF'
+export ANTHROPIC_BASE_URL_TEAM1=https://api.anthropic.com
+export ANTHROPIC_API_KEY_TEAM1=sk-ant-...your-team1-key...
+export ANTHROPIC_BASE_URL_TEAM2=https://api.anthropic.com
+export ANTHROPIC_API_KEY_TEAM2=sk-ant-...your-team2-key...
+EOF
+chmod 600 .env
 ```
 
-## 5. Build images and run the match
+Use two separate keys (one per team) so the agents don't share rate
+limits. If you route through an internal LLM proxy / router, point the
+`BASE_URL`s at it instead.
 
-Back on the EC2:
+## 5. Build images and run the match
 
 ```bash
 source .env
