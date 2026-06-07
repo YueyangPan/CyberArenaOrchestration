@@ -214,8 +214,8 @@ DEFENSE RECIPE
 
 NOTES
 - fpc errors are noisy but the first line is the file + line + msg. If
-  rebuild fails (SERVICE_RESTART_FAILED on the bus), your edit broke
-  compilation; revert that file and try a more minimal change.
+  rebuild fails (SERVICE_RESTART_FAILED), your edit broke compilation;
+  revert that file and try a more minimal change.
 - If CHECKER reports passed=false, your patch broke the CONNECT handshake;
   revert and try elsewhere.
 - Keep edits minimal — adding 1-3 bounds-check lines is enough for a

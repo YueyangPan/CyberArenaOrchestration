@@ -1,9 +1,9 @@
 """Timeline — append-only event stream for panel / file observation.
 
-Replaces the previous `EventBus` pub-sub model. Timeline is intentionally
-*not* a control-flow mechanism: it has no subscribers that drive internal
-logic. Anything that needs to act on an event calls the relevant method
-on GameMgr / Orchestrator / HealthPoller directly.
+Timeline is intentionally *not* a control-flow mechanism: it has no
+subscribers that drive internal logic. Anything that needs to act on
+an event calls the relevant method on GameMgr / Orchestrator /
+HealthPoller directly.
 
 Two sink kinds:
   * sync sinks — plain `Callable[[Event], None]`; invoked synchronously

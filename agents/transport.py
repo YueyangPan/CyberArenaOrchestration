@@ -88,9 +88,10 @@ class AgentTransport(Protocol):
         teardown paths (e.g. ClaudeAgentManager.kill) that don't have a
         specific PID. Best-effort: never raises.
 
-        Prefer `kill_session` from the per-phase runner — `kill_process`
-        races when the same container hosts multiple phases in sequence
-        (a freshly-started next-phase claude matches the same pattern).
+        Prefer `kill_session` when a session marker is available —
+        `kill_process` races when the same container hosts multiple
+        phases in sequence (a freshly-started next-phase claude
+        matches the same pattern).
         """
         ...
 
@@ -99,8 +100,7 @@ class AgentTransport(Protocol):
         `/tmp/cyberarena_phase_<marker>.pid` by phase_command's bash
         wrapper. No-op (best-effort) when the file is missing or empty.
 
-        Replaces the racy pattern-based `kill_process` for the runner's
-        on-timeout pkill: targets exactly the claude instance started
-        under this session marker, not a sibling that just started in
-        the next phase."""
+        Replaces the racy pattern-based `kill_process` on timeout:
+        targets exactly the claude instance started under this session
+        marker, not a sibling that just started in the next phase."""
         ...

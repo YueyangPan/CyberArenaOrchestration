@@ -1,16 +1,12 @@
-"""HealthChecker — runs a challenge's FunctionalityTest and emits one
+"""HealthChecker — run a challenge's FunctionalityTest, emit one
 SERVICE_HEALTH_CHECK event per CheckResult leaf.
 
-Stage 4 (challenge interface v2): the framework no longer owns a 4-level
-probe pattern. The challenge's own `FunctionalityTest.run(target)`
-decides the shape of the result tree; HealthChecker just walks it and
-records the leaves on the Timeline.
-
-The recommended convention (HealthLevel.PROCESS/TCP/PROTOCOL/CHECKER) is
-preserved by NotesChallenge and IcoChallenge so the existing panel and
-SLA-window code keep seeing the same level names. Challenges with a
-different shape (one leaf, deeper trees) work transparently — the panel
-rendering for non-conventional names is a Stage 11 follow-up.
+The challenge's `FunctionalityTest.run(target)` decides the shape of
+the result tree; this module just walks it and records leaves. The
+bundled challenges follow the HealthLevel convention
+(process/tcp/protocol/checker) so the panel renders the familiar
+4-chip strip; non-conventional tree shapes work too, the panel just
+shows the raw leaf names.
 """
 
 from __future__ import annotations
@@ -47,17 +43,12 @@ class HealthChecker:
         target: VulboxTarget,
         challenge: Challenge,
     ) -> CheckResult:
-        """Run `challenge.functionality_test` against `target`, record one
-        SERVICE_HEALTH_CHECK per leaf of the resulting CheckResult tree.
-
-        Returns the root CheckResult so callers (poller, restart-post)
-        can inspect overall pass/fail without re-walking the tree.
-        """
+        """Run the functionality test and emit one SERVICE_HEALTH_CHECK
+        per leaf. Returns the root CheckResult."""
         st = self._status()
         loop = asyncio.get_running_loop()
-        # FunctionalityTest.run is blocking by contract (most probes use
-        # docker exec under the hood). Run in the default executor so the
-        # event loop stays responsive.
+        # functionality_test.run is blocking (docker exec under the hood),
+        # so it goes through the default executor.
         result = await loop.run_in_executor(
             None, challenge.functionality_test.run, target,
         )
@@ -80,12 +71,9 @@ class HealthChecker:
 
 
 def leaves(node: CheckResult) -> list[CheckResult]:
-    """Pre-order walk yielding only the leaves of the CheckResult tree.
-
-    A leaf is a node with no children. Internal nodes (the root over a
-    4-level chain) carry the aggregate pass/fail and are skipped — we
-    emit one event per probed dimension, not for the rollup.
-    """
+    """Pre-order walk yielding only nodes with no children. Internal
+    nodes (the root rollup over a 4-level chain) are skipped — we
+    emit one event per probed dimension, not for the aggregate."""
     if not node.children:
         return [node]
     out: list[CheckResult] = []

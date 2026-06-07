@@ -1,7 +1,6 @@
 """ClaudeAgentManager — Claude Code adapter for the AgentManager ABC.
 
-Two responsibilities under persistent-memory v1 (see
-docs/persistent_memory_agent_plan_v1.md):
+Two responsibilities (see docs/persistent_memory_agent_plan_v1.md):
 
   install(handle, cfg)            # once per team at game start: npm
                                   # install, SSH pivot, env, mcp.json.
@@ -10,25 +9,20 @@ docs/persistent_memory_agent_plan_v1.md):
                                   # invokes `claude -p --continue ...`
                                   # consuming the prompt from PROMPT_PATH.
 
-The per-phase 3-line dance (write prompt → run_command → kill on
-timeout) lives in `AgentManager.run_phase`, not here. GameMgr owns
-artifact persistence + AGENT_* event emission via
-`record_phase_started` / `record_phase_done`.
+The per-phase dance (write prompt → run_command → kill on timeout)
+lives in `AgentManager.run_phase`. GameMgr owns artifact persistence
++ AGENT_* event emission via `record_phase_started` /
+`record_phase_done`.
 
-All side effects on the agent host go through `AgentTransport`
-(DockerExecBackend today, SSHBackend tomorrow). The manager never
-calls `docker exec` directly.
+All side effects on the agent host go through `AgentTransport`.
 
 Memory across phases carries via Claude CLI's `--continue` flag: the
 CLI's session store lives at /root/.claude/projects/<workdir-cwd>/
-inside the container; `--continue` reloads the most-recent session.
-We pin the cwd to STATE_DIR/workdir so different arenas' sessions
-stay isolated.
+inside the container. We pin the cwd to STATE_DIR/workdir so
+different arenas' sessions stay isolated.
 
-`status` / `kill` / `fetch_logs` are NOT part of the ABC anymore —
-they're concrete-only convenience methods kept for the M4-era live
-smoke tests (`test_m4_agent::test_live_hello_world`,
-`test_m5_6_agent_attack`) and `scripts/m6_screenshot_demo.py`.
+`status` / `kill` / `fetch_logs` are concrete-only convenience
+methods kept for live smoke tests + scripts/m6_screenshot_demo.py.
 """
 
 from __future__ import annotations
@@ -53,8 +47,7 @@ from .transport_docker import DockerExecBackend
 
 log = logging.getLogger(__name__)
 
-# Layout inside the agent host. Paths kept under /var/lib + /var/run +
-# /var/log to match the M4-era convention; the WORKDIR is new for
+# Layout inside the agent host. WORKDIR is the cwd pinned for
 # `--continue` session isolation.
 STATE_DIR = "/var/lib/cyberarena"
 LOG_DIR = "/var/log/cyberarena"
@@ -66,11 +59,10 @@ PHASE_CONTEXT_PATH = f"{STATE_DIR}/phase_context.json"
 ENV_PATH = f"{STATE_DIR}/agent.env"
 MCP_CONFIG_PATH = f"{STATE_DIR}/mcp.json"
 
-# Legacy paths from the M4 / M4.5 model — kept so fetch_logs / status
-# remain meaningful for any code path that still reads them, even
-# though the persistent-memory v1 model doesn't write them. New code
-# should look at the per-phase stream-{phase}.jsonl / agent-{phase}.log
-# artifacts in the host's run directory instead.
+# Legacy paths — kept so fetch_logs / status remain meaningful for any
+# code path that still reads them. New code should look at the
+# per-phase stream-{phase}.jsonl / agent-{phase}.log artifacts in the
+# host's run directory instead.
 PID_PATH = f"{RUN_DIR}/agent.pid"
 WRAPPER_PID_PATH = f"{RUN_DIR}/agent.wrapper.pid"
 EXIT_CODE_PATH = f"{RUN_DIR}/agent.exit_code"
@@ -78,9 +70,8 @@ STDOUT_PATH = f"{LOG_DIR}/agent.stdout"
 STDERR_PATH = f"{LOG_DIR}/agent.stderr"
 
 # install() callback. Fires after env / mcp.json / ssh pivot / workdir
-# are staged. The persistent-memory v1 install has no separate launch
-# step (claude is spawned per-phase by run_phase), so this is the only
-# install-side lifecycle hook.
+# are staged. Claude is spawned per-phase by run_phase, so this is the
+# only install-side lifecycle hook.
 OnInstalled = Callable[[str], None]
 
 
@@ -127,10 +118,10 @@ class ClaudeAgentManager(AgentManager):
         Steps:
           1. Make STATE_DIR / LOG_DIR / RUN_DIR / WORKDIR.
           2. npm install -g @anthropic-ai/claude-code (if cli starts with "claude").
-          3. SSH pivot if cfg.own_prod_container_name set (M5.6 mode).
+          3. SSH pivot if cfg.own_prod_container_name set.
           4. Write agent.env (no PROMPT_PATH here — prompts are per-phase).
           5. Write mcp.json if cfg.mcp_endpoint set.
-          6. Fire on_installed (caller bridges to AGENT_INSTALLED on the bus).
+          6. Fire on_installed (caller bridges to AGENT_INSTALLED).
 
         NO process is launched. The first `phase_command` invocation
         (driven by `AgentManager.run_phase`) is what actually starts Claude.
@@ -159,10 +150,9 @@ class ClaudeAgentManager(AgentManager):
 
         log.info("agent installed on %s (cli=%r)", container.name, cfg.cli)
 
-        # The one install-side lifecycle hook. Claude is spawned
-        # per-phase by `AgentManager.run_phase` (which composes
-        # `phase_command()` with the transport); GameMgr.record_phase_*
-        # emits AGENT_PROMPT_SENT / COMPLETED / TIMEOUT / FAILED.
+        # Claude is spawned per-phase by `AgentManager.run_phase`;
+        # GameMgr.record_phase_* emits AGENT_PROMPT_SENT / COMPLETED /
+        # TIMEOUT / FAILED.
         if on_installed is not None and cfg.team_id:
             on_installed(cfg.team_id)
 
@@ -186,13 +176,13 @@ class ClaudeAgentManager(AgentManager):
         cfg.model). Production leaves it None; tests pass it explicitly
         when the test mock client doesn't ship a model env var.
 
-        `session_marker` (optional, set by the runner per-invocation):
+        `session_marker` (optional, set by run_phase per-invocation):
         when given, claude is launched under `setsid -w bash -c …` so it
         gets its own process group. The inner bash writes its PID (=PGID,
         because it's the session leader) to
         `/tmp/cyberarena_phase_<marker>.pid` and then `exec`s claude in
         place (same PID/PGID). Any subprocesses claude spawns (exploits,
-        background jobs) inherit that PGID, so the runner's on-timeout
+        background jobs) inherit that PGID, so the on-timeout
         `kill_session` does `kill -KILL -- -<pgid>` and reaps the whole
         group — no orphans, no race with a sibling claude that the next
         phase just started in the same container.
@@ -224,17 +214,14 @@ class ClaudeAgentManager(AgentManager):
         ]
 
     # ── concrete-only convenience methods (NOT on the ABC) ─────────────
-    # Kept for the M4-era live-smoke tests (test_m4_agent::test_live_hello_world,
-    # test_m5_6_agent_attack) + scripts/m6_screenshot_demo.py. Under
-    # persistent-memory v1 install no longer writes PID/WRAPPER_PID/
-    # EXIT_CODE files, so these are mostly best-effort no-ops on this
-    # subclass — but the live smokes still expect them to be callable.
+    # Kept for live-smoke tests + scripts/m6_screenshot_demo.py. Install
+    # no longer writes PID/WRAPPER_PID/EXIT_CODE files, so these are
+    # mostly best-effort no-ops on this subclass.
 
     def status(self, container: ContainerHandle) -> AgentState:
-        """Legacy M4/M4.5 status read against the supervisor pid files.
-        These files are no longer written by the persistent-memory v1
-        install (no supervisor exists), so `status()` will normally
-        return NOT_INSTALLED. Kept for M4 test back-compat.
+        """Legacy status read against supervisor pid files. The
+        persistent-memory v1 install doesn't write them (no supervisor
+        exists), so this normally returns NOT_INSTALLED.
         """
         wrapper_pid = self._read_int_legacy(container, WRAPPER_PID_PATH)
         pid = self._read_int_legacy(container, PID_PATH)
@@ -258,10 +245,9 @@ class ClaudeAgentManager(AgentManager):
         return AgentState(status=AgentStatus.CRASHED, pid=pid, wrapper_pid=wrapper_pid)
 
     def kill(self, container: ContainerHandle) -> None:
-        """Legacy kill — sends SIGTERM to any process matching `claude -p`
-        inside the container. In the v1 model the per-phase claude is
-        typically already dead by the time kill() is called from
-        teardown; this is a safety net.
+        """Best-effort SIGTERM to any process matching `claude -p` inside
+        the container. The per-phase claude is typically already dead
+        by the time kill() is called from teardown; safety net only.
         """
         # Best-effort cleanup of legacy supervisor pid first.
         wrapper_pid = self._read_int_legacy(container, WRAPPER_PID_PATH)
@@ -275,10 +261,9 @@ class ClaudeAgentManager(AgentManager):
 
     def fetch_logs(self, container: ContainerHandle) -> AgentLogs:
         """Read the legacy stdout/stderr/exit_code paths. Returns empty
-        strings under the v1 model (those paths aren't written anymore).
-        New code should consume per-phase artifacts written by
-        `run_phase` (stream-{phase}.jsonl / agent-{phase}.log /
-        metadata-{phase}.json).
+        strings under the current model. New code should consume
+        per-phase artifacts written by `run_phase` (stream-{phase}.jsonl
+        / agent-{phase}.log / metadata-{phase}.json).
         """
         stdout = self._read_text(container, STDOUT_PATH)
         stderr = self._read_text(container, STDERR_PATH)
@@ -317,8 +302,8 @@ class ClaudeAgentManager(AgentManager):
             time.sleep(backoff)
 
     def _write_mcp_config(self, container: ContainerHandle, cfg: AgentConfig) -> None:
-        """Drop mcp.json with the team token in headers (M4.5 convention).
-        Mode 600 so it's not world-readable inside the container."""
+        """Drop mcp.json with the team token in headers. Mode 600 so
+        it's not world-readable inside the container."""
         payload = {
             "mcpServers": {
                 "cyberarena": {
@@ -334,10 +319,10 @@ class ClaudeAgentManager(AgentManager):
         self._exec_sync(container, ["chmod", "600", MCP_CONFIG_PATH], check=True)
 
     def _build_env_file(self, cfg: AgentConfig) -> str:
-        """agent.env contents: API key + base URL + IS_SANDBOX, plus all
-        the M5.6 attack-mode fields when populated. CLAUDE_MODEL is now
-        also exported so the per-phase claude invocation can pick it up
-        without needing --model on the command line."""
+        """agent.env contents: API key + base URL + IS_SANDBOX, plus the
+        attack-mode fields when populated. CLAUDE_MODEL is exported so
+        the per-phase claude invocation can pick it up without needing
+        --model on the command line."""
         lines = [
             f"export ANTHROPIC_API_KEY={shlex.quote(cfg.api_key)}",
             f"export ANTHROPIC_BASE_URL={shlex.quote(cfg.base_url)}",

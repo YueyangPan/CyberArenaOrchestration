@@ -1,25 +1,14 @@
 """HealthPoller — periodic + on-demand health-check scheduler.
 
-The poller does NOT subscribe to anything. GameMgr drives it at phase
-boundaries:
+GameMgr drives it at phase boundaries (the poller doesn't subscribe
+to anything):
 
-  enter_attack_phase  → poller.on_attack_enter(round_id)
-    fires one immediate probe per target (replaces the legacy
-    end-of-defense health check) and starts a per-(team, service)
-    task that loops `await asyncio.sleep(interval); checker.run()`.
-
-  enter_defense_phase / GAME_END / stop → poller.on_attack_exit()
-    cancels all periodic tasks.
-
-  _run_restart_job (any phase) → poller.trigger_now(team, service)
-    one-shot chain; agent gets a SERVICE_HEALTH_CHECK on the timeline
-    shortly after the restart_cmd settles.
-
-Stage 4 (challenge interface v2): PollTarget carries a `Challenge`
-instance and a pre-built `VulboxTarget`; HealthChecker.run delegates
-to `challenge.functionality_test.run(target)`. Interval is read from
-the v1 ChallengeSpec metadata as a transitional bridge until Stage 11
-defines the post-v2 interval source.
+  enter_attack_phase  → on_attack_enter(round_id) — one immediate
+                        probe + a per-(team, service) periodic task
+  enter_defense_phase / GAME_END / stop → on_attack_exit() — cancel
+  _run_restart_job → trigger_now(team, service) — one-shot probe so
+                     the agent sees a fresh SERVICE_HEALTH_CHECK
+                     right after a defense restart
 """
 
 from __future__ import annotations
@@ -35,7 +24,7 @@ from .checker import HealthChecker
 log = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_SECS = 10
-"""Fallback when a defense-capable challenge has no per-spec interval."""
+"""Fallback when a challenge doesn't override its poll interval."""
 
 
 @dataclass(frozen=True)
@@ -57,11 +46,9 @@ class HealthPoller:
         self._running = False
 
     def on_attack_enter(self, round_id: int) -> list[asyncio.Task]:
-        """Start polling: fire one immediate probe per target (as a
-        fire-and-forget Task so the caller isn't blocked), then start a
-        periodic task per target. Returns the immediate-probe tasks so
-        tests can await them; production callers ignore.
-        """
+        """Fire one immediate probe per target (fire-and-forget), then
+        start a periodic task per target. Returns the immediate-probe
+        tasks for tests to await; production callers ignore them."""
         if self._running:
             log.warning("poller.on_attack_enter while already running; restarting")
             self.on_attack_exit()
@@ -84,9 +71,8 @@ class HealthPoller:
         self._tasks.clear()
 
     async def trigger_now(self, team_id: str, service: str) -> None:
-        """One-shot probe for a (team, service) — used by restart-post.
-        Looks up the matching PollTarget; no-op if the service isn't
-        defense-capable (no target was registered)."""
+        """One-shot probe for restart-post. No-op if the service isn't
+        defense-capable (no PollTarget was registered)."""
         target = next(
             (t for t in self.targets if t.team_id == team_id and t.service == service),
             None,
@@ -100,8 +86,7 @@ class HealthPoller:
         await self._safe_run(target)
 
     async def stop(self) -> None:
-        """Cancel everything and wait for tasks to settle. Safe to call
-        multiple times."""
+        """Cancel everything. Safe to call multiple times."""
         self.on_attack_exit()
 
     async def _periodic_loop(self, target: PollTarget) -> None:
@@ -113,8 +98,8 @@ class HealthPoller:
             return
 
     async def _safe_run(self, target: PollTarget) -> None:
-        """Run one chain; log exceptions instead of propagating so a
-        single bad probe doesn't kill the periodic task."""
+        """Log exceptions instead of propagating so one bad probe
+        doesn't kill the periodic task."""
         try:
             await self.checker.run(
                 team_id=target.team_id,
@@ -139,20 +124,13 @@ def build_targets(
     target_factory,
     interval_lookup,
 ) -> list[PollTarget]:
-    """Build the poll-target list from game config.
+    """Cross-product (challenges × teams) filtered to defense-capable
+    challenges. Attack-only ones have no restart_handler and nothing
+    the poller would usefully repeat beyond the kickoff probe.
 
-    Cross-product (config.challenges × deploy_on teams) filtered to
-    defense-capable challenges (those whose `Challenge.restart_handler`
-    is not None — attack-only challenges have nothing the poller can
-    do periodically that the kickoff probe doesn't already cover).
-
-    `challenges`        — iterable of ChallengeConfig.
-    `teams_by_id`       — dict of team_id -> Team (must expose `.prod`).
-    `challenge_by_name` — callable: chcfg.name -> Challenge instance.
-    `target_factory`    — callable: (team_id, challenge) -> VulboxTarget;
-                          typically `GameMgr.target_for`.
-    `interval_lookup`   — callable: (chcfg.name, default) -> seconds;
-                          typically `challenges.registry.health_interval_secs`.
+    challenge_by_name(chcfg.name) -> Challenge — typically registry.build_challenge.
+    target_factory(team_id, challenge) -> VulboxTarget — typically GameMgr.target_for.
+    interval_lookup(chcfg.name, default) -> seconds — typically registry.health_interval_secs.
     """
     targets: list[PollTarget] = []
     for chcfg in challenges:

@@ -19,13 +19,13 @@ class EventType(str, Enum):
     # SSH pivot / workdir staged) → MCP-emitted READY (LLM proved the
     # channel works by calling report_ready). Per-phase invocation events
     # (AGENT_PROMPT_SENT / COMPLETED / TIMEOUT / FAILED) cover everything
-    # downstream of install. The M4.5-era AGENT_LAUNCHED event was retired
-    # alongside the supervisor model — there is no separate launch step.
+    # downstream of install. No separate launch step — claude is spawned
+    # per-phase by `AgentManager.run_phase`.
     AGENT_INSTALLED = "AGENT_INSTALLED"
     AGENT_READY = "AGENT_READY"
     FLAG_PLANTED = "FLAG_PLANTED"
     FLAG_SUBMITTED = "FLAG_SUBMITTED"
-    # Agent-self-reported deploy completion (M4.5; agent → MCP).
+    # Agent-self-reported deploy completion (agent → MCP).
     # Distinct from SERVICE_DEPLOYED which is the host-side initial install.
     DEPLOY_COMPLETE = "DEPLOY_COMPLETE"
     # DEFCON framework restart-job chain (orchestrator-emitted). Async by
@@ -49,8 +49,8 @@ class EventType(str, Enum):
     DEFENSE_KICKOFF = "DEFENSE_KICKOFF"
     # Mirror of DEFENSE_KICKOFF — emitted once per team on
     # PHASE_CHANGE → ATTACK entry. One attack agent per team per round
-    # (vs. defense's per-team-per-service) because an attack agent from
-    # M5.6 attacks every opposing team in a single run.
+    # (vs. defense's per-team-per-service) because an attack agent
+    # attacks every opposing team in a single run.
     ATTACK_KICKOFF = "ATTACK_KICKOFF"
     # Round loop terminated — fired exactly once at the end of the game,
     # whether via natural exit (round counter == total_rounds), stop()
