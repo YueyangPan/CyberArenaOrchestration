@@ -122,9 +122,18 @@ today). The reference implementation invokes `/arena/restart.sh` through
 that callable; other transports can plug in without changing the
 contract.
 
-The agent never invokes `restart.sh` directly. It can read and execute
-`/arena/restart.sh` but cannot modify it; the entire "edit source →
-restart service" pathway goes through this contract.
+**The supported restart path is the MCP `restart_service` tool.** The
+agent has shell access on prod and `/arena/restart.sh` is executable
+(mode 555, root-owned 555 — it can be read and run but not modified),
+so an agent that decides to bash it directly is not blocked at the
+filesystem layer. But the framework only drives the `STARTED →
+COMPLETED|FAILED` event chain and the post-restart health probe
+through the MCP-mediated path; a direct invocation records nothing
+and the round is effectively broken.
+
+Challenge authors should not assume the agent will (or should) invoke
+`restart.sh` directly. Defense prompts should call MCP
+`restart_service` and wait for the event chain.
 
 After restart, the framework re-runs `functionality_test`. CHECKER must
 pass for the round to count.
