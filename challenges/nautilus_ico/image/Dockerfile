@@ -50,6 +50,17 @@ RUN useradd --create-home --shell /bin/bash arena_agent \
 #                              what the agent edits. Per-container
 #                              writable layer; no host bind mount.
 COPY ico/service/ /opt/challenge_src/ico/
+
+# Pre-compile the initial ico binary at image build time so the
+# template carries it. Container startup then `cp -r`s the binary
+# along with the source — service is "ready immediately" instead of
+# waiting for entrypoint's fpc to finish. Same flags as restart.sh
+# so the baked binary and any later patch-rebuild come out identical.
+# The defense-time rebuild path still uses fpc inside the container
+# (restart.sh), so the toolchain stays in the runtime image.
+RUN cd /opt/challenge_src/ico && \
+    fpc -vh -Sd -Un -Cg -Cr- -Co- -O3 -Px86_64 -oico ico.pas
+
 RUN chmod -R 555 /opt/challenge_src/ico
 
 # ── Framework scripts ─────────────────────────────────────────────────
@@ -74,12 +85,13 @@ RUN mkdir -p /run/sshd /home/arena_agent/.ssh \
 # ── Entrypoint ────────────────────────────────────────────────────────
 #
 # 1. Generate sshd host keys (needed on first run).
-# 2. Copy the read-only source template into the writable workdir,
-#    chowned to arena_agent.
-# 3. Build the initial ico binary (so the service is ready before the
-#    first restart cycle).
-# 4. Start sshd. The service itself is launched by /arena/restart.sh
+# 2. Copy the read-only source template + pre-built binary into the
+#    writable workdir, chowned to arena_agent.
+# 3. Start sshd. The service itself is launched by /arena/restart.sh
 #    on the first MCP restart_service call.
+#
+# Initial `fpc` is no longer in entrypoint — done at image build time
+# above. Defense restart still recompiles via /arena/restart.sh.
 COPY entrypoint.sh /arena/entrypoint.sh
 RUN chmod 555 /arena/entrypoint.sh && chown root:root /arena/entrypoint.sh
 

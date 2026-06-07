@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # nautilus-ico container entrypoint.
 #
-# Runs as root, sets up the per-container source layout (private copy of
-# the baked template), generates sshd host keys, builds the initial
-# binary, then starts sshd in the foreground. The ico service itself is
-# launched by /arena/restart.sh on the first MCP restart_service call —
-# so the same restart path runs at start-of-game and at every defense
-# round.
+# Runs as root: generates sshd host keys (one-time), materializes the
+# per-container writable source workdir (private copy of the baked
+# template, including the pre-built binary), then exec's sshd in the
+# foreground. PID 1 reaps zombies and dies if sshd dies.
+#
+# The ico service itself is launched by /arena/restart.sh on the first
+# MCP restart_service call. Initial `fpc` compile is done at image
+# build time (see Dockerfile), not here — the template already carries
+# the binary so `cp -r` brings it along.
 
 set -e
 
@@ -22,13 +25,7 @@ cp -r /opt/challenge_src/ico/. /srv/challenge/ico/
 chown -R arena_agent:arena_agent /srv/challenge/ico
 chmod -R u+w /srv/challenge/ico
 
-# 3. Initial build (same flags as restart.sh).
-cd /srv/challenge/ico
-fpc -vh -Sd -Un -Cg -Cr- -Co- -O3 -Px86_64 -oico ico.pas || {
-    echo "initial fpc build failed — container will still start so the orchestrator can inspect" >&2
-}
-
-# 4. Start sshd in the foreground. PID 1 reaps zombies and dies if sshd dies.
-#    `restart.sh` is invoked on demand via `docker exec` for the actual
-#    service launch + every patch cycle.
+# 3. sshd foreground. restart.sh is invoked on demand via docker exec
+#    by the orchestrator for the actual ico service launch + every
+#    defense patch cycle.
 exec /usr/sbin/sshd -D -e
