@@ -25,9 +25,9 @@ challenges/<snake_name>/
     └── service/               # recommended — baked source / binaries
 ```
 
-The "recommended" Python files can be inlined into `challenge.py` for
-small challenges; the surfaces they implement are still required
-(§3).
+Recommended Python files can be inlined into `challenge.py` if your
+challenge is small. The surfaces they implement are still required —
+see §3.
 
 ## 2. Naming
 
@@ -37,61 +37,59 @@ small challenges; the surfaces they implement are still required
 | `Challenge.name` | `kebab-case` | `"nautilus-ico"` | Registry key, `game.yaml` `name:`, prompt-dispatcher key, event `service` field |
 | `VulboxImage.reference` | free-form OCI ref | `cyberarena/chal-nautilus-ico:v1` | Value `Challenge.vulbox.reference` returns; matches `image:` on team prod nodes in `game.yaml` |
 
-Python imports → snake. YAML / panel / wire → kebab. Image reference
-is your call (`ghcr.io/...`, `localhost:5000/...`, etc.) — don't bake
-registry policy into the challenge code.
+Python imports use snake; YAML, panel, and wire identifiers use
+kebab. The image reference is your call — `ghcr.io/...`,
+`localhost:5000/...`, anything Docker pulls. Don't bake registry
+policy into the challenge code.
 
 ## 3. Interface contracts
 
-`Challenge` is the **composition root**: one instance is the only
-handle the framework needs. The framework reads its `@property` /
-`@cached_property` attributes; it never constructs the components.
+`Challenge` is the composition root. A single instance carries
+everything the framework needs to deploy and run your challenge; it
+exposes the five components below as `@property` /
+`@cached_property` attributes and the framework reads them. You don't
+construct the components on the framework's behalf.
 
-All five components are mandatory — `restart_handler = None` is
-**not** acceptable. Defense is part of the round.
+All five are mandatory. `restart_handler = None` is not acceptable —
+defense is part of every round.
 
 | Component | Lives in | Surface |
 |---|---|---|
 | `Challenge` | `challenge.py` | `name`, `vulbox`, `functionality_test`, `flag_handler`, `restart_handler`, `docs` |
 | `VulboxImage` | inline in `challenge.py` | `reference: str`, `exposed_ports`, `build_context` |
-| `FunctionalityTest.run(target)` | `functionality_test.py` *or* inline | Returns a `CheckResult` tree. **Required:** one `checker` leaf that fails when the service's real function is broken (not merely when the port is closed). **Recommended:** at least one transport-level leaf alongside (`tcp` / `http` / `sql` / …). `nautilus_ico` uses `process` + `tcp` + `protocol` + `checker`; framework emits one event per leaf, `leaf.name` verbatim. |
-| `FlagHandler` | `flag_handler.py` *or* inline | `plant(target, flag) → handle` writes the flag and returns an opaque handle. `retrieve(target, handle) → str \| None` reads it back (`None` on miss, never raises). |
-| `RestartHandler.run(target)` | `restart_handler.py` *or* inline | Rebuilds + restarts the service. Use `target.meta["exec_in_container"]` to run commands inside the container. Returns a `CheckResult` tree with at least one leaf that fails when the rebuild produced a broken service. `nautilus_ico` uses `compile` + `spawn` + `smoke`; web / db might prefer `build` + `start` + `smoke`. |
-| `build_attack_prompt` + `build_defense_prompt` | `prompts.py` | Both required. Defense prompt **must** state that submitting a flag during DEFENSE rejects with `reason=WRONG_PHASE`. If you know where the bug is, name file / function. If you don't (legacy / unaudited / discovery-style challenge), give real attack-surface guidance (entry points, untrusted-input boundaries) — don't fabricate. |
+| `FunctionalityTest.run(target)` | `functionality_test.py` *or* inline | Returns a `CheckResult` tree. At minimum one `checker` leaf that fails when the service is actually broken, not just when the port is closed. Transport-level leaves (`tcp`, `http`, `sql`) alongside it are helpful for the panel and the agent. `nautilus_ico` uses `process` + `tcp` + `protocol` + `checker`. The framework emits one event per leaf and uses `leaf.name` verbatim. |
+| `FlagHandler` | `flag_handler.py` *or* inline | `plant(target, flag) → handle` writes the flag and returns an opaque handle. `retrieve(target, handle) → str \| None` reads it back. Returns `None` on miss; never raises. |
+| `RestartHandler.run(target)` | `restart_handler.py` *or* inline | Rebuilds and restarts the service. Run things inside the container via `target.meta["exec_in_container"]`. Return a `CheckResult` tree; at least one leaf should fail when the rebuild produces a broken service. `nautilus_ico` uses `compile` + `spawn` + `smoke`. |
+| `build_attack_prompt` + `build_defense_prompt` | `prompts.py` | Both required. The defense prompt must tell the agent that flag submissions during DEFENSE are rejected with `reason=WRONG_PHASE`. Name the vulnerable file and function if you know them. If you don't, give real attack-surface guidance — entry points, untrusted-input paths — instead of guessing. |
 
 ## 4. Image requirements
 
-The framework needs four things from your image. Everything else is up
-to you.
+Four things the framework needs from your image:
 
-- **SSH access for `arena_agent`** (non-root). The defender agent SSHes
-  in during DEFENSE to edit your source; root login is disabled.
-- **A writable copy of your source.** The agent edits a copy, not the
-  baked original — so the entrypoint should materialize a working
-  directory owned by `arena_agent` before launching the service.
-  `restart.sh` rebuilds from there.
-- **A rebuild script the framework can invoke** through your
-  `RestartHandler`. The reference puts it at `/arena/restart.sh`
-  (root-owned, not agent-writable).
-- **Self-contained startup.** No `apt-get` / `pip install` after build
-  — everything must already be in the image. Compiled services
-  should pre-compile their initial binary at build time but keep the
-  toolchain so `restart.sh` can rebuild later.
+- SSH for `arena_agent`. The defender uses it during DEFENSE to edit
+  source. Root login disabled.
+- A writable copy of your source. The agent edits the copy;
+  `restart.sh` rebuilds from it. Set this up in the entrypoint before
+  launching the service.
+- A rebuild script your `RestartHandler` invokes. The reference puts
+  it at `/arena/restart.sh`, root-owned.
+- Self-contained startup. Nothing fetched after build — bake every
+  runtime dep into the image. Compiled services should pre-compile
+  the initial binary at build time but keep the toolchain so rebuilds
+  work later.
 
-Build for `linux/amd64` unless you have a reason otherwise (some
-toolchains have no arm backend). Pick any service slug `<svc>` for the
-in-image paths — `nautilus_ico` uses `ico`, and it's fine for it to
-differ from your directory name and `Challenge.name`.
+Build for `linux/amd64`. Pick any in-image service slug you want
+(`nautilus_ico` uses `ico`); it doesn't need to match your directory
+name or `Challenge.name`.
 
-For the exact Dockerfile + entrypoint pattern that satisfies all of
-the above, copy
+The cleanest way to start: copy
 [`challenges/nautilus_ico/image/`](../challenges/nautilus_ico/image/)
-as your starting point.
+and adjust.
 
 ## 5. Defense flow contract
 
-When the agent calls `mcp__cyberarena__restart_service`, the framework
-runs `restart_handler.run(target)`:
+Agent calls `mcp__cyberarena__restart_service`. Framework runs your
+`restart_handler.run(target)`:
 
 ```
 restart_handler.run(target)
@@ -100,14 +98,13 @@ restart_handler.run(target)
   → return CheckResult{ ... }
 ```
 
-**Defense prompts should call MCP `restart_service` and wait for the
-event chain**, not run `restart.sh` directly. The script's permissions
-don't physically block a direct call, but only the MCP path emits
-restart events and re-probes health — bypass it and the round
-records nothing.
+The agent should always go through MCP, never run `restart.sh`
+directly. The script is reachable from the SSH session, but only the
+MCP path emits restart events and re-probes health. A direct
+invocation produces a round that records nothing.
 
-After the restart, the framework re-runs `functionality_test`.
-CHECKER must pass for the round to count.
+After the restart, the framework re-runs `functionality_test`. CHECKER
+has to pass for the round to count.
 
 ## 6. Pipeline integration
 
