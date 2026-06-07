@@ -754,7 +754,7 @@ class GameMgr:
         """Bus emit: per-phase agent invocation is about to begin.
 
         Called by the kickoff handler just before
-        `agents.runner.run_phase_via_transport`. Carries the first line
+        `AgentManager.run_phase`. Carries the first line
         of the prompt + `is_first` flag so panel observers can show
         whether this is the long briefing or a short continuation cue.
         """

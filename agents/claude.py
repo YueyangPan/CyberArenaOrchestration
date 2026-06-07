@@ -11,8 +11,8 @@ docs/persistent_memory_agent_plan_v1.md):
                                   # consuming the prompt from PROMPT_PATH.
 
 The per-phase 3-line dance (write prompt → run_command → kill on
-timeout) lives in `agents.runner.run_phase_via_transport`, not here.
-GameMgr owns artifact persistence + AGENT_* event emission via
+timeout) lives in `AgentManager.run_phase`, not here. GameMgr owns
+artifact persistence + AGENT_* event emission via
 `record_phase_started` / `record_phase_done`.
 
 All side effects on the agent host go through `AgentTransport`
@@ -133,8 +133,7 @@ class ClaudeAgentManager(AgentManager):
           6. Fire on_installed (caller bridges to AGENT_INSTALLED on the bus).
 
         NO process is launched. The first `phase_command` invocation
-        (driven by `agents.runner.run_phase_via_transport`) is what
-        actually starts Claude.
+        (driven by `AgentManager.run_phase`) is what actually starts Claude.
         """
         # All dirs the per-phase flow expects to exist.
         self._exec_sync(container, ["mkdir", "-p", STATE_DIR, LOG_DIR, RUN_DIR, WORKDIR], check=True)
@@ -160,9 +159,8 @@ class ClaudeAgentManager(AgentManager):
 
         log.info("agent installed on %s (cli=%r)", container.name, cfg.cli)
 
-        # The one install-side lifecycle hook. There's no separate
-        # "launched" step — claude is spawned per-phase by
-        # `agents.runner.run_phase_via_transport` (which composes
+        # The one install-side lifecycle hook. Claude is spawned
+        # per-phase by `AgentManager.run_phase` (which composes
         # `phase_command()` with the transport); GameMgr.record_phase_*
         # emits AGENT_PROMPT_SENT / COMPLETED / TIMEOUT / FAILED.
         if on_installed is not None and cfg.team_id:

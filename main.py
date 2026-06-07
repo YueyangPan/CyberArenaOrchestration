@@ -16,7 +16,6 @@ import uvicorn
 
 from agents.manager import AgentManager
 from agents.registry import build as build_agent_manager
-from agents.runner import run_phase_via_transport
 from agents.transport_docker import DockerExecBackend
 from gamemgr.api import build_app
 from gamemgr.config import load as load_game_config
@@ -211,7 +210,7 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
       * `_make_phase_handler` (defense + attack) — runs per (team,
         phase) from the kickoff subscribers. The whole body is the
         5-line dance: lookup handle → record_phase_started →
-        run_phase_via_transport → record_phase_done. All CLI-specific
+        mgr.run_phase → record_phase_done. All CLI-specific
         details (prompt path, claude argv, kill pattern) live behind
         `mgr.PROMPT_PATH` / `mgr.phase_command()` / `mgr.PHASE_KILL_PATTERN`.
     """
@@ -277,8 +276,8 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
         # Run the agent. We don't persist artifacts here (it's a single
         # MCP call). Success/failure is signalled via AGENT_READY on
         # the bus, observed by GameMgr.dry_run_all_agents.
-        await run_phase_via_transport(
-            mgr, backend, handle, prompt,
+        await mgr.run_phase(
+            backend, handle, prompt,
             timeout=DRY_RUN_AGENT_TIMEOUT_SECS, model=model,
         )
 
@@ -309,8 +308,8 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
 
             started_at = time.time()
             try:
-                result = await run_phase_via_transport(
-                    mgr, backend, handle, prompt,
+                result = await mgr.run_phase(
+                    backend, handle, prompt,
                     timeout=timeout_secs, model=cfg.model or None,
                 )
             except Exception as e:

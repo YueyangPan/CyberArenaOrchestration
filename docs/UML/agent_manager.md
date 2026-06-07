@@ -1,15 +1,15 @@
 # Agent layer — UML
 
-Three orthogonal pieces compose to invoke one LLM-agent CLI for one
-phase:
+Two orthogonal abstractions:
 
-- **AgentManager** (ABC) — per-CLI recipe (data + 2 methods)
+- **AgentManager** (ABC) — per-CLI recipe: install + phase_command +
+  the `run_phase` glue that drives one phase.
 - **AgentTransport** (Protocol) — per-host-kind execution surface
-- **agents.runner** — free function that composes the two
+  (docker exec today; SSH later).
 
-Adding a new CLI = one new `AgentManager` subclass (~50–80 LOC). Adding
-a new host kind = one new `AgentTransport`. Neither change touches
-the other axis.
+Adding a new CLI = one new `AgentManager` subclass (~50–80 LOC).
+Adding a new host kind = one new `AgentTransport`. Neither change
+touches the other axis.
 
 ## Class diagram
 
@@ -20,14 +20,15 @@ classDiagram
     +PROMPT_PATH: str
     +PHASE_KILL_PATTERN: str
     +install(container, cfg, *, on_installed) None
-    +phase_command(*, model) list~str~
+    +phase_command(*, model, session_marker) list~str~
+    +run_phase(transport, handle, prompt, *, timeout, model) CommandResult
   }
 
   class ClaudeAgentManager {
     +PROMPT_PATH = "/var/lib/cyberarena/prompt.txt"
     +PHASE_KILL_PATTERN = "claude -p"
     +install(...) None
-    +phase_command(model) list~str~
+    +phase_command(model, session_marker) list~str~
     +status(container) AgentState
     +kill(container) None
     +fetch_logs(container) AgentLogs
@@ -40,6 +41,7 @@ classDiagram
     +write_file(handle, path, content) None
     +read_file(handle, path) bytes
     +kill_process(handle, pattern) None
+    +kill_session(handle, marker) None
   }
 
   class DockerExecBackend {
@@ -48,6 +50,7 @@ classDiagram
     +write_file(...) None
     +read_file(...) bytes
     +kill_process(...) None
+    +kill_session(...) None
   }
 
   class CommandResult {
@@ -55,6 +58,7 @@ classDiagram
     +stdout: bytes
     +stderr: bytes
     +timed_out: bool
+    +pkilled_at: float?
   }
 
   class AgentConfig {
@@ -77,23 +81,18 @@ classDiagram
     +build(cfg) AgentManager
   }
 
-  class runner {
-    <<module>>
-    +run_phase_via_transport(mgr, transport, handle, prompt, *, timeout, model) CommandResult
-  }
-
   AgentManager <|-- ClaudeAgentManager
   AgentTransport <|.. DockerExecBackend
   registry ..> AgentManager : builds
   registry ..> AgentConfig : dispatches on provider
-  runner ..> AgentManager : reads PROMPT_PATH<br/>+ PHASE_KILL_PATTERN<br/>+ phase_command()
-  runner ..> AgentTransport : write_file +<br/>run_command +<br/>kill_process
-  runner ..> CommandResult : returns
+  AgentManager ..> AgentTransport : run_phase writes file +<br/>runs command + kill_session
+  AgentManager ..> CommandResult : returns
 ```
 
 ## Per-CLI extension point
 
-Adding a new CLI (codex / gemini / openai_compat) is one new class:
+Adding a new CLI (codex / gemini / openai_compat) is one new class —
+inherited `run_phase` keeps the glue identical:
 
 ```python
 class CodexAgentManager(AgentManager):
@@ -104,17 +103,19 @@ class CodexAgentManager(AgentManager):
         # npm install -g @openai/codex
         # write env, .codex/config.json, ssh pivot...
 
-    def phase_command(self, *, model=None):
+    def phase_command(self, *, model=None, session_marker=None):
         return ["bash", "-c", "cd ... && codex --resume ... < $PROMPT_PATH"]
 ```
 
 Then one line in `agents/registry.py`:
+
 ```python
 REGISTRY = {"claude": ClaudeAgentManager, "codex": CodexAgentManager}
 ```
 
-No copy-pasted host plumbing — the transport + runner already handle
-that.
+The transport handles host plumbing; `run_phase` on the ABC handles
+the prompt-stage / invoke / kill-on-timeout dance — neither needs to
+be reimplemented.
 
 ## One-phase sequence
 
@@ -122,28 +123,26 @@ that.
 sequenceDiagram
   autonumber
   participant Game as GameMgr
-  participant Run as runner
   participant Mgr as AgentManager
   participant Tx as AgentTransport
   participant Host as Agent host
   participant Bus as EventBus
 
   Game->>Bus: AGENT_PROMPT_SENT (record_phase_started)
-  Game->>Run: run_phase_via_transport(mgr, tx, handle, prompt, timeout)
-  Run->>Mgr: phase_command(model)
-  Mgr-->>Run: argv
-  Run->>Tx: write_file(mgr.PROMPT_PATH, prompt)
+  Game->>Mgr: run_phase(tx, handle, prompt, timeout)
+  Mgr->>Tx: write_file(PROMPT_PATH, prompt)
   Tx->>Host: stage prompt.txt
-  Run->>Tx: run_command(argv, timeout)
-  Tx->>Host: spawn CLI
-  Note over Host: CLI reads + appends<br/>session store (--continue)
+  Mgr->>Mgr: phase_command(model, session_marker)
+  Mgr->>Tx: run_command(argv, timeout)
+  Tx->>Host: spawn CLI under setsid -w
+  Note over Host: CLI reads PROMPT_PATH + appends<br/>session store (--continue)
   Host-->>Tx: stdout / stderr / exit_code
-  Tx-->>Run: CommandResult
+  Tx-->>Mgr: CommandResult
   alt timed_out
-    Run->>Tx: kill_process(mgr.PHASE_KILL_PATTERN)
-    Tx->>Host: pkill -KILL -f
+    Mgr->>Tx: kill_session(session_marker)
+    Tx->>Host: kill -KILL -- -<pgid>
   end
-  Run-->>Game: CommandResult
+  Mgr-->>Game: CommandResult
   Note over Game: write 3 artifacts (record_phase_done)
   Game->>Bus: AGENT_COMPLETED · TIMEOUT · FAILED
 ```
@@ -152,12 +151,11 @@ sequenceDiagram
 
 | Path | Role |
 |---|---|
-| `agents/manager.py` | `AgentManager` ABC |
+| `agents/manager.py` | `AgentManager` ABC + `run_phase` glue |
 | `agents/claude.py` | `ClaudeAgentManager` + paths constants |
 | `agents/transport.py` | `AgentTransport` Protocol + `CommandResult` + `AgentHandle` |
 | `agents/transport_docker.py` | `DockerExecBackend` |
-| `agents/runner.py` | `run_phase_via_transport` |
 | `agents/registry.py` | `REGISTRY` + `build(cfg)` |
-| `agents/prompts/__init__.py` | Prompt dispatcher + short cues |
-| `agents/prompts/{notes,nautilus_ico}.py` | Per-challenge briefings |
+| `agents/prompts/__init__.py` | Prompt dispatcher + shared helpers |
+| `challenges/<name>/prompts.py` | Per-challenge `build_attack_prompt` / `build_defense_prompt` |
 | `models/agent.py` | `AgentConfig`, `AgentStatus`, `AgentState`, `AgentLogs` |

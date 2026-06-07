@@ -1,50 +1,47 @@
-"""AgentManager ABC — per-CLI recipe contract.
+"""`AgentManager` ABC — per-CLI recipe + the one-phase dance.
 
-An `AgentManager` subclass tells the framework two things about one
-LLM-agent CLI flavor (Claude Code, OpenAI codex CLI, Gemini CLI, …):
+A subclass tells the framework two things about one LLM-agent CLI
+flavor (Claude Code, OpenAI codex CLI, Gemini CLI, …):
 
-  1. How to install the CLI inside an agent host
-  2. The shell argv to invoke that CLI for one phase with
-     persistent-memory semantics (resume previous session via the
-     CLI's own `--continue` / `--resume` flag)
+  1. How to install the CLI inside an agent host (`install`)
+  2. The shell argv to invoke it for one phase, resuming the prior
+     session (`phase_command`)
 
-Everything else — writing the prompt file, awaiting the transport,
-killing on timeout, persisting artifacts, emitting events — lives in
-`agents.runner.run_phase_via_transport` + `GameMgr.record_phase_*`,
-not on the manager. The split means:
+`run_phase` is the common glue — stage prompt, invoke through the
+transport with a timeout, kill the process group on timeout. It lives
+here as a concrete method so subclasses don't reimplement it.
 
-  * Adding a new CLI = subclass with `install` + `phase_command` +
-    two class constants, ~50-80 LOC. No copy-pasted host plumbing.
-  * Swapping host transports = backend change, not a manager change
-    (see `agents.transport`).
+Adding a new CLI = subclass with `install` + `phase_command` + two
+class constants. No copy-pasted host plumbing; the transport handles
+that axis independently.
 
 `status` / `kill` / `fetch_logs` from the M4-era observability surface
-are NOT abstract here. Concrete subclasses may keep them for legacy
-live-smoke tests, but new CLIs are not required to implement them —
-their semantics (per-phase invocation, not a long-running supervisor)
-mean status/kill/fetch_logs are best-effort no-ops anyway.
+are not abstract here — concrete subclasses may keep them for legacy
+smoke tests, but new CLIs don't need them (per-phase invocation makes
+them best-effort no-ops anyway).
 """
 
 from __future__ import annotations
 
+import secrets
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
 from models.agent import AgentConfig
 from orchestrator.handle import ContainerHandle
 
+from .transport import AgentHandle, AgentTransport, CommandResult
+
 
 class AgentManager(ABC):
-    # File path inside the agent host where the per-phase prompt is
-    # written before each invocation. The CLI consumes it via stdin
-    # redirect (or `--prompt-file` if the CLI prefers that — implement
-    # however you want in `phase_command`).
+    # Path inside the agent host where the per-phase prompt is staged
+    # before each invocation. The CLI reads it via stdin redirect (or
+    # `--prompt-file` — up to `phase_command` to wire it).
     PROMPT_PATH: ClassVar[str]
 
-    # `pkill -KILL -f <pattern>` is run inside the host after a
-    # `transport.run_command` timeout if SIGTERM didn't propagate
-    # cleanly. Should match a substring unique to this CLI's process
-    # tree so we don't pkill the agent's own tool subprocesses.
+    # `pkill -KILL -f <pattern>` fallback if `kill_session` can't find
+    # the pidfile (transport-level timeout cleanup). Match a substring
+    # unique to this CLI's process tree.
     PHASE_KILL_PATTERN: ClassVar[str]
 
     @abstractmethod
@@ -56,18 +53,57 @@ class AgentManager(ABC):
         on_installed=None,
     ) -> None:
         """One-shot setup at game start: install the CLI, write env /
-        MCP config files, provision any SSH pivot the agent needs.
+        MCP config, provision any SSH pivot the agent needs.
         Idempotent. No process is launched."""
         ...
 
     @abstractmethod
-    def phase_command(self, *, model: str | None = None) -> list[str]:
-        """Shell argv to invoke the CLI for one phase. Must read the
-        prompt from `PROMPT_PATH` and resume the prior session so
-        memory carries (`--continue` / `--resume` / equivalent).
+    def phase_command(
+        self,
+        *,
+        model: str | None = None,
+        session_marker: str | None = None,
+    ) -> list[str]:
+        """Shell argv that drives one phase.
 
-        Return type matches `AgentTransport.run_command`'s `cmd`
-        argument: list of argv tokens. For shell-form invocations
-        (cd / source / redirect), wrap in `["bash", "-c", "..."]`.
+        Reads the prompt from `PROMPT_PATH` and resumes the prior
+        session (`--continue` / `--resume` / equivalent).
+
+        `session_marker` is the per-invocation token used by
+        `kill_session` to target this run's process group via a
+        pidfile (typically `/tmp/cyberarena_phase_<marker>.pid`).
+        Wrap claude under `setsid -w` and tee the leader's PID into
+        that file so the kill on timeout is non-racy.
         """
         ...
+
+    async def run_phase(
+        self,
+        transport: AgentTransport,
+        handle: AgentHandle,
+        prompt: str,
+        *,
+        timeout: float,
+        model: str | None = None,
+    ) -> CommandResult:
+        """Run one phase via `transport`. Returns the raw `CommandResult`.
+
+        Stages the prompt, runs the CLI with `timeout`, and on timeout
+        precision-kills the session via the marker-pidfile pattern.
+        Persistence (stream-{phase}.jsonl etc.) and event emission
+        (AGENT_COMPLETED / TIMEOUT / FAILED) are the caller's job —
+        see `GameMgr.record_phase_done`.
+        """
+        transport.write_file(handle, self.PROMPT_PATH, prompt.encode())
+        session_marker = secrets.token_hex(6)
+        result = await transport.run_command(
+            handle,
+            self.phase_command(model=model, session_marker=session_marker),
+            timeout=timeout,
+        )
+        if result.timed_out:
+            # SIGTERM on the docker exec wrapper doesn't always
+            # propagate to the in-container child; signal the
+            # session's whole process group via the pidfile marker.
+            transport.kill_session(handle, session_marker)
+        return result
