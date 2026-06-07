@@ -97,9 +97,7 @@ the image (the reference uses `ico`). It does not need to match
    leave the artifact under `/opt/challenge_src/<svc>/`. Keep the
    build toolchain in the runtime image — `restart.sh` rebuilds in-container.
 
-Recommended (convention only — `EXPOSE` is metadata, not a hard
-requirement; the framework reaches the service over the docker network
-either way):
+Recommended:
 
 7. `EXPOSE 22` (sshd) plus the service port(s).
 
