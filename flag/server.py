@@ -121,9 +121,19 @@ class FlagServer:
         flags there would give every observer an attack-for-free.
         Phase / round are stamped via the status_resolver so the panel
         can render which phase the submission happened in.
+
+        Phase-gating: submissions during DEFENSE are rejected with
+        WRONG_PHASE *before* the FlagStore is consulted. This stops a
+        confused defense agent from burning a DUPLICATE slot (the store
+        would otherwise mark the flag string as already-submitted for
+        that team, blocking a legitimate ATTACK-phase retry later).
         """
-        result = self.store.submit(team_id, flag)
         st = self._status()
+        phase = (st.get("phase") or "").upper()
+        if phase == "DEFENSE":
+            result = SubmitResult(accepted=False, reason="WRONG_PHASE")
+        else:
+            result = self.store.submit(team_id, flag)
         self.timeline.record(
             EventType.FLAG_SUBMITTED,
             team_id=team_id,

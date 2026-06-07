@@ -110,15 +110,23 @@ def build_mcp_app(game: "GameMgr") -> tuple[FastMCP, "Starlette"]:
 
     @mcp.tool()
     async def submit_flag(flag: str, ctx: Context) -> dict:
-        """Submit a stolen flag. Returns {accepted, reason}.
+        """Submit a stolen flag. Returns {accepted, reason, detail}.
 
         Shares the same `GameMgr.submit_flag()` handler as REST, so the
         recorded `FLAG_SUBMITTED` event is identical regardless of which
         transport the submission arrived through.
+
+        `detail` is a one-line human-readable hint matching `reason` —
+        useful when the model rejects need a clear "why" to avoid
+        burning more tokens guessing (e.g. WRONG_PHASE during DEFENSE).
         """
         team_id = _team_id_from_ctx(ctx)
         result = await game.submit_flag(team_id, flag)
-        return {"accepted": result.accepted, "reason": result.reason}
+        return {
+            "accepted": result.accepted,
+            "reason": result.reason,
+            "detail": result.detail,
+        }
 
     @mcp.tool()
     async def report_ready(ctx: Context) -> dict:

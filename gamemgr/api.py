@@ -79,12 +79,18 @@ def build_app(game: GameMgr, shutdown_event: asyncio.Event) -> FastAPI:
         # emit a FLAG_SUBMITTED event — we don't want the event stream to
         # become a token-probing oracle.
         if not x_team_token:
-            return {"accepted": False, "reason": "BAD_TOKEN"}
+            return {"accepted": False, "reason": "BAD_TOKEN",
+                    "detail": "X-Team-Token header missing or empty"}
         team_id = game._token_to_team.get(x_team_token)
         if team_id is None:
-            return {"accepted": False, "reason": "BAD_TOKEN"}
+            return {"accepted": False, "reason": "BAD_TOKEN",
+                    "detail": "X-Team-Token header missing or empty"}
         result = await game.submit_flag(team_id, body.get("flag", ""))
-        return {"accepted": result.accepted, "reason": result.reason}
+        return {
+            "accepted": result.accepted,
+            "reason": result.reason,
+            "detail": result.detail,
+        }
 
     @app.websocket("/events/stream")
     async def events_stream(websocket: WebSocket):
