@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""Notes daemon — tiny TCP service used as the game-simple challenge.
+"""Notes daemon — tiny TCP service used as the framework smoke test.
 
 Protocol (newline-terminated, one command per connection):
   PUT <text>   -> 'OK <id>'
   GET <id>     -> the stored text, or 'ERR'
   LIST         -> 'COUNT <n>'
-
-Baked into the `cyberarena/chal-notes` image at /opt/cyberarena/notes/server.py
-by the per-challenge Dockerfile. The entrypoint launches it on container
-start; no docker-exec ship-and-spawn from the orchestrator anymore.
 """
 
 import socket

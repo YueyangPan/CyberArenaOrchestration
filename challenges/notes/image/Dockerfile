@@ -1,12 +1,8 @@
-# Runtime image for the notes challenge.
+# cyberarena/chal-notes runtime image.
 #
-# Single-stage ubuntu:24.04 — small surface, python3 only (no compile
-# toolchain like ico needs). Bakes the notes daemon + an arena_agent
-# SSH user. The entrypoint starts sshd in the foreground and spawns
-# the daemon in the background, so the orchestrator doesn't need a
-# docker-exec ship-and-spawn step at deploy time.
-#
-# Build context: this directory (challenges/notes/image/).
+# ubuntu + python3 + sshd. Bakes server.py + an arena_agent SSH user.
+# Entrypoint runs sshd in the foreground and spawns the daemon in the
+# background — no docker-exec ship-and-spawn at deploy time.
 
 FROM --platform=linux/amd64 ubuntu:24.04
 
@@ -20,34 +16,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ── User ──────────────────────────────────────────────────────────────
-#
-# `arena_agent` — non-root user the dev container SSHes in as. Same
-# convention as the ico image so the framework's _provision_ssh_pivot
-# auto-detects the right SSH user via `id arena_agent`.
+# Non-root user the dev container SSHes in as. The framework's
+# _provision_ssh_pivot auto-detects this via `id arena_agent`.
 RUN useradd --create-home --shell /bin/bash arena_agent
 
-# ── sshd ──────────────────────────────────────────────────────────────
-#
-# PermitRootLogin no — non-root only. The agent SSH key is provisioned
-# at install time by the orchestrator, which writes the public key to
-# /home/arena_agent/.ssh/authorized_keys after the container starts.
+# sshd: non-root only. The agent key is provisioned at install time.
 RUN mkdir -p /run/sshd /home/arena_agent/.ssh \
     && chown arena_agent:arena_agent /home/arena_agent/.ssh \
     && chmod 700 /home/arena_agent/.ssh \
     && sed -i 's/^#*PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
 
-# ── Notes daemon ──────────────────────────────────────────────────────
-#
-# server.py lives at /opt/cyberarena/notes/server.py — the same path
-# the framework's functionality_test pgreps for. Read-only to the
-# arena_agent user (the agent doesn't patch notes; defense isn't a
-# notes workflow).
+# Daemon source, read-only. The functionality_test pgreps for this exact path.
 RUN mkdir -p /opt/cyberarena/notes
 COPY server.py /opt/cyberarena/notes/server.py
 RUN chmod 555 /opt/cyberarena/notes/server.py
 
-# ── Entrypoint ────────────────────────────────────────────────────────
 COPY entrypoint.sh /arena/entrypoint.sh
 RUN chmod 555 /arena/entrypoint.sh
 

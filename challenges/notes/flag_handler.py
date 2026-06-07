@@ -1,15 +1,7 @@
-"""NotesFlagHandler — plant/retrieve flags via the notes daemon's own protocol.
+"""Plant + retrieve flags via the notes daemon's PUT/GET protocol.
 
-`plant` does `PUT <flag>` from inside the prod container (127.0.0.1)
-so it works regardless of cross-team network state — planting happens
-at game start and must succeed even before ATTACK opens game_net. The
-daemon replies `OK <id>`; we parse and return `<id>` as the opaque
-handle. `retrieve` then does `GET <id>`.
-
-Notes is attack-only in the v1 game.yaml so no defense rebuild
-exists, but the FlagHandler is still wired the same way attack agents
-would use over the public interface — same code path with a different
-target.
+Both calls run inside the prod container on 127.0.0.1, so they work
+regardless of cross-team network state.
 """
 
 from __future__ import annotations
@@ -27,11 +19,10 @@ class NotesFlagHandler(FlagHandler):
         return ("service",)
 
     def plant(self, target: VulboxTarget, flag: str) -> str:
-        """PUT the flag, return the `<id>` from the daemon's `OK <id>` reply."""
+        """`PUT <flag>` — daemon replies `OK <id>`. Returns `<id>`."""
         exec_in = target.meta["exec_in_container"]
         port = target.ports["service"]
-        # repr(flag) is python-safe for the python -c body — handles
-        # quote / backslash / unicode in the flag string.
+        # repr(flag) safely escapes quotes / backslashes for the python -c body.
         probe = (
             f"import socket, sys\n"
             f"s = socket.socket(); s.settimeout(3)\n"
@@ -46,7 +37,6 @@ class NotesFlagHandler(FlagHandler):
             raise RuntimeError(
                 f"notes plant_flag failed on {target.host}: rc={rc}, out={out!r}"
             )
-        # Reply shape: "OK <idx>" — return idx as the handle.
         line = out.strip().splitlines()[-1] if out else ""
         parts = line.split()
         if len(parts) < 2 or parts[0] != "OK":
@@ -56,8 +46,7 @@ class NotesFlagHandler(FlagHandler):
         return parts[1]
 
     def retrieve(self, target: VulboxTarget, handle: str) -> str | None:
-        """GET <handle>. Returns the stored flag, or None if the daemon
-        answered ERR (id out of range, store rotated since plant, etc.)."""
+        """`GET <handle>` — returns the stored flag, or None on `ERR`."""
         exec_in = target.meta["exec_in_container"]
         port = target.ports["service"]
         probe = (
@@ -77,7 +66,6 @@ class NotesFlagHandler(FlagHandler):
 
 
 def _q(s: str) -> str:
-    """Single-quote the python source for bash -c. Bash single quotes
-    can't contain a literal single quote, so we escape with the
-    '\\'' trick — standard shell idiom."""
+    """Wrap a string for `bash -c '...'`. Bash single-quotes can't
+    contain a literal single quote — standard `'\\''` workaround."""
     return "'" + s.replace("'", "'\\''") + "'"

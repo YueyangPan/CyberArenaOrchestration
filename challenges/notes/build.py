@@ -1,15 +1,7 @@
-"""Image build for the notes challenge.
+"""Build the `cyberarena/chal-notes` image from `image/`.
 
-Simple single-stage ubuntu + python3 + sshd + the notes daemon baked
-in at build time. No external pin (vs. ico which clones an upstream
-vendor commit); the tag's `v<n>` suffix is bumped manually when the
-Dockerfile or daemon source changes meaningfully — the cache-by-content
-docker layer system handles the actual rebuild detection.
-
-Shells out to `docker build` (not the python SDK) for the same reason
-ico does: the SDK's legacy builder mishandles `--platform=linux/amd64`
-on arm64 hosts (mac dev), and the CLI uses buildx which gets the cross-
-arch path right.
+Shells out to `docker build` (not the python SDK) because the SDK's
+legacy builder misroutes `--platform=linux/amd64` on arm hosts.
 """
 
 from __future__ import annotations
@@ -43,7 +35,7 @@ def build_image(client: docker.DockerClient | None = None) -> str:
     if not _CONTEXT_DIR.is_dir():
         raise FileNotFoundError(f"missing build context: {_CONTEXT_DIR}")
 
-    log.info("notes: building %s (context=%s)", tag, _CONTEXT_DIR)
+    log.info("notes: building %s", tag)
     try:
         subprocess.run(
             ["docker", "build", "--platform=linux/amd64", "-t", tag, str(_CONTEXT_DIR)],

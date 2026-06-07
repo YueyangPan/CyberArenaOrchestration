@@ -1,13 +1,10 @@
-# Defense-mode runtime image for nautilus-ico.
+# cyberarena/chal-nautilus-ico runtime image.
 #
-# Differs from upstream's multi-stage Dockerfile: single-stage so the
-# FreePascal toolchain (fpc + fp-units-*) stays in the runtime image,
-# which is what makes in-container rebuilds possible. The whole defense
-# workflow depends on this — see DEFCON plan §Integration tax.
+# Single-stage so the FreePascal toolchain (fpc + fp-units-*) stays in
+# the runtime image — the defense workflow rebuilds in-container.
 #
-# Build context: this directory PLUS vendor/nautilus-finals-2025/ico/.
-# The NautilusSource adapter assembles that combined context at
-# build_image() time.
+# Build context: this dir + vendor/nautilus-finals-2025/ico/. The
+# context is assembled by challenges.nautilus_ico.build.build_image().
 
 FROM --platform=linux/amd64 ubuntu:24.04
 
@@ -23,75 +20,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Users ─────────────────────────────────────────────────────────────
-#
-# Two distinct unprivileged users — different reasons to exist:
-#
-# `arena_agent` — non-root user the dev container SSHes in as. Owns
-#   /srv/challenge/ico/. Cannot modify /arena/* (root-owned 555).
-#
-# `ico` — the service runtime user. The Pascal server forks per-client
-#   and `DropPrivileges('ico')` (see service/server.pas) before handling
-#   the protocol; if this user doesn't exist, every child crashes mid-
-#   handshake (connection reset on first send). Required even though the
-#   agent never logs in as `ico`. Mirrors upstream's adduser pattern.
-#
-# sshd's host keys generated at first start (see ENTRYPOINT below).
+# Two users:
+#   arena_agent — non-root user the dev container SSHes in as.
+#   ico         — service-runtime user. server.pas calls
+#                 DropPrivileges('ico') before handling a connection;
+#                 without this user, every child crashes mid-handshake.
 RUN useradd --create-home --shell /bin/bash arena_agent \
     && adduser --no-create-home --disabled-password --gecos "" ico
 
-# ── Source layout ─────────────────────────────────────────────────────
-#
-# Bake the source twice:
-#   /opt/challenge_src/ico/  — root-owned, read-only template. Used by
-#                              entrypoint to repopulate /srv/ on every
-#                              container start (clean baseline).
-#   /srv/challenge/ico/      — chowned to arena_agent at start. This is
-#                              what the agent edits. Per-container
-#                              writable layer; no host bind mount.
+# Bake source twice:
+#   /opt/challenge_src/ico/  — read-only template (root-owned 555)
+#   /srv/challenge/ico/      — entrypoint cp -r's it per-container,
+#                              chowned to arena_agent; agent edits this.
 COPY ico/service/ /opt/challenge_src/ico/
 
-# Pre-compile the initial ico binary at image build time so the
-# template carries it. Container startup then `cp -r`s the binary
-# along with the source — service is "ready immediately" instead of
-# waiting for entrypoint's fpc to finish. Same flags as restart.sh
-# so the baked binary and any later patch-rebuild come out identical.
-# The defense-time rebuild path still uses fpc inside the container
-# (restart.sh), so the toolchain stays in the runtime image.
+# Pre-compile the initial binary at build time (same flags as restart.sh,
+# from upstream Makefile). The cp -r in entrypoint brings the binary
+# along, so the service is "ready immediately" — no startup fpc cost
+# and no per-host compile drift.
 RUN cd /opt/challenge_src/ico && \
     fpc -vh -Sd -Un -Cg -Cr- -Co- -O3 -Px86_64 -oico ico.pas
 
 RUN chmod -R 555 /opt/challenge_src/ico
 
-# ── Framework scripts ─────────────────────────────────────────────────
-#
-# /arena/restart.sh and /arena/checker.sh — invoked by the orchestrator
-# via docker exec (as root). Agent SSH user can read+execute, NOT write.
+# Framework scripts: root-owned 555. Agent SSH user can read+exec, not write.
 COPY restart.sh /arena/restart.sh
 COPY checker.sh /arena/checker.sh
 RUN chmod 555 /arena/restart.sh /arena/checker.sh \
     && chown root:root /arena/restart.sh /arena/checker.sh
 
-# ── SSH configuration ─────────────────────────────────────────────────
-#
-# PermitRootLogin no — non-root only. The agent SSH key is provisioned
-# at runtime by ClaudeAgentManager._provision_ssh_pivot, which writes
-# /home/arena_agent/.ssh/authorized_keys after the container starts.
+# sshd: non-root only. Agent key is provisioned at install time.
 RUN mkdir -p /run/sshd /home/arena_agent/.ssh \
     && chown arena_agent:arena_agent /home/arena_agent/.ssh \
     && chmod 700 /home/arena_agent/.ssh \
     && sed -i 's/^#*PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
 
-# ── Entrypoint ────────────────────────────────────────────────────────
-#
-# 1. Generate sshd host keys (needed on first run).
-# 2. Copy the read-only source template + pre-built binary into the
-#    writable workdir, chowned to arena_agent.
-# 3. Start sshd. The service itself is launched by /arena/restart.sh
-#    on the first MCP restart_service call.
-#
-# Initial `fpc` is no longer in entrypoint — done at image build time
-# above. Defense restart still recompiles via /arena/restart.sh.
 COPY entrypoint.sh /arena/entrypoint.sh
 RUN chmod 555 /arena/entrypoint.sh && chown root:root /arena/entrypoint.sh
 

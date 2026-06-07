@@ -1,28 +1,14 @@
-"""Image build for nautilus-ico.
+"""Build the `cyberarena/chal-nautilus-ico` image.
 
-The ico challenge needs a dedicated image (custom Pascal binary +
-framework scripts under /arena/). We assemble the build context from
-two sources:
+Combines two sources into one build context:
+  challenges/nautilus_ico/image/    — Dockerfile + framework scripts (this repo)
+  vendor/nautilus-finals-2025/ico/  — Pascal sources (pin-cloned upstream)
 
-  challenges/nautilus_ico/image/   (this repo, colocated with the
-                              challenge code) — Dockerfile, restart.sh,
-                              checker.sh, entrypoint.sh
-  vendor/nautilus-finals-2025/ico/  (upstream pin-clone) — Pascal source
-                              under `service/` that the Dockerfile copies
-
-The vendor checkout is created by `scripts/sync_nautilus.sh` (a one-shot
-pin clone); the `image/` dir is hand-authored alongside the Python code.
-
-Tag is `cyberarena/chal-nautilus-ico:<pin>` where `<pin>` is the short
-SHA of the vendor checkout, baked into the tag so cached images are
-unambiguous after a vendor upgrade.
+Run `scripts/sync_nautilus.sh` once to materialize the vendor checkout.
 
 Shells out to `docker build` (not the python SDK) because the SDK's
-legacy builder + `--platform=linux/amd64` combination errors on the
-post-build image lookup (BuildKit returns a manifest list; the SDK
-picks the wrong arch). The CLI uses buildx and handles cross-arch
-cleanly — important on the arm64 dev mac since the Pascal toolchain
-(ppcx64) only ships an x86_64 backend on Ubuntu.
+legacy builder misroutes `--platform=linux/amd64` on arm hosts and
+fpc/ppcx64 is amd64-only on Ubuntu.
 """
 
 from __future__ import annotations
@@ -44,8 +30,7 @@ _VENDOR_DIR = Path(__file__).resolve().parents[2] / "vendor" / "nautilus-finals-
 
 
 def build_image(client: docker.DockerClient | None = None) -> str:
-    """Build the ico image (or no-op if it's already in the local cache).
-    Returns the resolved tag."""
+    """Build (or cache-hit) the ico image. Returns the resolved tag."""
     challenge = IcoChallenge()
     tag = challenge.vulbox.reference
 
@@ -67,16 +52,14 @@ def build_image(client: docker.DockerClient | None = None) -> str:
 
     with tempfile.TemporaryDirectory(prefix="cyberarena-build-ico-") as tmp_root:
         ctx = Path(tmp_root)
-        # Framework files (Dockerfile, restart.sh, checker.sh, entrypoint.sh,
-        # spec.toml) land at the context root.
+        # Framework files at context root; vendor under <ctx>/ico/ so the
+        # Dockerfile's `COPY ico/service/` resolves.
         for entry in _FRAMEWORK_DIR.iterdir():
             if entry.is_file():
                 shutil.copy2(entry, ctx / entry.name)
-        # Upstream source lives under <ctx>/ico/ — the Dockerfile's
-        # `COPY ico/service/` line is relative to the context root.
         shutil.copytree(_VENDOR_DIR, ctx / "ico")
 
-        log.info("nautilus-ico: building %s (context=%s)", tag, ctx)
+        log.info("nautilus-ico: building %s", tag)
         try:
             subprocess.run(
                 ["docker", "build", "--platform=linux/amd64", "-t", tag, str(ctx)],
