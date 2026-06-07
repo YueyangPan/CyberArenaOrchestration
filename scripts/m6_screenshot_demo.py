@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Live M5.6-style attack + M6 panel screenshots.
+"""Live attack + panel screenshots.
 
 Runs end-to-end:
 
-  1. Bring up arena (M1) + deploy challenge (M2) + plant initial flags (M5).
+  1. Bring up arena + deploy challenge + plant initial flags.
   2. Start uvicorn on :8000 so the panel + submit endpoint are live.
   3. Snap screenshot #1 — panel after plant, before agent.
-  4. Install Claude attack agent on team2_dev (M5.6 pipeline: SSH pivot
-     provisioned inside install()).
+  4. Install Claude attack agent on team2_dev (SSH pivot provisioned
+     inside install()).
   5. Poll FlagStore until team2 lands at least one ACCEPTED submission, or
      time out (default 4 min).
   6. Snap screenshot #2 — panel after attack.
@@ -141,10 +141,9 @@ def main() -> int:
         for tid, cfg_ in agent_cfgs.items():
             print(f"  🤖 installing attack agent on {tid}_dev …")
             mgr.install(_handle(client, f"{tid}_dev"), cfg_)
-            # AGENT_INSTALLED is in the EventType enum (M4 design) but no
-            # production code path emits it yet. Surface it here so the panel
-            # shows the installed-agent chip. Future M4.5 will emit from
-            # ClaudeAgentManager directly.
+            # Surface AGENT_INSTALLED here so the panel shows the
+            # installed-agent chip in screenshot mode (production wires
+            # this through GameMgr.install_agents).
             game.timeline.record(
                 EventType.AGENT_INSTALLED,
                 team_id=tid,

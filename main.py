@@ -258,7 +258,7 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
     # ── pre-R1 dry-run handler ─────────────────────────────────────────
     # Tiny one-turn invocation: ask the agent to call report_ready via
     # MCP, then exit. Success is observed by GameMgr.dry_run_all_agents
-    # watching the bus for AGENT_READY for this team.
+    # waiting for AGENT_READY per team.
     async def dry_run_handler(team_id: str) -> None:
         team = next((t for t in game.config.topology.teams if t.id == team_id), None)
         if team is None or not team.dev:
@@ -274,8 +274,8 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
         model = (cfg.model if cfg is not None else "") or None
         prompt = _DRY_RUN_PROMPT
         # Run the agent. We don't persist artifacts here (it's a single
-        # MCP call). Success/failure is signalled via AGENT_READY on
-        # the bus, observed by GameMgr.dry_run_all_agents.
+        # MCP call). Success/failure is signalled via AGENT_READY,
+        # observed by GameMgr.dry_run_all_agents.
         await mgr.run_phase(
             backend, handle, prompt,
             timeout=DRY_RUN_AGENT_TIMEOUT_SECS, model=model,
