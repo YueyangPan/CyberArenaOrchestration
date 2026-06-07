@@ -1,8 +1,10 @@
-# Running DEF CON ico from scratch
+# How to run the sample challenge
 
-Reproducibility check: from a blank Linux box (typically an EC2) to a
-finished 3-round match. Distro-agnostic; tested most recently on
-Amazon Linux 2023.
+End-to-end recipe for taking a blank Linux host (typically an EC2)
+and running a full 3-round match of the bundled DEF CON ico sample
+challenge. The same pattern works for your own challenges once
+they're wired in — only the config file changes. Distro-agnostic;
+tested most recently on Amazon Linux 2023.
 
 **You need:** a Linux host (x86_64, ≥ 4 GB disk) with sudo, two
 Anthropic API keys (separate keys for TEAM1 and TEAM2 so the agents
