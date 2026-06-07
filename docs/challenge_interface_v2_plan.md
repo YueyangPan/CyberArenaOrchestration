@@ -28,7 +28,7 @@ just calls methods on the `Challenge` instance.
 | Component | Responsibility |
 |---|---|
 | `VulboxImage` | image reference + exposed ports + build context |
-| `FunctionalityTest.run(target)` | returns a `CheckResult` tree (recommended leaves: `process`, `tcp`, `protocol`, `checker`) |
+| `FunctionalityTest.run(target)` | returns a `CheckResult` tree. Only requirement: one leaf named `checker` (or any leaf that fails when the service's real function breaks). Transport-level leaves alongside it are recommended but free-form. |
 | `FlagHandler.plant(target, flag)` / `retrieve(target, handle)` | opaque per-challenge plant + retrieve |
 | `RestartHandler.run(target)` | rebuild + respawn after agent defense edits |
 | `prompts.build_attack_prompt` / `build_defense_prompt` | per-challenge prompts |

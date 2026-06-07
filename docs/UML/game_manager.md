@@ -236,5 +236,5 @@ sequenceDiagram
 | `gamemgr/api.py` | FastAPI `build_app(game, shutdown)` |
 | `gamemgr/mcp_server.py` | MCP tools (submit_flag, report_ready, restart_service, …) |
 | `gamemgr/panel_snapshot.py` | `write_snapshot(run_dir)` |
-| `health/checker.py` | `HealthChecker` (4-level probe primitive) |
+| `health/checker.py` | `HealthChecker` — runs the challenge's `FunctionalityTest`, emits one event per `CheckResult` leaf |
 | `health/poller.py` | `HealthPoller` (ATTACK-only periodic + trigger_now) |

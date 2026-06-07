@@ -68,7 +68,9 @@ Agent recipe (per challenge's `build_defense_prompt`):
 
 The restart emits `SERVICE_RESTART_STARTED` →
 `COMPLETED|FAILED`, then one `SERVICE_HEALTH_CHECK` per `CheckResult`
-leaf (typical leaves: `process`, `tcp`, `protocol`, `checker`).
+leaf. Leaf names are challenge-defined; the bundled `nautilus_ico`
+uses `process` / `tcp` / `protocol` / `checker` and others can pick
+whatever shape fits (web → `http` + `checker`, db → `sql` + `checker`, …).
 `DEPLOY_COMPLETE` is agent-triggered; `duration_ms` is host-computed
 from the `DEFENSE_KICKOFF` timestamp (agent-self-reported values were
 unreliable in live runs).
