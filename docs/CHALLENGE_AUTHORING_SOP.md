@@ -6,7 +6,10 @@ self-contained `challenges/<snake_name>/` directory. Reference:
 Finals 2025 `ico`). Interface ABCs:
 [`challenges/interface/`](../challenges/interface/).
 
-## 1. Files
+## 1. Layout
+
+For the bigger picture of how these pieces slot into the framework,
+see [docs/UML/challenges.md](UML/challenges.md).
 
 ```
 challenges/<snake_name>/
