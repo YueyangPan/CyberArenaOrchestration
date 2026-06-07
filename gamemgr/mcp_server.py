@@ -10,14 +10,15 @@ Auth: every tool inspects the `X-Team-Token` header on the live HTTP
 request via `Context.request_context.request`. Unknown / missing token
 raises an MCP error with code -32001 and a deliberately generic
 "Unauthorized" message — no `BAD_TOKEN` / team-id / token-hint strings
-on the wire (M4.5 §安全注意: don't be a token oracle).
+on the wire (don't be a token oracle).
 
-Tools (three; named per the M4.5 plan):
+Tools:
   - submit_flag(flag)              shared with REST /game/flag/submit
   - report_ready()                 LLM ack that the channel works
   - report_deploy_complete(...)    agent self-reports defense finish
+  - restart_service(service)       agent triggers post-edit restart
 
-Mount-path constants are exported by-design (see M4.5 §MCP mount 路径):
+Mount-path constants:
   MCP_MOUNT_PATH       FastAPI app.mount() prefix
   MCP_PUBLIC_ENDPOINT  what clients put in mcp.json (with trailing slash
                        to dodge FastAPI's `/mcp` → `/mcp/` 307)
@@ -95,7 +96,7 @@ def build_mcp_app(game: "GameMgr") -> tuple[FastMCP, "Starlette"]:
     def _team_id_from_ctx(ctx: Context) -> str:
         """Resolve X-Team-Token header → team_id, or raise generic
         Unauthorized. Never reveals which step failed (no header / unknown
-        token / etc.) — see M4.5 token-oracle hardening."""
+        token / etc.) — see token-oracle hardening above."""
         req = ctx.request_context.request
         token = ""
         if req is not None:
@@ -110,15 +111,23 @@ def build_mcp_app(game: "GameMgr") -> tuple[FastMCP, "Starlette"]:
 
     @mcp.tool()
     async def submit_flag(flag: str, ctx: Context) -> dict:
-        """Submit a stolen flag. Returns {accepted, reason}.
+        """Submit a stolen flag. Returns {accepted, reason, detail}.
 
         Shares the same `GameMgr.submit_flag()` handler as REST, so the
         recorded `FLAG_SUBMITTED` event is identical regardless of which
         transport the submission arrived through.
+
+        `detail` is a one-line human-readable hint matching `reason` —
+        useful when the model rejects need a clear "why" to avoid
+        burning more tokens guessing (e.g. WRONG_PHASE during DEFENSE).
         """
         team_id = _team_id_from_ctx(ctx)
         result = await game.submit_flag(team_id, flag)
-        return {"accepted": result.accepted, "reason": result.reason}
+        return {
+            "accepted": result.accepted,
+            "reason": result.reason,
+            "detail": result.detail,
+        }
 
     @mcp.tool()
     async def report_ready(ctx: Context) -> dict:

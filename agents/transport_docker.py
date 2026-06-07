@@ -181,8 +181,8 @@ class DockerExecBackend(AgentTransport):
     def kill_process(self, handle: AgentHandle, pattern: str) -> None:
         """Best-effort pkill inside the container. Used by teardown
         paths (e.g. ClaudeAgentManager.kill) that don't have a specific
-        PID. Per-phase runners should use `kill_session` to avoid
-        racing concurrent claude instances in the same container."""
+        PID. Prefer `kill_session` when a session marker is available
+        to avoid racing concurrent claude instances in the same container."""
         try:
             c = self._client.containers.get(handle.name)
             c.exec_run(["pkill", "-KILL", "-f", pattern])

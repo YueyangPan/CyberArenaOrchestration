@@ -13,7 +13,8 @@ don't invent new categories ad-hoc, but it no longer influences the
 path — only the filename does. Each kind has a canonical filename
 convention documented inline.
 
-See docs/DEFCON_challenge_framework_plan_v1.md for the full design.
+See docs/archived/DEFCON_challenge_framework_plan_v1.md for the
+historical design that introduced this layout.
 """
 
 from __future__ import annotations

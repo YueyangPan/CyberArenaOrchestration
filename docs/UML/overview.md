@@ -17,9 +17,8 @@ graph TD
     TL(["Timeline<br/>(append-only · FileSink + WS)"]):::core
     FS(["FlagServer<br/>(plant · rotate · submit)"]):::core
     HP(["HealthPoller<br/>(ATTACK-only periodic)"]):::core
-    Mgr(["AgentManager<br/>(CLI recipe)"]):::core
+    Mgr(["AgentManager<br/>(CLI recipe + run_phase)"]):::core
     Tx(["AgentTransport<br/>(host execution)"]):::core
-    Runner(["agents.runner<br/>(3-line dance)"]):::glue
     API(["FastAPI · MCP server"]):::core
     Panel["panel.html<br/>(live + snapshot)"]
 
@@ -33,9 +32,8 @@ graph TD
     FS --> TL
     HP --> TL
     TL --> Panel
-    Game --> Runner
-    Runner --> Mgr
-    Runner --> Tx
+    Game --> Mgr
+    Mgr --> Tx
     Game --> API
     API --> TL
   end
@@ -62,14 +60,13 @@ classDef glue stroke-dasharray:4 4,opacity:0.7
 | Component | Responsibility | Details |
 |---|---|---|
 | **main.py** | Entry point | Wires `Orchestrator`, `GameMgr`, `AgentManager` per team via registry, registers handlers, starts FastAPI + round loop |
-| **Orchestrator** | Docker lifecycle | Creates containers + networks per [topology.yaml](../m1_topology_plan.md), exposes `set_cross_team_network(allow)` for phase-driven isolation. See [orchestrator.md](orchestrator.md) |
+| **Orchestrator** | Docker lifecycle | Creates containers + networks per [topology.yaml](../archived/m1_topology_plan.md), exposes `set_cross_team_network(allow)` for phase-driven isolation. See [orchestrator.md](orchestrator.md) |
 | **GameMgr** | Orchestration executor | Owns timeline, round loop, artifact store; holds references to FlagServer + HealthPoller facilities. Records AGENT_* events; drives phase transitions via direct methods. See [game_manager.md](game_manager.md) |
 | **Timeline** | Append-only telemetry | `record()` + `attach_file_sink` + `attach_stream`. Replaces the legacy EventBus — no subscribers drive internal logic. See [timeline.md](timeline.md) |
-| **FlagServer** | Flag mechanics | Plants flags (SERVICE_PROTOCOL via adapter / FILE_AT_PATH via docker exec), runs per-round rotation, verifies submissions, records FLAG_PLANTED / FLAG_SUBMITTED. See [flag.md](flag.md) |
-| **HealthPoller** | Service health observation | 4-level chain (PROCESS → TCP → PROTOCOL → CHECKER) via `HealthChecker`. Runs periodically during ATTACK + one-shot after restart. See [health.md](health.md) |
-| **AgentManager** | Per-CLI recipe | ABC: `install` + `phase_command` + 2 constants. Concrete: ClaudeAgentManager (codex / gemini future). See [agent_manager.md](agent_manager.md) |
-| **AgentTransport** | Host execution | Protocol: `run_command` / `write_file` / `kill_process`. Concrete: DockerExecBackend (SSH later). See [agent_manager.md](agent_manager.md) |
-| **agents.runner** | Glue | One free function: stage prompt → run CLI with timeout → pkill on timeout. Returns raw `CommandResult` to caller. See [agent_manager.md](agent_manager.md) |
+| **FlagServer** | Flag mechanics | Delegates plant + retrieve to each challenge's `FlagHandler`, runs per-round rotation, verifies submissions, records FLAG_PLANTED / FLAG_SUBMITTED. See [flag.md](flag.md) |
+| **HealthPoller** | Service health observation | Runs the challenge's `FunctionalityTest` via `HealthChecker` and emits one `SERVICE_HEALTH_CHECK` per `CheckResult` leaf. Bundled challenges use the `PROCESS → TCP → PROTOCOL → CHECKER` convention; the framework doesn't require it. Runs periodically during ATTACK + one-shot after restart. See [health.md](health.md) |
+| **AgentManager** | Per-CLI recipe + one-phase glue | ABC: `install` + `phase_command` + `run_phase` + 2 constants. Concrete: ClaudeAgentManager (codex / gemini future). See [agent_manager.md](agent_manager.md) |
+| **AgentTransport** | Host execution | Protocol: `run_command` / `write_file` / `kill_session`. Concrete: DockerExecBackend (SSH later). See [agent_manager.md](agent_manager.md) |
 | **FastAPI + MCP** | External surface | REST `/game/flag/submit` etc.; WebSocket `/events/stream` for panel; MCP HTTP `/mcp/` for agent tool calls |
 | **panel.html** | Observer UI | Live mode connects WebSocket; snapshot mode replays `events.jsonl` embedded at game end (`runs/<ts>/panel.html`) |
 | **Challenge** | Pluggable vulnerable app | `Challenge` ABC composing `vulbox` + `functionality_test` + `flag_handler` + `restart_handler?` + `docs`. Two in tree: notes (attack-only), nautilus-ico (full defense). See [challenges.md](challenges.md) |
@@ -109,7 +106,7 @@ Two cross-cutting concerns:
 - [docs/UML/game_manager.md](game_manager.md) — GameMgr internals (timeline, round loop, artifacts)
 - [docs/UML/timeline.md](timeline.md) — Timeline append-only telemetry stream (post-bus refactor)
 - [docs/UML/flag.md](flag.md) — FlagServer + FlagStore (plant / rotate / submit)
-- [docs/UML/health.md](health.md) — HealthChecker + HealthPoller (4-level probe + ATTACK polling)
+- [docs/UML/health.md](health.md) — HealthChecker + HealthPoller (per-challenge probe tree + ATTACK polling)
 - [docs/UML/orchestrator.md](orchestrator.md) — Docker / network lifecycle
 - [docs/UML/challenges.md](challenges.md) — pluggable challenge sources
 - [docs/persistent_memory_agent_plan_v1.md](../persistent_memory_agent_plan_v1.md) — design rationale for the agent layer

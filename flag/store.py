@@ -5,10 +5,12 @@ and who has already submitted what. Lives entirely in memory — game
 state does not need to survive process restart in MVP.
 
 Reasons returned by `submit()`:
-  ACCEPTED   — first submission of someone else's live flag by this team
-  UNKNOWN    — flag string not in any (team, service) row
-  OWN        — flag belongs to the submitter's own team
-  DUPLICATE  — this (submitter, victim, service) was already submitted
+  ACCEPTED     — first submission of someone else's live flag by this team
+  UNKNOWN      — flag string not in any (team, service) row
+  OWN          — flag belongs to the submitter's own team
+  DUPLICATE    — this (submitter, victim, service) was already submitted
+  WRONG_PHASE  — submission arrived during DEFENSE — only ATTACK accepts;
+                 enforced one layer up in `FlagServer.submit`, not here
 """
 
 from __future__ import annotations
@@ -28,12 +30,31 @@ def new_flag() -> str:
     return f"FLAG{{{body}}}"
 
 
+# Human-readable hints attached to each rejection reason. Surfaced to
+# the agent via the MCP + REST submit-flag responses so the model has
+# a clear signal of WHY a submission was rejected (the prompt tells
+# agents what's allowed; this is the runtime echo of the same rule).
+REASON_DETAIL: dict[str, str] = {
+    "ACCEPTED":    "submission accepted",
+    "UNKNOWN":     "flag string not recognized — either it was never planted or it was rotated out",
+    "OWN":         "you cannot submit your own team's flag",
+    "DUPLICATE":   "you already submitted this exact flag string earlier",
+    "WRONG_PHASE": "flag submissions are only accepted during ATTACK; the game is currently in DEFENSE",
+}
+
+
 @dataclass(frozen=True)
 class SubmitResult:
     accepted: bool
-    reason: str   # ACCEPTED | UNKNOWN | OWN | DUPLICATE
+    reason: str   # ACCEPTED | UNKNOWN | OWN | DUPLICATE | WRONG_PHASE
     victim_team_id: str | None = None
     service: str | None = None
+
+    @property
+    def detail(self) -> str:
+        """Human-readable explanation matching `reason`. Empty string
+        for unknown / unmapped reasons."""
+        return REASON_DETAIL.get(self.reason, "")
 
 
 @dataclass

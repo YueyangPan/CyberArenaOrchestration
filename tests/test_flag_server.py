@@ -96,13 +96,13 @@ def _target_factory(team_id: str, ch: Challenge) -> VulboxTarget:
     )
 
 
-def _server(challenge_by_owner: dict | None = None):
+def _server(challenge_by_owner: dict | None = None, *, phase: str = "ATTACK"):
     timeline = Timeline()
     server = FlagServer(
         timeline,
         challenge_by_owner=challenge_by_owner if challenge_by_owner is not None else {},
         target_factory=_target_factory,
-        status_resolver=lambda: {"round": 7, "phase": "ATTACK"},
+        status_resolver=lambda: {"round": 7, "phase": phase},
     )
     return server, timeline
 
@@ -214,6 +214,59 @@ def test_submit_unknown_records_event_without_victim_or_service():
     ev = next(e for e in tl.history() if e.type == EventType.FLAG_SUBMITTED.value)
     assert ev.payload["reason"] == "UNKNOWN"
     assert ev.payload["victim_team_id"] is None
+
+
+# ── phase-gating ─────────────────────────────────────────────────────
+
+
+def test_submit_during_defense_rejected_as_wrong_phase():
+    """Submissions during DEFENSE must be rejected without consulting the
+    FlagStore — a confused defense agent reusing an ATTACK-phase flag
+    string should NOT burn its DUPLICATE slot for the next ATTACK."""
+    ch = _StubChallenge()
+    server, tl = _server({("team1", "notes"): ch, ("team2", "notes"): ch}, phase="DEFENSE")
+    server.plant_flags(round_id=1)
+    target_flag = server.store.planted[("team1", "notes")]
+
+    result = server.submit("team2", target_flag)
+    assert result.accepted is False
+    assert result.reason == "WRONG_PHASE"
+    # detail carries a human-readable explanation for the agent.
+    assert "defense" in result.detail.lower()
+    # The store wasn't touched — the flag is still NOT in team2's
+    # submitted set, so a real ATTACK-phase resubmit would still succeed.
+    assert target_flag not in server.store.submissions.get("team2", set())
+
+    # FLAG_SUBMITTED still lands on the timeline (panel needs visibility)
+    # but with reason=WRONG_PHASE.
+    ev = next(e for e in tl.history() if e.type == EventType.FLAG_SUBMITTED.value)
+    assert ev.payload["reason"] == "WRONG_PHASE"
+
+
+def test_submit_during_defense_then_attack_resubmit_accepted():
+    """After WRONG_PHASE rejection during DEFENSE, the same flag in the
+    next ATTACK phase is still ACCEPTED — store wasn't tainted."""
+    ch = _StubChallenge()
+    timeline = Timeline()
+    current = {"phase": "DEFENSE"}
+    server = FlagServer(
+        timeline,
+        challenge_by_owner={("team1", "notes"): ch, ("team2", "notes"): ch},
+        target_factory=_target_factory,
+        status_resolver=lambda: {"round": 7, "phase": current["phase"]},
+    )
+    server.plant_flags(round_id=1)
+    target_flag = server.store.planted[("team1", "notes")]
+
+    # DEFENSE submit -> WRONG_PHASE
+    r1 = server.submit("team2", target_flag)
+    assert r1.reason == "WRONG_PHASE"
+
+    # Phase flips to ATTACK; same flag is still acceptable.
+    current["phase"] = "ATTACK"
+    r2 = server.submit("team2", target_flag)
+    assert r2.accepted is True
+    assert r2.reason == "ACCEPTED"
 
 
 # ── setup snapshot ───────────────────────────────────────────────────

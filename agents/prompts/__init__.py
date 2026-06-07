@@ -37,9 +37,8 @@ from ._helpers import (  # noqa: F401
 
 
 # slug (matches Challenge.name) -> dotted path of the per-challenge
-# prompts module. Stage 6 of the challenge-interface-v2 migration moved
-# the bodies from `agents.prompts.<name>` to `challenges.<name>.prompts`
-# so per-challenge code stays colocated.
+# prompts module. Per-challenge bodies live next to the challenge code
+# so everything for one challenge stays in one directory.
 _PROMPT_MODULES: dict[str, str] = {
     "notes": "challenges.notes.prompts",
     "nautilus-ico": "challenges.nautilus_ico.prompts",
@@ -73,7 +72,7 @@ def build_attack_prompt(
     prompt so we don't re-send the topology / protocol crib.
 
     Falls back to the notes recipe when no service-specific module is
-    registered — preserves the M5.6 single-challenge demo path.
+    registered — preserves the single-challenge smoke-test path.
     """
     if not is_first:
         return short_attack_cue(cfg)

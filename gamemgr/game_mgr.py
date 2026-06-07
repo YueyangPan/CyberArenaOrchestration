@@ -27,11 +27,10 @@ from typing import Awaitable, Callable
 
 from .artifacts import ArtifactKind, ArtifactStore
 
-# Kickoff handler signature for persistent-memory v1. main.py registers
-# one of these per phase via register_defense_kickoff_handler /
-# register_attack_kickoff_handler; the handler awaits run_phase on
-# ClaudeAgentManager and emits AGENT_COMPLETED / TIMEOUT / FAILED.
-#   args: (team_id, cfg, round_id, phase_lower, is_first)
+# Kickoff handler signature. main.py registers one per phase via
+# register_defense_kickoff_handler / register_attack_kickoff_handler;
+# the handler awaits `mgr.run_phase(...)` and emits AGENT_COMPLETED /
+# TIMEOUT / FAILED. args: (team_id, cfg, round_id, phase_lower, is_first)
 PhaseKickoffHandler = Callable[[str, AgentConfig, int, str, bool], Awaitable[None]]
 
 from .config import ChallengeConfig, GameConfig
@@ -50,25 +49,19 @@ class GameMgr:
     def __init__(self, config: GameConfig, orchestrator: Orchestrator) -> None:
         self.config = config
         self.orchestrator = orchestrator
-        # Timeline replaces the legacy EventBus. It is observation-only:
-        # FileSink + WebSocket consume; nothing internal subscribes.
-        # Internal control flow (phase transitions, deploy_complete handling,
-        # dry-run gating) goes through direct method calls on GameMgr.
+        # Timeline is observation-only: FileSink + WebSocket consume;
+        # nothing internal subscribes. Internal control flow goes
+        # through direct method calls on GameMgr.
         self.timeline = Timeline()
         self.round_loop: RoundLoop | None = None
         self.run_dir: Path | None = None
         # (team_id, service_name) -> Challenge instance. Populated by
-        # deploy_challenges; read by FlagServer (plant), HealthChecker
-        # (functionality_test), restart_service (restart_handler) and
-        # emit_setup_events. Mutable dict — passed by reference to the
-        # facilities at construction so they see deploy mutations.
+        # deploy_challenges, read by FlagServer / HealthChecker /
+        # restart_service / emit_setup_events. Mutable dict passed by
+        # reference so the facilities see deploy mutations.
         self._challenge_by_owner: dict[tuple[str, str], Challenge] = {}
-        # FlagServer owns all flag mechanics (planting, rotation, submission
-        # verification). GameMgr keeps the public method shapes
-        # (plant_initial_flags / plant_flags / submit_flag / flags) but
-        # delegates the work. Built here because the dicts above are passed
-        # by reference — deploy_challenges populates them later, and the
-        # FlagServer sees those mutations naturally.
+        # FlagServer owns plant / rotation / submission; GameMgr keeps
+        # the public method shapes and delegates.
         self.flag_server = FlagServer(
             self.timeline,
             challenge_by_owner=self._challenge_by_owner,
@@ -79,23 +72,19 @@ class GameMgr:
         self._token_to_team: dict[str, str] = {
             t.token: t.id for t in config.topology.teams if t.token
         }
-        # M4.5: agent self-reports via MCP. Overwrite-per-(team, service);
-        # only the latest deploy report survives. Adaptive defense duration
-        # (future) will read duration_ms; nothing in this milestone reads it.
+        # Agent self-reports via MCP. Overwrite-per-(team, service);
+        # only the latest deploy report survives.
         self.deploy_reports: dict[str, dict[str, dict]] = {}
-        # M4.5: service-name whitelist built from yaml `challenges:`. Plugin
-        # model intact — we never compare against a hardcoded literal.
+        # Service-name whitelist built from yaml — we never compare
+        # against a hardcoded literal.
         self._known_services: frozenset[str] = frozenset(
             c.name for c in config.challenges
         )
-        # Persistent-memory v1: kickoff handlers run a phase via
-        # ClaudeAgentManager.run_phase (not install). Handler signature:
+        # Kickoff handlers run a phase via mgr.run_phase. Signature:
         #   async def handler(team_id, cfg, round_id, phase, is_first)
-        # is_first is True on the very first kickoff per team (any phase)
-        # so the handler can route to the long-briefing prompt path;
-        # subsequent kickoffs get a short cue. None = no-op (the kickoff
-        # event still publishes; tests use this to verify event emission
-        # without spinning up real agents).
+        # `is_first=True` on the team's first kickoff so the handler
+        # picks the long briefing prompt; later kickoffs get a short
+        # cue. `None` = event-only mode (used by tests).
         self._defense_kickoff_handler: "PhaseKickoffHandler | None" = None
         self._attack_kickoff_handler: "PhaseKickoffHandler | None" = None
         # Persistent-memory v1: one-shot install runs BEFORE the round
@@ -109,8 +98,8 @@ class GameMgr:
         ) = None
         # Pre-R1 dry-run readiness probe. Handler runs one short claude
         # invocation with a prompt asking the agent to call
-        # `mcp__cyberarena__report_ready`. GameMgr watches the bus for
-        # AGENT_READY per team within `dry_run_all_agents`. Signature:
+        # `mcp__cyberarena__report_ready`. GameMgr waits for AGENT_READY
+        # per team within `dry_run_all_agents`. Signature:
         #   async def handler(team_id) -> None
         # None = event-only mode (tests).
         self._dry_run_handler: (
@@ -144,12 +133,11 @@ class GameMgr:
         # cut DEFENSE short without waiting for the timer.
         self._defense_pending: dict[int, set[tuple[str, str]]] = {}
         # Per-team AGENT_READY gating for dry-run. Populated by
-        # dry_run_all_agents at start; set by record_agent_ready when MCP
-        # report_ready arrives. Replaces the old transient bus subscriber.
+        # dry_run_all_agents at start; set by record_agent_ready when
+        # the agent's MCP report_ready arrives.
         self._ready_events: dict[str, asyncio.Event] = {}
         # HealthChecker + HealthPoller are constructed lazily in start()
-        # because they bind to the timeline and need the running event
-        # loop for their tasks.
+        # because they bind to the running event loop.
         self.health_checker: HealthChecker | None = None
         self.health_poller: HealthPoller | None = None
 
@@ -312,7 +300,7 @@ class GameMgr:
 
         Best-effort: a team whose install raises gets a log line and is
         skipped — the round loop still starts and the failing team's
-        kickoff will fail with a clean AGENT_FAILED on the bus.
+        kickoff will record a clean AGENT_FAILED.
         """
         if self._install_agent_handler is None:
             return  # event-only mode (tests)
@@ -447,10 +435,9 @@ class GameMgr:
     def _spawn_defense_kickoff(self, round_id: int) -> list[asyncio.Task]:
         """Per-team-per-service defense kickoff for one DEFENSE entry.
 
-        Replaces the old `_on_defense_kickoff` bus subscriber. Records
-        DEFENSE_KICKOFF, populates `_defense_pending` for early-end
-        tracking, and spawns per-team handler tasks (fire-and-forget;
-        returned for tests to await).
+        Records DEFENSE_KICKOFF, populates `_defense_pending` for the
+        early-end tracker, and spawns per-team handler tasks
+        (fire-and-forget; returned for tests to await).
 
         A challenge is "defense-capable" iff its Challenge subclass
         exposes a `restart_handler` (not None). Attack-only challenges
@@ -540,14 +527,11 @@ class GameMgr:
     def _spawn_attack_kickoff(self, round_id: int) -> list[asyncio.Task]:
         """Per-team attack kickoff for one ATTACK entry.
 
-        Replaces the old `_on_attack_kickoff` bus subscriber. Records
-        ATTACK_KICKOFF and spawns per-team handler tasks (fire-and-forget;
-        returned for tests to await).
-
-        Per team (not per-team-per-service) because the M5.6 attack
-        prompt walks every opposing prod from a single install.
-        Idempotent per (round_id, team_id) so a re-entry in the same
-        round doesn't double-spawn.
+        Records ATTACK_KICKOFF and spawns per-team handler tasks
+        (fire-and-forget; returned for tests to await). One kickoff per
+        team rather than per-service because the attack agent's prompt
+        walks every opposing prod from a single invocation. Idempotent
+        per (round_id, team_id).
         """
         kickoffs: list[tuple[str, AgentConfig, bool]] = []
         for team in self.config.topology.teams:
@@ -718,7 +702,7 @@ class GameMgr:
         sync because FlagServer.submit is sync."""
         return self.flag_server.submit(team_id, flag)
 
-    # ── M4.5: lifecycle / report emitters ───────────────────────────────
+    # ── MCP lifecycle / report emitters ─────────────────────────────────
 
     def is_known_service(self, name: str) -> bool:
         """White-list check for agent-self-reported service names.
@@ -754,7 +738,7 @@ class GameMgr:
         """Bus emit: per-phase agent invocation is about to begin.
 
         Called by the kickoff handler just before
-        `agents.runner.run_phase_via_transport`. Carries the first line
+        `AgentManager.run_phase`. Carries the first line
         of the prompt + `is_first` flag so panel observers can show
         whether this is the long briefing or a short continuation cue.
         """
@@ -938,7 +922,7 @@ class GameMgr:
 
         Returns a `job_id` immediately; the rebuild + restart runs in a
         background task that emits SERVICE_RESTART_STARTED / _COMPLETED /
-        _FAILED + a SERVICE_HEALTH_CHECK per level on the bus.
+        _FAILED + a SERVICE_HEALTH_CHECK per level.
 
         Raises ValueError for unknown service, attack-only challenge
         (no restart_handler), or a restart already in flight for this
@@ -954,7 +938,7 @@ class GameMgr:
                 f"service {service!r} has no restart handler — not defendable"
             )
 
-        # 2. Container lookup. M5.6 topology: one team{N}_prod per team.
+        # 2. Container lookup. Topology has one team{N}_prod per team.
         team = next((t for t in self.config.topology.teams if t.id == team_id), None)
         if team is None or not team.prod:
             raise ValueError(f"unknown team: {team_id!r}")
@@ -1104,7 +1088,7 @@ class GameMgr:
     # it — restart-post probe goes through `self.health_poller.trigger_now`
     # and ATTACK-phase periodic polling goes through `self.health_poller`.
 
-    # ── agent provisioning (M5.6) ───────────────────────────────────────
+    # ── agent provisioning ──────────────────────────────────────────────
 
     def agent_config_for(
         self,

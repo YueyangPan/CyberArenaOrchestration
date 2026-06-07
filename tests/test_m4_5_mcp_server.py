@@ -7,7 +7,7 @@ client; a tiny raw `httpx` health probe stays as a separate test to
 catch "the mount route disappeared entirely" regressions without
 re-implementing the JSON-RPC protocol.
 
-Key invariants pinned here (see docs/m4_5_mcp_plan.md):
+Key invariants pinned here (see docs/archived/m4_5_mcp_plan.md):
   - submit_flag/report_ready/report_deploy_complete callable end-to-end
   - bad token → MCP error -32001 "Unauthorized", message says nothing
     about BAD_TOKEN / tokens / team ids; timeline stays silent
@@ -323,9 +323,12 @@ def test_mcp_rest_parity_bad_token_both_silent(server, game):
     assert res.isError is True
     assert "Unauthorized" in (res.content[0].text or "")
 
-    # REST: bad token → 200 OK with BAD_TOKEN reason (M5.5 behavior preserved)
+    # REST: bad token → 200 OK with BAD_TOKEN reason (M5.5 behavior preserved).
+    # The `detail` field was added in the WRONG_PHASE / explanation pass —
+    # it's a human-readable hint, fine for it to be present here.
     rest_resp = _rest_submit("bogus-token", flag)
-    assert rest_resp == {"accepted": False, "reason": "BAD_TOKEN"}
+    assert rest_resp["accepted"] is False
+    assert rest_resp["reason"] == "BAD_TOKEN"
 
     # Both silent on the bus.
     new = game.timeline.history()[b1:]

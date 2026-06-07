@@ -192,7 +192,9 @@ def test_submit_with_valid_token_accepted(http_app, fresh_flag):
         json={"flag": fresh_flag},
     )
     assert r.status_code == 200
-    assert r.json() == {"accepted": True, "reason": "ACCEPTED"}
+    body = r.json()
+    assert body["accepted"] is True
+    assert body["reason"] == "ACCEPTED"
 
 
 def test_submit_with_wrong_token_rejected(http_app, game, fresh_flag):
@@ -202,14 +204,18 @@ def test_submit_with_wrong_token_rejected(http_app, game, fresh_flag):
         headers={"X-Team-Token": "not-a-real-token"},
         json={"flag": fresh_flag},
     )
-    assert r.json() == {"accepted": False, "reason": "BAD_TOKEN"}
+    body = r.json()
+    assert body["accepted"] is False
+    assert body["reason"] == "BAD_TOKEN"
     after = sum(1 for e in game.timeline.history() if e.type == "FLAG_SUBMITTED")
     assert after == before, "BAD_TOKEN must not emit a FLAG_SUBMITTED event"
 
 
 def test_submit_without_token_rejected(http_app, fresh_flag):
     r = http_app.post("/game/flag/submit", json={"flag": fresh_flag})
-    assert r.json() == {"accepted": False, "reason": "BAD_TOKEN"}
+    body = r.json()
+    assert body["accepted"] is False
+    assert body["reason"] == "BAD_TOKEN"
 
 
 def test_submit_body_team_id_is_ignored(http_app, fresh_flag):

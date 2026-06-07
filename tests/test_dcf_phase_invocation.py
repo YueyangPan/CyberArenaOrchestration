@@ -1,14 +1,11 @@
 """Persistent-memory v1 — per-phase invocation, in three layers.
 
-The fat `run_phase` method has been split into three pieces and this
-test file mirrors that split:
-
   1. `ClaudeAgentManager.phase_command(model)` — pure CLI argv builder.
      No transport, no I/O. Just check what shell command we'd run.
 
-  2. `agents.runner.run_phase_via_transport(...)` — the 3-line dance:
-     write prompt → run_command → pkill on timeout. Tested against an
-     in-memory FakeTransport.
+  2. `AgentManager.run_phase(...)` — the 3-line dance: write prompt →
+     run_command → kill_session on timeout. Tested against an in-memory
+     FakeTransport.
 
   3. `GameMgr.record_phase_done(...)` — artifact persistence + event
      emission. Independent of the transport.
@@ -32,7 +29,6 @@ from agents.claude import (
     PROMPT_PATH,
     WORKDIR,
 )
-from agents.runner import run_phase_via_transport
 from agents.transport import AgentTransport, CommandResult
 from gamemgr.artifacts import ArtifactStore
 from gamemgr.config import ChallengeConfig, GameConfig, RoundConfig
@@ -126,16 +122,16 @@ def test_prompt_path_and_kill_pattern_match_abc_contract():
     assert ClaudeAgentManager.PHASE_KILL_PATTERN == "claude -p"
 
 
-# ── (2) runner.run_phase_via_transport — 3-line dance ─────────────────
+# ── (2) AgentManager.run_phase — 3-line dance ─────────────────────────
 
 
-def test_runner_writes_prompt_then_invokes_phase_command():
+def test_run_phase_writes_prompt_then_invokes_phase_command():
     transport = _FakeTransport()
     mgr = ClaudeAgentManager(transport=transport, client=None)
 
     async def go():
-        return await run_phase_via_transport(
-            mgr, transport, _handle(), "do the thing", timeout=10,
+        return await mgr.run_phase(
+            transport, _handle(), "do the thing", timeout=10,
         )
     asyncio.run(go())
 
@@ -156,9 +152,10 @@ def test_runner_writes_prompt_then_invokes_phase_command():
     assert "claude -p --continue" in shell
 
 
-def test_runner_returns_raw_command_result():
-    """Runner returns the transport's CommandResult unchanged — caller
-    decides what to do with stdout/stderr (persistence is GameMgr's job)."""
+def test_run_phase_returns_raw_command_result():
+    """run_phase returns the transport's CommandResult unchanged —
+    caller decides what to do with stdout/stderr (persistence is
+    GameMgr's job)."""
     transport = _FakeTransport(
         next_result=CommandResult(
             exit_code=0,
@@ -170,8 +167,8 @@ def test_runner_returns_raw_command_result():
     mgr = ClaudeAgentManager(transport=transport, client=None)
 
     async def go():
-        return await run_phase_via_transport(
-            mgr, transport, _handle(), "p", timeout=5,
+        return await mgr.run_phase(
+            transport, _handle(), "p", timeout=5,
         )
     result = asyncio.run(go())
 
@@ -181,8 +178,8 @@ def test_runner_returns_raw_command_result():
     assert result.timed_out is False
 
 
-def test_runner_timeout_fires_kill_session_with_invocation_marker():
-    """On timeout the runner calls transport.kill_session with the
+def test_run_phase_timeout_fires_kill_session_with_invocation_marker():
+    """On timeout run_phase calls transport.kill_session with the
     per-invocation session marker — precision SIGKILL on the timed-out
     claude's process group (not a pattern that would race with a
     sibling claude started by the next phase)."""
@@ -194,8 +191,8 @@ def test_runner_timeout_fires_kill_session_with_invocation_marker():
     mgr = ClaudeAgentManager(transport=transport, client=None)
 
     async def go():
-        return await run_phase_via_transport(
-            mgr, transport, _handle("team2_dev"), "p", timeout=1,
+        return await mgr.run_phase(
+            transport, _handle("team2_dev"), "p", timeout=1,
         )
     result = asyncio.run(go())
 
@@ -211,12 +208,12 @@ def test_runner_timeout_fires_kill_session_with_invocation_marker():
     assert marker in shell, f"marker {marker!r} not found in shell {shell!r}"
 
 
-def test_runner_no_kill_on_clean_exit():
+def test_run_phase_no_kill_on_clean_exit():
     transport = _FakeTransport()  # default: clean exit
     mgr = ClaudeAgentManager(transport=transport, client=None)
 
     async def go():
-        await run_phase_via_transport(mgr, transport, _handle(), "p", timeout=10)
+        await mgr.run_phase(transport, _handle(), "p", timeout=10)
 
     asyncio.run(go())
     assert transport.kill_calls == []

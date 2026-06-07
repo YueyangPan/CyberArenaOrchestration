@@ -24,11 +24,11 @@ class AgentConfig:
     api_key: str = ""
     base_url: str = ""
     # Text fed to the CLI on stdin (claude reads it as the user prompt in
-    # headless mode). Empty → a no-op placeholder is used; smoke tests and
-    # M5 prompt-builder override this with concrete instructions.
+    # headless mode). Empty → a no-op placeholder is used; the per-phase
+    # prompt builder overrides this with concrete instructions.
     system_prompt: str = ""
 
-    # ── M5.6 attack-mode fields (all optional; empty → no SSH provisioning) ──
+    # ── attack-mode fields (all optional; empty → no SSH provisioning) ──
     # The team this agent belongs to; carried through to agent.env as
     # CYBERARENA_TEAM_ID so the LLM can self-identify in shell commands.
     team_id: str = ""
@@ -45,11 +45,11 @@ class AgentConfig:
     # Where the agent POSTs flag submissions (typically resolves via
     # host.docker.internal which is wired in by Node.extra_hosts).
     submit_url: str = ""
-    # M4.5: MCP endpoint URL. Empty → no MCP, agent stays on the curl/REST
+    # MCP endpoint URL. Empty → no MCP, agent stays on the curl/REST
     # fallback path (lets non-MCP tests keep working unchanged). Non-empty
     # → ClaudeAgentManager.install writes mcp.json and adds --mcp-config.
-    # Composed from `MCP_PUBLIC_ENDPOINT` constant in gamemgr.mcp_server —
-    # never hand-write "/mcp" / "/mcp/" literals elsewhere.
+    # Composed from `MCP_PUBLIC_ENDPOINT` in gamemgr.mcp_server — never
+    # hand-write "/mcp" / "/mcp/" literals elsewhere.
     mcp_endpoint: str = ""
     # Arbitrary extra env vars exported into agent.env. Useful escape hatch
     # for future adapters that need provider-specific or runtime knobs without
