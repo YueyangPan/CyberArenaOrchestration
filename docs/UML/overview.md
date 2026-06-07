@@ -60,7 +60,7 @@ classDef glue stroke-dasharray:4 4,opacity:0.7
 | Component | Responsibility | Details |
 |---|---|---|
 | **main.py** | Entry point | Wires `Orchestrator`, `GameMgr`, `AgentManager` per team via registry, registers handlers, starts FastAPI + round loop |
-| **Orchestrator** | Docker lifecycle | Creates containers + networks per [topology.yaml](../m1_topology_plan.md), exposes `set_cross_team_network(allow)` for phase-driven isolation. See [orchestrator.md](orchestrator.md) |
+| **Orchestrator** | Docker lifecycle | Creates containers + networks per [topology.yaml](../archived/m1_topology_plan.md), exposes `set_cross_team_network(allow)` for phase-driven isolation. See [orchestrator.md](orchestrator.md) |
 | **GameMgr** | Orchestration executor | Owns timeline, round loop, artifact store; holds references to FlagServer + HealthPoller facilities. Records AGENT_* events; drives phase transitions via direct methods. See [game_manager.md](game_manager.md) |
 | **Timeline** | Append-only telemetry | `record()` + `attach_file_sink` + `attach_stream`. Replaces the legacy EventBus — no subscribers drive internal logic. See [timeline.md](timeline.md) |
 | **FlagServer** | Flag mechanics | Plants flags (SERVICE_PROTOCOL via adapter / FILE_AT_PATH via docker exec), runs per-round rotation, verifies submissions, records FLAG_PLANTED / FLAG_SUBMITTED. See [flag.md](flag.md) |

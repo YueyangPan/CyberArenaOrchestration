@@ -7,7 +7,7 @@ client; a tiny raw `httpx` health probe stays as a separate test to
 catch "the mount route disappeared entirely" regressions without
 re-implementing the JSON-RPC protocol.
 
-Key invariants pinned here (see docs/m4_5_mcp_plan.md):
+Key invariants pinned here (see docs/archived/m4_5_mcp_plan.md):
   - submit_flag/report_ready/report_deploy_complete callable end-to-end
   - bad token → MCP error -32001 "Unauthorized", message says nothing
     about BAD_TOKEN / tokens / team ids; timeline stays silent

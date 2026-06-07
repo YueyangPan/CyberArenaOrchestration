@@ -1,6 +1,6 @@
 # Cyber Arena — System Design (v1.7)
 
-> v1.7 supersedes [design_v1.6.md](design_v1.6.md). It captures the
+> v1.7 supersedes [design_v1.6.md](archived/design_v1.6.md). It captures the
 > post-DEFCON system: a pluggable `ChallengeSource` framework, the
 > nautilus-ico challenge running on the unchanged M5.6 topology, and
 > the agent defense loop (edit → MCP `restart_service` → smoke →
@@ -194,7 +194,7 @@ actionable message if not synced.
 
 ## 8. What's still deferred
 
-(See [DEFCON_challenge_framework_report_v1.md](DEFCON_challenge_framework_report_v1.md) §Deferred for the full list.)
+(See [archived/DEFCON_challenge_framework_report_v1.md](archived/DEFCON_challenge_framework_report_v1.md) §Deferred for the full list.)
 
 Headline items: real ico CHECKER (lift full poller), `ArtifactStore`
 wiring into `fetch_logs()` + end-of-round `docker logs`,
