@@ -43,12 +43,19 @@ Two distinct names. They are **not** interchangeable.
 | What | Style | Example | Used as |
 |---|---|---|---|
 | Directory name | `snake_case` | `nautilus_ico` | Python package path — `from challenges.nautilus_ico import IcoChallenge`. |
-| `Challenge.name` (the `@property`) | `kebab-case` | `"nautilus-ico"` | Registry key in `challenges/registry.py`, `name:` field under `challenges:` in `game.yaml`, prompt-dispatcher key in `agents/prompts/__init__.py::_PROMPT_MODULES`, event payload `service` field, image tag suffix. |
-| Image tag | derived from `Challenge.name` | `cyberarena/chal-nautilus-ico:v1` | `image:` field on team prod nodes in `game.yaml`; the value `Challenge.vulbox.reference` returns. |
+| `Challenge.name` (the `@property`) | `kebab-case` | `"nautilus-ico"` | Registry key in `challenges/registry.py`, `name:` field under `challenges:` in `game.yaml`, prompt-dispatcher key in `agents/prompts/__init__.py::_PROMPT_MODULES`, event payload `service` field. |
+| Image reference | author's choice (free-form OCI reference) | `cyberarena/chal-nautilus-ico:v1` | `image:` field on team prod nodes in `game.yaml`; the value `Challenge.vulbox.reference` returns. |
 
 Rule of thumb: anything Python imports uses snake_case; anything the
 **operator** types into a YAML, sees in the panel, or matches by string
 uses kebab-case.
+
+The image reference is **not** required to follow the
+`cyberarena/chal-<kebab>:<v>` shape — that's just the convention the
+bundled reference challenges use. Anything Docker would accept as a
+pull spec works (e.g. `ghcr.io/2077ai/challenges/nautilus-ico:v1`,
+`localhost:5000/chal-ico:v1`, …). Keep registry policy out of the
+challenge code.
 
 ## 3. Interface contracts
 
@@ -66,7 +73,7 @@ first-class part of the round).
 | Component | Lives in | Required surface |
 |---|---|---|
 | `Challenge` | `challenge.py` | `name`, `vulbox`, `functionality_test`, `flag_handler`, `restart_handler`, `docs` |
-| `VulboxImage` | inline in `challenge.py` | `reference` (`cyberarena/chal-<kebab-name>:<v>`), `exposed_ports`, `build_context` |
+| `VulboxImage` | inline in `challenge.py` | `reference: str` (free-form OCI image reference, e.g. `cyberarena/chal-nautilus-ico:v1`), `exposed_ports`, `build_context` |
 | `FunctionalityTest.run(target)` | `functionality_test.py` *or* inline in `challenge.py` | Returns a `CheckResult` tree. Recommended 4 leaves: `process`, `tcp`, `protocol`, `checker`. CHECKER must fail when the service's real function is broken — not merely when the port is closed. |
 | `FlagHandler.plant/retrieve(target, ...)` | `flag_handler.py` *or* inline | `plant` writes the flag and returns an opaque handle; `retrieve` reads it back via the same handle. Returns `None` on miss, never raises. |
 | `RestartHandler.run(target)` | `restart_handler.py` *or* inline | Rebuilds and restarts the service in-place after agent edits. Implementation is challenge-defined and uses whatever execution mechanism `target` provides (today: `target.meta["exec_in_container"]` — docker exec; tomorrow could be SSH / k8s exec / VM agent). Returns a `CheckResult` with three leaves: `compile`, `spawn`, `smoke`. The reference `nautilus_ico/restart_handler.py` invokes `/arena/restart.sh` through that callable. |
@@ -140,8 +147,9 @@ In the steps below `<snake>` is your directory name and `<kebab>` is
    _HEALTH_INTERVAL_SECS["<kebab>"] = <seconds>
    ```
 3. Reference it from `game.yaml` (or a new `game_<kebab>.yaml`) by
-   setting `image: cyberarena/chal-<kebab>:<v>` on the team prod
-   nodes and adding a `challenges:` entry with `name: <kebab>`.
+   setting `image:` on the team prod nodes to the same string your
+   `VulboxImage.reference` returns, and adding a `challenges:` entry
+   with `name: <kebab>`.
 4. `python -m main setup -c config/game_<kebab>.yaml` builds the image
    via your `build.py`; `python -m main start -c config/game_<kebab>.yaml`
    runs a full match.
@@ -149,7 +157,7 @@ In the steps below `<snake>` is your directory name and `<kebab>` is
 ## 7. Acceptance checks (run before submitting)
 
 **Build & startup**
-- [ ] `docker build` succeeds and produces `cyberarena/chal-<kebab>:<version>`
+- [ ] `docker build` succeeds and produces the reference `VulboxImage.reference` returns
 - [ ] `docker run` brings the container up; the service is reachable
       within 5 seconds
 - [ ] `id arena_agent` returns uid > 0; `sshd -t` exits 0
