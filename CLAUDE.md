@@ -19,6 +19,7 @@ All design lives in [docs/](docs/). Read the relevant doc before changing relate
 - [docs/DEFCON_challenge_framework_plan_v1.md](docs/DEFCON_challenge_framework_plan_v1.md) / [docs/DEFCON_challenge_framework_report_v1.md](docs/DEFCON_challenge_framework_report_v1.md) — DEFCON: pluggable ChallengeSource + nautilus-ico defense workflow
 - [docs/persistent_memory_agent_plan_v1.md](docs/persistent_memory_agent_plan_v1.md) — Persistent-memory agent v1: install once, `claude -p --continue` per phase via `AgentTransport` (replaces the M4-era per-phase install + supervisor model)
 - [docs/challenge_interface_v2_plan.md](docs/challenge_interface_v2_plan.md) — Challenge interface v2 (shipped 2026-06-03): pluggable per-challenge `Challenge` ABC (VulboxImage + FunctionalityTest + FlagHandler + RestartHandler + ChallengeDocs) under `challenges/<name>/`; retired ChallengeSource / FlagMechanism / Service ABC. Live design lives in [docs/UML/challenges.md](docs/UML/challenges.md).
+- [docs/CHALLENGE_AUTHORING_SOP.md](docs/CHALLENGE_AUTHORING_SOP.md) — SOP for collaborators packaging new challenges into the `challenges/<name>/` format. Hand to outside contributors before they start.
 - [docs/UML/overview.md](docs/UML/overview.md) — system-level UML; drills into [agent_manager.md](docs/UML/agent_manager.md) · [game_manager.md](docs/UML/game_manager.md) · [timeline.md](docs/UML/timeline.md) · [flag.md](docs/UML/flag.md) · [health.md](docs/UML/health.md) · [orchestrator.md](docs/UML/orchestrator.md) · [challenges.md](docs/UML/challenges.md)
 
 ## Update Rule
