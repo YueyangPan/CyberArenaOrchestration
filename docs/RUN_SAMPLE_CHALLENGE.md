@@ -68,14 +68,29 @@ an internal LLM router or proxy, point `BASE_URL` at it instead.
 ## 5. Build and run
 
 ```bash
-source .env
 bash scripts/build_images.sh                            # cyberarena/dev-base
 python main.py setup -c config/game_ico.yaml           # also builds chal-nautilus-ico
 nohup python main.py start -c config/game_ico.yaml > /tmp/game.log 2>&1 &
 tail -f /tmp/game.log
 ```
 
-The match takes 12–15 minutes.
+`main.py` auto-loads `.env` via `python-dotenv`, so no `source .env`
+needed. Backgrounding with `nohup` is for SSH sessions; if you're on
+the box directly, just run `start` in the foreground. Match takes
+12–15 minutes.
+
+The live panel is at `http://localhost:8000/panel`. To view it from
+your laptop, forward the port:
+
+```bash
+ssh -L 8000:localhost:8000 <user>@<host>          # run this on your laptop
+```
+
+When you're done, tear everything down:
+
+```bash
+python main.py teardown -c config/game_ico.yaml
+```
 
 ## 6. Verify
 
