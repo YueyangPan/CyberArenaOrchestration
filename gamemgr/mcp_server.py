@@ -174,8 +174,10 @@ def build_mcp_app(game: "GameMgr") -> tuple[FastMCP, "Starlette"]:
         Returns:
           {"job_id": "<12-hex>"} — restart accepted, running in background.
         Raises:
-          InvalidParams: unknown service, no restart_cmd in spec, or a
-            restart is already in flight for (team, service).
+          InvalidParams: unknown service, no restart_cmd in spec, a restart
+            already in flight for (team, service), or called during the
+            ATTACK phase (restart is DEFENSE-only — emits
+            SERVICE_RESTART_REJECTED).
           Unauthorized: bad / missing X-Team-Token (silent on the timeline).
         """
         team_id = _team_id_from_ctx(ctx)

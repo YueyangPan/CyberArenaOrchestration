@@ -99,6 +99,29 @@ def test_restart_service_unknown_team():
     asyncio.run(run())
 
 
+def test_restart_service_rejected_during_attack():
+    """restart is DEFENSE-only: during ATTACK it's rejected without a
+    rebuild and surfaces SERVICE_RESTART_REJECTED — NOT _FAILED (so the
+    healthy-run 'restarts failed' count stays clean). This blocks the
+    attack agent's --continue session from finishing a leftover defense
+    restart in the attack phase."""
+    import types
+    from gamemgr.round import Phase
+
+    game = _make_game()
+    game.round_loop = types.SimpleNamespace(phase=Phase.ATTACK, round=1)
+    bus = game.timeline
+
+    async def run():
+        with pytest.raises(ValueError, match="DEFENSE-only"):
+            await game.restart_service("team1", "nautilus-ico")
+
+    asyncio.run(run())
+    assert len(_events_of(bus, EventType.SERVICE_RESTART_REJECTED.value)) == 1
+    assert _events_of(bus, EventType.SERVICE_RESTART_STARTED.value) == []
+    assert _events_of(bus, EventType.SERVICE_RESTART_FAILED.value) == []
+
+
 def test_restart_service_happy_path_emits_started_completed_with_health_chain(monkeypatch):
     """Mock docker exec to a no-op success; assert the full event chain."""
     game = _make_game()

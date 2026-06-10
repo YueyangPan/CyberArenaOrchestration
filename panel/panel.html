@@ -362,6 +362,9 @@
       const verdict = p.accepted ? 'ACCEPTED' : (p.reason || '?');
       return `${verdict} ${p.submitter_team_id || '?'} → ${p.victim_team_id || '?'} (${p.service || '?'})`;
     }
+    if (t === 'SERVICE_RESTART_REJECTED') {
+      return `${p.service || '?'} restart rejected: ${p.reason || '?'}${ev.team_id ? ' · ' + ev.team_id : ''}`;
+    }
     if (t === 'FLAG_PLANTED' || t === 'DEPLOY_COMPLETE' || t === 'DEFENSE_KICKOFF' ||
         t === 'ATTACK_KICKOFF' || t === 'SERVICE_DEPLOYED' ||
         t === 'SERVICE_RESTART_STARTED' || t === 'SERVICE_RESTART_COMPLETED' ||

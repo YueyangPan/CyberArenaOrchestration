@@ -94,4 +94,4 @@ round_config:
   #   room to iterate if the first attempt EOFs.
   defense_secs: 180
   attack_secs: 120
-  total_rounds: 3
+  total_rounds: 1

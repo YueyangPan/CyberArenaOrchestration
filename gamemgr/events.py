@@ -42,6 +42,11 @@ class EventType(str, Enum):
     SERVICE_RESTART_STARTED = "SERVICE_RESTART_STARTED"
     SERVICE_RESTART_COMPLETED = "SERVICE_RESTART_COMPLETED"
     SERVICE_RESTART_FAILED = "SERVICE_RESTART_FAILED"
+    # restart_service called outside DEFENSE (e.g. an attack agent's
+    # --continue session finishing a leftover defense restart). Rejected
+    # before any rebuild runs — distinct from _FAILED (which means the
+    # rebuild ran and failed) so it doesn't inflate the failed count.
+    SERVICE_RESTART_REJECTED = "SERVICE_RESTART_REJECTED"
     # Per-level service health probe emitted after each restart, one event
     # per HealthLevel (PROCESS → TCP → PROTOCOL → CHECKER). Payload carries
     # {level, passed, detail}. Catches "hollow patch" cheese paths where

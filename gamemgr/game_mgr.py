@@ -1041,8 +1041,10 @@ class GameMgr:
         _FAILED + a SERVICE_HEALTH_CHECK per level.
 
         Raises ValueError for unknown service, attack-only challenge
-        (no restart_handler), or a restart already in flight for this
-        (team, service). The MCP layer translates these into InvalidParams.
+        (no restart_handler), a restart already in flight for this
+        (team, service), or a call during the ATTACK phase (restart is a
+        DEFENSE-recovery action). The MCP layer translates these into
+        InvalidParams.
         """
         # 1. Challenge lookup (v2: restart goes through challenge.restart_handler).
         try:
@@ -1059,6 +1061,24 @@ class GameMgr:
         if team is None or not team.prod:
             raise ValueError(f"unknown team: {team_id!r}")
         container_name = team.prod
+
+        # 2b. Phase gate — restart is DEFENSE-only. An attack agent's
+        # --continue session sometimes finishes a leftover defense restart
+        # in the ATTACK phase; reject it (no rebuild) and surface a
+        # SERVICE_RESTART_REJECTED so it's visible without inflating the
+        # _FAILED count.
+        st = self.status()
+        if (st.get("phase") or "").upper() == Phase.ATTACK.value:
+            self.timeline.record(
+                EventType.SERVICE_RESTART_REJECTED,
+                team_id=team_id,
+                round_id=st.get("round", 0),
+                phase=st.get("phase", ""),
+                payload={"team_id": team_id, "service": service, "reason": "WRONG_PHASE"},
+            )
+            raise ValueError(
+                f"restart_service is DEFENSE-only; current phase is {st.get('phase', '')!r}"
+            )
 
         # 3. In-flight guard — one rebuild per (team, service) at a time.
         if not hasattr(self, "_restart_jobs"):
