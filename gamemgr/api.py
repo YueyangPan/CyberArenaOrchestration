@@ -114,19 +114,34 @@ def build_app(game: GameMgr, shutdown_event: asyncio.Event) -> FastAPI:
         # attach_stream gives this connection its own queue; record() fans
         # out via put_nowait so a slow client cannot back-pressure the game.
         queue = game.timeline.attach_stream()
+        # Race each receive against shutdown_event so this long-lived stream
+        # CLOSES promptly when the server is winding down. Without it the
+        # handler blocks on queue.get() forever, stalling uvicorn's graceful
+        # drain → force_exit → a CancelledError logged from the cancelled
+        # lifespan/MCP task on an otherwise-clean end-of-match.
+        stopper = asyncio.ensure_future(shutdown_event.wait())
         try:
             for past in game.timeline.history():
                 await websocket.send_json(asdict(past))
-            while True:
-                event = await queue.get()
-                await websocket.send_json(asdict(event))
+            while not shutdown_event.is_set():
+                getter = asyncio.ensure_future(queue.get())
+                done, _pending = await asyncio.wait(
+                    {getter, stopper}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if stopper in done:
+                    getter.cancel()
+                    break
+                await websocket.send_json(asdict(getter.result()))
         except (WebSocketDisconnect, asyncio.CancelledError):
-            # Client closed, or the server is shutting down and cancelled
-            # this long-lived stream — both are clean exits, not errors.
-            # (Swallowing CancelledError here keeps uvicorn's force-exit
-            # from logging "Exception in ASGI application" for the panel WS.)
+            # Client closed, or the server force-cancelled this stream —
+            # both are clean exits, not errors.
             pass
         finally:
+            stopper.cancel()
             game.timeline.detach_stream(queue)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     return app

@@ -177,12 +177,19 @@ async def _run_start(args) -> int:
         except Exception:
             log.exception("failed to write panel snapshot")
 
+    # Signal the long-lived panel WebSocket(s) to close so uvicorn's graceful
+    # drain can actually complete. On a natural end-of-game (loop_task done)
+    # `shutdown` was never set; setting it now lets /events/stream return
+    # instead of blocking on queue.get() forever — without this the drain
+    # times out, we force_exit, and uvicorn logs a CancelledError from the
+    # cancelled lifespan/MCP task even though the match ended cleanly.
+    shutdown.set()
+
     # Tell uvicorn to wind down. `should_exit` triggers graceful shutdown
-    # (drains in-flight requests + closes idle keep-alives), but it can
-    # hang indefinitely on long-lived streams — panel WebSockets and the
-    # MCP StreamableHTTP SSE sessions are both "long-lived" by design.
-    # Escalate to `force_exit` (drops connections) after a short grace,
-    # then to outright task cancellation if even that doesn't fire.
+    # (drains in-flight requests + closes idle keep-alives). With the WS
+    # streams now closing on `shutdown`, this normally completes well within
+    # the grace; force_exit below is the belt-and-suspenders for any other
+    # long-lived stream (e.g. a lingering MCP SSE session).
     # Note: force_exit makes uvicorn's serve() finish by raising
     # CancelledError, so every wait below must catch CancelledError as well
     # as TimeoutError — otherwise it escapes _run_start and asyncio.run
