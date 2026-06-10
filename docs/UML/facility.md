@@ -71,10 +71,10 @@ FlagServer/HealthChecker directly — they reach exec through the
 ```mermaid
 flowchart LR
   subgraph GameMgr
-    status[status()]
-    tl[Timeline.record]
-    dx[_exec_in_container]
-    rc[_resolve_container]
+    status["status()"]
+    tl["Timeline.record"]
+    dx["_exec_in_container"]
+    rc["_resolve_container"]
   end
   subgraph FacilityContext
     SP[LocalStatusPort] --> status
