@@ -167,20 +167,27 @@ async def _run_start(args) -> int:
     # MCP StreamableHTTP SSE sessions are both "long-lived" by design.
     # Escalate to `force_exit` (drops connections) after a short grace,
     # then to outright task cancellation if even that doesn't fire.
+    # Note: force_exit makes uvicorn's serve() finish by raising
+    # CancelledError, so every wait below must catch CancelledError as well
+    # as TimeoutError — otherwise it escapes _run_start and asyncio.run
+    # dumps the whole stack on an otherwise-clean shutdown.
     server.should_exit = True
     try:
         await asyncio.wait_for(server_task, timeout=10)
-    except asyncio.TimeoutError:
-        log.warning("uvicorn didn't exit within 10s; setting force_exit")
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        log.warning(
+            "uvicorn didn't exit within 10s (a live panel WebSocket / MCP SSE "
+            "session is still open); forcing exit"
+        )
         server.force_exit = True
         try:
             await asyncio.wait_for(server_task, timeout=5)
-        except asyncio.TimeoutError:
-            log.error("uvicorn force_exit also stalled; cancelling task")
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            log.warning("uvicorn force_exit didn't settle in 5s; cancelling the server task")
             server_task.cancel()
             try:
                 await server_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
 
     if not loop_task.done():

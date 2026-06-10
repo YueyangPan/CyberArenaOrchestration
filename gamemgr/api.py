@@ -120,7 +120,11 @@ def build_app(game: GameMgr, shutdown_event: asyncio.Event) -> FastAPI:
             while True:
                 event = await queue.get()
                 await websocket.send_json(asdict(event))
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            # Client closed, or the server is shutting down and cancelled
+            # this long-lived stream — both are clean exits, not errors.
+            # (Swallowing CancelledError here keeps uvicorn's force-exit
+            # from logging "Exception in ASGI application" for the panel WS.)
             pass
         finally:
             game.timeline.detach_stream(queue)

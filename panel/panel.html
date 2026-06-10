@@ -219,7 +219,7 @@
 <div class="zoom-row">
   <label><input type="checkbox" id="follow" checked> follow live tail</label>
   <span style="margin-left: 1rem">zoom</span>
-  <input type="range" id="zoom" min="6" max="120" step="1" value="24">
+  <input type="range" id="zoom" min="3" max="100" step="1" value="24">
   <span class="val" id="zoom-val">24</span> px/s
 </div>
 <div class="timeline" id="timeline"></div>
@@ -443,12 +443,20 @@
   const NS = 'http://www.w3.org/2000/svg';
   let DENSITY = 24;     // px per second
   let FOLLOW = true;    // auto-scroll to right edge when new events arrive
+  // While the pointer is over the timeline, pause the live-tail rebuild:
+  // re-rendering mid-hover destroys the hovered dot before its mouseleave
+  // fires, which would leave the tooltip stuck open. Leaving the timeline
+  // always clears the tooltip (belt-and-suspenders if a dot was orphaned).
+  let hoveringTimeline = false;
+  TIMELINE.addEventListener('mouseenter', () => { hoveringTimeline = true; });
+  TIMELINE.addEventListener('mouseleave', () => { hoveringTimeline = false; hideTooltip(); });
 
   function render() {
     // Preserve horizontal scroll across the rebuild: following → snap to
     // the right edge (live tail); not following → keep the user's position
     // so a timer re-render doesn't yank them while inspecting history.
     const prevScroll = TIMELINE.scrollLeft;
+    hideTooltip();   // the rebuild orphans any hovered dot; drop a stale tooltip
     TIMELINE.innerHTML = '';
     const ACTOR_LIST = actors();
     const ROW_H = 36;
@@ -954,7 +962,7 @@
       // Live tail: advance the time axis ~4×/s even with no new events, so
       // "now" keeps moving. Gated on FOLLOW so it never yanks a viewer who
       // has unchecked follow to scroll back and inspect history.
-      setInterval(() => { if (FOLLOW) render(); }, 250);
+      setInterval(() => { if (FOLLOW && !hoveringTimeline) render(); }, 250);
     }
   });
 </script>
