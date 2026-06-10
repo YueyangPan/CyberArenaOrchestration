@@ -424,6 +424,9 @@
     });
     // Header side-effects.
     if (ev.type === 'ROUND_START') $('round-num').textContent = ev.round_id;
+    // total_rounds rides on ROUND_START (and GAME_END); pick it up from
+    // whichever lands first so the header shows "N / total", not "N / ?".
+    if (ev.payload && ev.payload.total_rounds) $('round-total').textContent = ev.payload.total_rounds;
     if (ev.type === 'PHASE_CHANGE' || ev.phase) {
       const ph = $('phase');
       const raw = (ev.type === 'PHASE_CHANGE') ? (ev.payload?.phase || ev.phase) : ev.phase;

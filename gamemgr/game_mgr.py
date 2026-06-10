@@ -704,9 +704,14 @@ class GameMgr:
     # ── RoundLoop dispatch — direct method calls, no pub-sub ────────────
 
     def on_round_start(self, round_id: int, phase: str) -> None:
-        """RoundLoop callback: record ROUND_START. No side effects."""
+        """RoundLoop callback: record ROUND_START. Carries total_rounds so
+        the panel header can show `round N / total` from round 1 (the only
+        other carrier was GAME_END, which is too late)."""
         self.timeline.record(
-            EventType.ROUND_START, round_id=round_id, phase=phase,
+            EventType.ROUND_START,
+            round_id=round_id,
+            phase=phase,
+            payload={"total_rounds": self.config.rounds.total_rounds},
         )
 
     def enter_defense_phase(self, round_id: int) -> list[asyncio.Task]:
