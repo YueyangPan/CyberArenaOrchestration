@@ -8,8 +8,9 @@ Two pieces:
     for the restart-post one-shot probe.
 
 The package is independent of `gamemgr` internals — it consumes
-`Challenge` instances + a Timeline and emits events back. Pluggable per
-the v2 challenge ABC (no demo-service specifics hardcoded).
+`Challenge` instances + a `FacilityContext` (events + status ports) and
+emits events back. Pluggable per the v2 challenge ABC (no demo-service
+specifics hardcoded).
 """
 
 from .checker import HealthChecker

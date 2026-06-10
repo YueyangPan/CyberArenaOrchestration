@@ -150,6 +150,9 @@ def test_run_phase_writes_prompt_then_invokes_phase_command():
     assert "setsid -w bash -c" in shell, shell
     assert "/tmp/cyberarena_phase_" in shell and ".pid" in shell, shell
     assert "claude -p --continue" in shell
+    # The per-invocation marker is exported into claude's env so
+    # kill_session can reap it via /proc/<pid>/environ.
+    assert "export CYBERARENA_PHASE=" in shell, shell
 
 
 def test_run_phase_returns_raw_command_result():

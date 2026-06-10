@@ -134,13 +134,13 @@ sequenceDiagram
   Tx->>Host: stage prompt.txt
   Mgr->>Mgr: phase_command(model, session_marker)
   Mgr->>Tx: run_command(argv, timeout)
-  Tx->>Host: spawn CLI under setsid -w
+  Tx->>Host: spawn CLI under setsid -w (env CYBERARENA_PHASE=<marker>)
   Note over Host: CLI reads PROMPT_PATH + appends<br/>session store (--continue)
   Host-->>Tx: stdout / stderr / exit_code
   Tx-->>Mgr: CommandResult
   alt timed_out
     Mgr->>Tx: kill_session(session_marker)
-    Tx->>Host: kill -KILL -- -<pgid>
+    Tx->>Host: PGID kill (best-effort) + SIGKILL pids w/ CYBERARENA_PHASE=<marker> in /proc/*/environ
   end
   Mgr-->>Game: CommandResult
   Note over Game: write 3 artifacts (record_phase_done)

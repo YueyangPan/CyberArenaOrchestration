@@ -8,6 +8,37 @@ through an MCP channel.
 System design: [docs/design_v1.7.md](docs/design_v1.7.md). Writing a
 new challenge: [docs/CHALLENGE_AUTHORING_SOP.md](docs/CHALLENGE_AUTHORING_SOP.md).
 
+## Repository layout
+
+Flat package layout — every directory below is importable by its own
+name (`from gamemgr import …`). The top level splits into core code,
+support assets, and generated/vendored dirs (the last group is
+git-ignored).
+
+```
+main.py            CLI entry: setup / start / teardown
+│
+├─ gamemgr/        GameMgr, round loop, Timeline, events, FastAPI + MCP surface, config loader
+├─ orchestrator/   Docker container + network lifecycle (infra/)
+├─ flag/           FlagServer + FlagStore — plant / rotate / submit
+├─ health/         HealthChecker + HealthPoller — functionality probes
+├─ facility/       Facility boundary: status/events/exec ports + in-process adapters
+├─ agents/         Agent managers + transports (Claude CLI, per-phase run)
+├─ challenges/     Per-challenge impls + the Challenge interface ABC + registry
+├─ models/         Shared data models (topology, agent config)
+│
+├─ config/         Game YAML configs + team-image Dockerfiles (docker/)
+├─ panel/          panel.html live dashboard (served at /panel)
+├─ scripts/        Helper scripts (build_images.sh, screenshots)
+├─ tests/          Test suite (run scoped to tests/ — see below)
+├─ docs/           Design docs + UML (docs/UML/)
+│
+├─ vendor/         Third-party challenge sources (referenced by challenge builds)  ·  git-ignored
+└─ runs/           Generated run artifacts: events.jsonl, panel snapshots          ·  git-ignored
+```
+
+How the pieces fit: see [docs/UML/overview.md](docs/UML/overview.md).
+
 ## Prerequisites
 
 | Requirement | macOS | Ubuntu |

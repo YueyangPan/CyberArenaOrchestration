@@ -210,6 +210,7 @@ def test_emit_health_chain_emits_four_events_one_per_level(dcf_ico_container):
 
     from challenges.interface import VulboxTarget
     from challenges.nautilus_ico import IcoChallenge
+    from facility import FacilityContext, LocalEventSink, LocalStatusPort
     from gamemgr.timeline import Timeline
     from health.checker import HealthChecker
 
@@ -235,7 +236,12 @@ def test_emit_health_chain_emits_four_events_one_per_level(dcf_ico_container):
     )
 
     tl = Timeline()
-    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+    checker = HealthChecker(
+        FacilityContext(
+            status=LocalStatusPort(lambda: {"round": 1, "phase": "ATTACK"}),
+            events=LocalEventSink(tl),
+        )
+    )
 
     async def run():
         await checker.run(

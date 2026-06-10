@@ -143,6 +143,61 @@
   .conn[data-state=lost]    .dot { background: #ff8b8b; box-shadow: 0 0 8px rgba(255, 139, 139, 0.6); }
   .conn[data-state=snapshot] .dot { background: var(--accent); box-shadow: 0 0 8px rgba(124, 110, 240, 0.6); }
   .conn .text { color: var(--text-dim); }
+
+  /* ── agent transcripts (below the timeline) ───────────────── */
+  .transcripts { max-width: 1400px; margin: 1.6rem auto 0; }
+  .transcripts > h2 {
+    font-size: 0.9rem; font-weight: 600; color: #aaa;
+    margin-bottom: 0.7rem;
+    display: flex; align-items: baseline; gap: 0.6rem;
+  }
+  .transcripts > h2 .sub { font-size: 0.7rem; color: var(--text-faint); font-family: var(--mono); }
+  .transcript-team { margin-bottom: 1.1rem; }
+  .transcript-team-name {
+    font-family: var(--mono); font-size: 0.82rem; font-weight: 700;
+    margin-bottom: 0.4rem;
+  }
+  .transcript-host {
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 8px; margin-bottom: 0.6rem;
+  }
+  .transcript-host > summary {
+    padding: 0.6rem 0.9rem; cursor: pointer;
+    font-family: var(--mono); font-size: 0.78rem;
+    display: flex; align-items: baseline; gap: 0.9rem; flex-wrap: wrap;
+  }
+  .transcript-host > summary:hover { background: rgba(255,255,255,0.04); }
+  .transcript-host .host-name { color: #ffe66d; font-weight: 700; }
+  .transcript-host .host-stats { color: var(--text-dim); font-size: 0.72rem; }
+  .cards { padding: 0.3rem 0.8rem 0.8rem; display: flex; flex-direction: column; gap: 0.3rem; }
+  .card {
+    border-left: 3px solid rgba(255,255,255,0.12);
+    padding: 0.4rem 0.65rem; background: rgba(255,255,255,0.02);
+    border-radius: 4px; font-family: var(--mono); font-size: 0.74rem;
+  }
+  .card.kind-system      { border-left-color: #b794f4; }
+  .card.kind-thinking    { border-left-color: #7c6ef0; opacity: 0.85; }
+  .card.kind-text        { border-left-color: #f687b3; }
+  .card.kind-tool-use    { border-left-color: #fbb360; }
+  .card.kind-tool-result { border-left-color: #4ecdc4; }
+  .card.is-error         { border-left-color: #ff6b6b; background: rgba(255,107,107,0.06); }
+  .card-head { display: flex; gap: 0.55rem; align-items: baseline; }
+  .card-head .icon { font-size: 0.9rem; }
+  .card-head .kind {
+    color: #999; font-size: 0.62rem; text-transform: uppercase;
+    letter-spacing: 0.05em; min-width: 5.5rem; flex: 0 0 5.5rem;
+  }
+  .card-head .title { color: var(--text); word-break: break-word; flex: 1; }
+  .card-body { margin-top: 0.3rem; }
+  .card-body > summary { color: var(--text-dim); font-size: 0.64rem; cursor: pointer; margin-left: 6.05rem; }
+  .card-body > summary:hover { color: #ccc; }
+  .card-body pre {
+    margin-top: 0.3rem; margin-left: 6.05rem; padding: 0.5rem 0.7rem;
+    background: rgba(0,0,0,0.3); border-radius: 4px; font-size: 0.66rem;
+    max-height: 320px; overflow: auto; white-space: pre-wrap;
+    word-break: break-word; color: #ccc;
+  }
 </style>
 </head>
 <body>
@@ -169,6 +224,11 @@
 </div>
 <div class="timeline" id="timeline"></div>
 <div class="tooltip" id="tooltip"></div>
+
+<section class="transcripts" id="transcripts" hidden>
+  <h2>Agent transcripts <span class="sub" id="transcripts-sub"></span></h2>
+  <div id="transcripts-body"></div>
+</section>
 
 <footer>
   <span class="conn" id="conn" data-state="trying">
@@ -214,6 +274,7 @@
 
   // ── categories (drives dot color + toggle bar) ──────────────
   const CATEGORIES = [
+    { key: 'setup',    label: 'Setup',           color: '#9aa0a6', on: true },
     { key: 'phase',    label: 'Phase',           color: '#a18bff', on: true },
     { key: 'kickoff',  label: 'Kickoff',         color: '#ffe66d', on: true },
     { key: 'agent',    label: 'Agent lifecycle', color: '#ff6b9d', on: true },
@@ -227,6 +288,8 @@
   const VISIBLE = Object.fromEntries(CATEGORIES.map(c => [c.key, c.on]));
 
   function categoryFor(type) {
+    if (type === 'SETUP_STARTED' || type === 'SETUP_COMPLETE' || type === 'IMAGE_BUILT' ||
+        type === 'CONTAINER_READY' || type === 'FACILITY_READY') return 'setup';
     if (type === 'ROUND_START' || type === 'ROUND_STOP' || type === 'PHASE_CHANGE' || type === 'GAME_END') return 'phase';
     if (type === 'DEFENSE_KICKOFF' || type === 'ATTACK_KICKOFF') return 'kickoff';
     if (type === 'SERVICE_HEALTH_CHECK') return 'health';
@@ -242,8 +305,26 @@
   function actorFor(ev) {
     const t = ev.type;
     if (t === 'SERVICE_HEALTH_CHECK')       return 'health_poller';
+    // Setup/bring-up events: facilities to their own lanes; container
+    // readiness to the owning team lane (by node-id prefix); the rest to
+    // orchestrator.
+    if (t === 'FACILITY_READY') {
+      const f = (ev.payload && ev.payload.facility) || '';
+      if (f === 'flag')   return 'flag_server';
+      if (f === 'health') return 'health_poller';
+      return 'orchestrator';
+    }
+    if (t === 'CONTAINER_READY') {
+      const m = ((ev.payload && ev.payload.node) || '').match(/^(team\d+)_/);
+      return m ? m[1] : 'orchestrator';
+    }
+    if (t === 'SETUP_STARTED' || t === 'SETUP_COMPLETE' || t === 'IMAGE_BUILT') return 'orchestrator';
     if (t === 'FLAG_PLANTED')               return 'flag_server';
-    if (t === 'FLAG_SUBMITTED')             return 'flag_server';
+    // FLAG_SUBMITTED is anchored on the SUBMITTER team's lane (so the
+    // team lane gets discovered + shows the submission); render() also
+    // draws a paired dot on flag_server with a connector. See the
+    // FLAG_SUBMITTED block in render().
+    if (t === 'FLAG_SUBMITTED')             return ev.payload?.submitter_team_id || ev.team_id || 'flag_server';
     if (t === 'ROUND_START' || t === 'ROUND_STOP' ||
         t === 'PHASE_CHANGE' || t === 'GAME_END') return 'orchestrator';
     if (t === 'SERVICE_DEPLOYED') {
@@ -260,6 +341,20 @@
   function summarize(ev) {
     const t = ev.type;
     const p = ev.payload || {};
+    if (t === 'SETUP_STARTED') return `arena bring-up started · run ${p.run || ''}`;
+    if (t === 'SETUP_COMPLETE') {
+      const f = (p.facilities || []).join('+');
+      return `arena ready · ${p.containers ?? '?'} containers · ${p.services ?? '?'} services deployed · facilities: ${f || '?'}`;
+    }
+    if (t === 'IMAGE_BUILT') {
+      const tag = p.tag || '';
+      const i = tag.lastIndexOf(':');
+      const repo = i > 0 ? tag.slice(0, i) : tag;
+      const ver = i > 0 ? tag.slice(i + 1) : '';
+      return `challenge image · ${repo}${ver ? ' @ ' + ver.slice(0, 12) : ''}`;
+    }
+    if (t === 'CONTAINER_READY') return `${p.node || '?'}${p.role ? ' [' + p.role + ']' : ''}${p.image ? ' · ' + p.image : ''}`;
+    if (t === 'FACILITY_READY') return `${p.facility || '?'} ready`;
     if (t === 'PHASE_CHANGE') return `phase → ${ev.phase}`;
     if (t === 'ROUND_START' || t === 'ROUND_STOP') return `R${ev.round_id}`;
     if (t === 'GAME_END') return `reason=${p.reason || '?'}`;
@@ -276,7 +371,8 @@
       return `${p.service || '?'}${dur}${team ? ' · ' + team : ''}`;
     }
     if (t === 'SERVICE_HEALTH_CHECK') {
-      return `${ev.team_id || '?'}/${p.service || '?'} ${p.level || '?'}=${p.passed} (${(p.detail || '').slice(0, 80)})`;
+      const trig = (p.trigger && p.trigger !== 'periodic') ? ` ⟨${p.trigger}⟩` : '';
+      return `${ev.team_id || '?'}/${p.service || '?'} ${p.level || '?'}=${p.passed}${trig} (${(p.detail || '').slice(0, 80)})`;
     }
     if (t === 'AGENT_PROMPT_SENT') {
       const first = p.prompt_first_line || '';
@@ -302,6 +398,7 @@
     seenIds: new Set(),
     t0: null,              // first event ts, for offset_s computation
     teamLanes: [],         // discovered team_id values, sorted by lane index
+    live: false,           // true in live (WS) mode → the axis tracks wall-clock
   };
 
   function ingest(ev) {
@@ -348,16 +445,26 @@
   let FOLLOW = true;    // auto-scroll to right edge when new events arrive
 
   function render() {
+    // Preserve horizontal scroll across the rebuild: following → snap to
+    // the right edge (live tail); not following → keep the user's position
+    // so a timer re-render doesn't yank them while inspecting history.
+    const prevScroll = TIMELINE.scrollLeft;
     TIMELINE.innerHTML = '';
     const ACTOR_LIST = actors();
     const ROW_H = 36;
     const LANE_TOP = 64;          // top padding above lanes (axis area)
     const LEFT_PAD = 16;          // breathing room for the "0s" tick label
     const RIGHT_PAD = 12;
-    // Bottom of time window: max of last-event offset and 60s, so the
-    // axis isn't collapsed before the first events arrive.
+    // Bottom of time window: max of last-event offset, wall-clock "now",
+    // and 60s. The `nowOffset` term is what makes the axis keep advancing
+    // in live mode even when no new events arrive. It assumes the panel
+    // host's clock matches the orchestrator's (true for the local panel;
+    // a remote viewer with clock skew may see the now-edge slightly off).
+    // Snapshots (state.live=false) freeze at the last event — the game is
+    // over, so the axis must not run off to the current wall-clock.
     const lastOffset = state.events.length ? state.events[state.events.length - 1].offset_s : 0;
-    const T_MAX = Math.max(lastOffset, 60);
+    const nowOffset = (state.live && state.t0 != null) ? (Date.now() / 1000 - state.t0) : 0;
+    const T_MAX = Math.max(lastOffset, nowOffset, 60);
     // SVG canvas width: at least enough to render every event at the
     // current px/s density, plus pad on both sides. The gutter is
     // rendered separately as sticky HTML.
@@ -475,27 +582,129 @@
       svg.appendChild(t);
     }
 
-    // Event dots.
+    // Event dots. First collect the drawable ones (PHASE/ROUND markers
+    // and FLAG_SUBMITTED render separately), then de-overlap: events that
+    // land on the same lane at (nearly) the same x — e.g. AGENT_INSTALLED
+    // + DRY_RUN_START at one instant, the 2 CONTAINER_READY per team, the
+    // 2 FLAG_PLANTED on flag_server — get fanned out vertically within the
+    // lane row so each stays hoverable instead of hiding under the next.
+    const drawable = [];
     for (const e of state.events) {
       if (!VISIBLE[e.category]) continue;
       if (e.type === 'PHASE_CHANGE' || e.type === 'ROUND_START' ||
           e.type === 'ROUND_STOP'  || e.type === 'GAME_END') continue;
+      if (e.type === 'FLAG_SUBMITTED') continue;
       const cx = xOf(e.offset_s);
-      const cy = yOf(e.actor);
-      if (cy == null) continue;
-      const dot = document.createElementNS(NS, 'circle');
-      dot.setAttribute('cx', cx);
-      dot.setAttribute('cy', cy);
-      dot.setAttribute('r', 4);
-      dot.setAttribute('fill', COLOR[e.category] || '#888');
-      dot.setAttribute('fill-opacity', '0.85');
-      dot.setAttribute('stroke', 'rgba(0,0,0,0.4)');
-      dot.setAttribute('stroke-width', '0.5');
-      dot.style.cursor = 'crosshair';
-      dot.addEventListener('mouseenter', evt => showTooltip(evt, e));
-      dot.addEventListener('mousemove',  evt => moveTooltip(evt));
-      dot.addEventListener('mouseleave', () => hideTooltip());
-      svg.appendChild(dot);
+      const cy0 = yOf(e.actor);
+      if (cy0 == null) continue;
+      drawable.push({ e, cx, cy0, cy: cy0 });
+    }
+    // Group by (lane, ~4px x-bucket); stagger each group around its lane
+    // center, capping the spread so dots stay inside the 36px row.
+    const groups = {};
+    for (const d of drawable) {
+      const key = `${d.cy0}@${Math.round(d.cx / 4)}`;
+      (groups[key] = groups[key] || []).push(d);
+    }
+    for (const key in groups) {
+      const g = groups[key];
+      if (g.length < 2) continue;
+      const step = Math.min(7, 26 / (g.length - 1));
+      g.forEach((d, k) => { d.cy = d.cy0 + (k - (g.length - 1) / 2) * step; });
+    }
+
+    for (const d of drawable) {
+      const e = d.e;
+      const col = COLOR[e.category] || '#888';
+      // Off-cadence health probes (attack-entry / post-restart one-shots)
+      // render as a diamond, distinct from the periodic circles.
+      const oneShot = e.type === 'SERVICE_HEALTH_CHECK'
+        && e.ev.payload && e.ev.payload.trigger && e.ev.payload.trigger !== 'periodic';
+      let mark;
+      if (oneShot) {
+        const r = 5;
+        mark = document.createElementNS(NS, 'polygon');
+        mark.setAttribute('points',
+          `${d.cx},${d.cy - r} ${d.cx + r},${d.cy} ${d.cx},${d.cy + r} ${d.cx - r},${d.cy}`);
+      } else {
+        mark = document.createElementNS(NS, 'circle');
+        mark.setAttribute('cx', d.cx);
+        mark.setAttribute('cy', d.cy);
+        mark.setAttribute('r', 4);
+      }
+      mark.setAttribute('fill', col);
+      mark.setAttribute('fill-opacity', oneShot ? '0.9' : '0.85');
+      mark.setAttribute('stroke', 'rgba(0,0,0,0.4)');
+      mark.setAttribute('stroke-width', '0.5');
+      mark.style.cursor = 'crosshair';
+      mark.addEventListener('mouseenter', evt => showTooltip(evt, e));
+      mark.addEventListener('mousemove',  evt => moveTooltip(evt));
+      mark.addEventListener('mouseleave', () => hideTooltip());
+      svg.appendChild(mark);
+    }
+
+    // FLAG_SUBMITTED as a two-lane interaction: a dot on the submitter
+    // team's lane + a dot on flag_server, joined by a connector. Verdict
+    // is the color — accepted = filled green, rejected = hollow red ring
+    // (so a wall of retries reads as rings, the wins as solid dots).
+    function flagDot(cx, cy, color, r, e, filled) {
+      const d = document.createElementNS(NS, 'circle');
+      d.setAttribute('cx', cx); d.setAttribute('cy', cy); d.setAttribute('r', r);
+      d.setAttribute('fill', filled ? color : 'none');
+      d.setAttribute('fill-opacity', '0.9');
+      d.setAttribute('stroke', color);
+      d.setAttribute('stroke-width', filled ? '0.5' : '1.5');
+      d.style.cursor = 'crosshair';
+      d.addEventListener('mouseenter', evt => showTooltip(evt, e));
+      d.addEventListener('mousemove',  evt => moveTooltip(evt));
+      d.addEventListener('mouseleave', () => hideTooltip());
+      return d;
+    }
+    if (VISIBLE['flag']) {
+      for (const e of state.events) {
+        if (e.type !== 'FLAG_SUBMITTED') continue;
+        const p = e.ev.payload || {};
+        const submitter = p.submitter_team_id || e.ev.team_id;
+        const yTeam = yOf(submitter);
+        const ySrv  = yOf('flag_server');
+        if (yTeam == null || ySrv == null) continue;
+        const x = xOf(e.offset_s);
+        const accepted = !!p.accepted;
+        const col = accepted ? '#82d97c' : '#ff6b6b';
+        const line = document.createElementNS(NS, 'line');
+        line.setAttribute('x1', x); line.setAttribute('y1', yTeam);
+        line.setAttribute('x2', x); line.setAttribute('y2', ySrv);
+        line.setAttribute('stroke', col);
+        line.setAttribute('stroke-opacity', accepted ? '0.55' : '0.30');
+        line.setAttribute('stroke-width', accepted ? '1.5' : '1');
+        if (!accepted) line.setAttribute('stroke-dasharray', '3,3');
+        svg.appendChild(line);
+        const r = accepted ? 5 : 3.5;
+        svg.appendChild(flagDot(x, yTeam, col, r, e, accepted));
+        svg.appendChild(flagDot(x, ySrv,  col, r, e, accepted));
+      }
+    }
+
+    // "now" marker — a moving vertical line at the current wall-clock
+    // position (live mode only). This is the thing that visibly advances
+    // between events.
+    if (state.live && state.t0 != null) {
+      const xNow = xOf(nowOffset);
+      const nowLine = document.createElementNS(NS, 'line');
+      nowLine.setAttribute('x1', xNow); nowLine.setAttribute('y1', LANE_TOP - 8);
+      nowLine.setAttribute('x2', xNow); nowLine.setAttribute('y2', H - 12);
+      nowLine.setAttribute('stroke', '#e0e0e0');
+      nowLine.setAttribute('stroke-opacity', '0.5');
+      nowLine.setAttribute('stroke-width', '1');
+      svg.appendChild(nowLine);
+      const nowLbl = document.createElementNS(NS, 'text');
+      nowLbl.setAttribute('x', xNow - 3); nowLbl.setAttribute('y', LANE_TOP - 2);
+      nowLbl.setAttribute('text-anchor', 'end');
+      nowLbl.setAttribute('font-family', "'JetBrains Mono', monospace");
+      nowLbl.setAttribute('font-size', '9');
+      nowLbl.setAttribute('fill', '#e0e0e0');
+      nowLbl.textContent = 'now';
+      svg.appendChild(nowLbl);
     }
 
     row.appendChild(svg);
@@ -503,6 +712,8 @@
 
     if (FOLLOW) {
       TIMELINE.scrollLeft = TIMELINE.scrollWidth;
+    } else {
+      TIMELINE.scrollLeft = prevScroll;
     }
   }
 
@@ -615,6 +826,105 @@
     backoff = Math.min(backoff * 2, 30000);
   }
 
+  // ── agent transcripts (below the timeline) ──────────────────
+  // Fetched from /game/agents (parsed stream-json artifacts), polled
+  // every few seconds. Transcripts are written whole at each phase end,
+  // so we only re-render when the data signature changes — that keeps a
+  // poll from collapsing any "show full" the viewer has expanded.
+  const KIND_ICON = {
+    system: '⚙', thinking: '🧠', text: '💬', tool_use: '🔧', tool_result: '↩',
+  };
+  const KIND_CLASS = {
+    system: 'kind-system', thinking: 'kind-thinking', text: 'kind-text',
+    tool_use: 'kind-tool-use', tool_result: 'kind-tool-result',
+  };
+  let transcriptSig = null;
+
+  function renderCard(ae) {
+    const card = document.createElement('div');
+    card.className = `card ${KIND_CLASS[ae.kind] || ''}${ae.is_error ? ' is-error' : ''}`;
+    let html = `
+      <div class="card-head">
+        <span class="icon">${KIND_ICON[ae.kind] || '•'}</span>
+        <span class="kind">${escapeHtml(ae.kind)}</span>
+        <span class="title">${escapeHtml(ae.title)}</span>
+      </div>`;
+    // Long bodies + structured kinds collapse into a nested <details>.
+    const hasBody = (ae.body && ae.body.length > (ae.title || '').length + 4)
+      || ['system', 'tool_use', 'tool_result'].includes(ae.kind);
+    if (hasBody) {
+      html += `<details class="card-body"><summary>show full</summary>`
+            + `<pre>${escapeHtml(ae.body)}</pre></details>`;
+    }
+    card.innerHTML = html;
+    return card;
+  }
+
+  function renderTranscripts(transcripts) {
+    const section = $('transcripts');
+    const body = $('transcripts-body');
+    if (!transcripts || !transcripts.length) { section.hidden = true; return; }
+    section.hidden = false;
+
+    const byTeam = {};
+    for (const t of transcripts) (byTeam[t.team_id] = byTeam[t.team_id] || []).push(t);
+
+    let totalTokIn = 0, totalTokOut = 0;
+    body.innerHTML = '';
+    for (const team of Object.keys(byTeam).sort()) {
+      const wrap = document.createElement('div');
+      wrap.className = 'transcript-team';
+      const name = document.createElement('div');
+      name.className = 'transcript-team-name';
+      name.textContent = team;
+      name.style.color = colorForActor(team);
+      wrap.appendChild(name);
+
+      for (const tr of byTeam[team]) {
+        const s = tr.stats;
+        totalTokIn += s.tokens_in; totalTokOut += s.tokens_out;
+        const det = document.createElement('details');
+        det.className = 'transcript-host';
+        det.open = true;
+        det.innerHTML = `
+          <summary>
+            <span class="host-name">R${tr.round_id} · ${escapeHtml(tr.phase)}</span>
+            <span class="host-stats">${s.events} events · ${s.tools} tools `
+            + `(${escapeHtml(s.tools_breakdown)}) · ${s.errors} err · `
+            + `${s.tokens_in.toLocaleString()}↓ / ${s.tokens_out.toLocaleString()}↑ tok</span>
+          </summary>
+          <div class="cards"></div>`;
+        const cards = det.querySelector('.cards');
+        for (const ae of tr.events) cards.appendChild(renderCard(ae));
+        wrap.appendChild(det);
+      }
+      body.appendChild(wrap);
+    }
+    $('transcripts-sub').textContent =
+      `${transcripts.length} transcript(s) · ${totalTokIn.toLocaleString()}↓ / ${totalTokOut.toLocaleString()}↑ tokens`;
+  }
+
+  function signatureOf(transcripts) {
+    // Cheap content signature: which transcripts exist + their event
+    // counts. Changes only when a new phase transcript lands.
+    return transcripts
+      .map(t => `${t.team_id}/${t.round_id}/${t.phase}:${t.stats.events}`)
+      .join(',');
+  }
+
+  async function fetchTranscripts() {
+    try {
+      const res = await fetch('/game/agents');
+      if (!res.ok) return;
+      const body = await res.json();
+      const transcripts = body.transcripts || [];
+      const sig = signatureOf(transcripts);
+      if (sig === transcriptSig) return;   // unchanged — don't clobber expands
+      transcriptSig = sig;
+      renderTranscripts(transcripts);
+    } catch (e) { /* best-effort */ }
+  }
+
   // ── boot ─────────────────────────────────────────────────────
   // Defer until DOMContentLoaded so any later <script> tags (notably the
   // INITIAL_EVENTS block panel_snapshot.py injects right before the
@@ -630,8 +940,21 @@
       conn.querySelector('.text').textContent = 'snapshot';
       for (const ev of window.INITIAL_EVENTS) ingest(ev);
       buildControls(); render();
+      // Offline snapshots may inline transcripts; render them if present.
+      if (Array.isArray(window.INITIAL_TRANSCRIPTS)) {
+        renderTranscripts(window.INITIAL_TRANSCRIPTS);
+      }
     } else {
+      state.live = true;
       backfill().then(connect);
+      // Agent transcripts land at phase end — poll the artifact-backed
+      // endpoint rather than riding the event stream.
+      fetchTranscripts();
+      setInterval(fetchTranscripts, 5000);
+      // Live tail: advance the time axis ~4×/s even with no new events, so
+      // "now" keeps moving. Gated on FOLLOW so it never yanks a viewer who
+      // has unchecked follow to scroll back and inspect history.
+      setInterval(() => { if (FOLLOW) render(); }, 250);
     }
   });
 </script>

@@ -26,6 +26,7 @@ from challenges.interface import (
     VulboxImage,
     VulboxTarget,
 )
+from facility import FacilityContext, LocalEventSink, LocalStatusPort
 from gamemgr.events import EventType
 from gamemgr.timeline import Timeline
 from health.checker import HealthChecker
@@ -121,7 +122,12 @@ class _AttackOnlyChallenge(Challenge):
 
 
 def _checker(timeline: Timeline) -> HealthChecker:
-    return HealthChecker(timeline, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+    return HealthChecker(
+        FacilityContext(
+            status=LocalStatusPort(lambda: {"round": 1, "phase": "ATTACK"}),
+            events=LocalEventSink(timeline),
+        )
+    )
 
 
 def _checks(timeline: Timeline) -> list:
@@ -160,6 +166,9 @@ def test_on_attack_enter_fires_immediate_probe_per_target():
     assert sorted(by_team.keys()) == ["team1", "team2"]
     assert len(by_team["team1"]) == 4
     assert len(by_team["team2"]) == 4
+    # The on-entry one-shot is tagged so it's distinguishable from the
+    # periodic cadence on the same lane.
+    assert all(e.payload.get("trigger") == "attack_enter" for e in _checks(tl))
 
 
 def test_periodic_loop_runs_at_interval():
@@ -206,6 +215,8 @@ def test_trigger_now_runs_one_chain_for_known_target():
 
     asyncio.run(run())
     assert len(_checks(tl)) == 4
+    # Post-restart one-shot is tagged "restart".
+    assert all(e.payload.get("trigger") == "restart" for e in _checks(tl))
 
 
 def test_trigger_now_is_noop_for_unknown_target():

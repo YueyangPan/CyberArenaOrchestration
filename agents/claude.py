@@ -184,8 +184,16 @@ class ClaudeAgentManager(AgentManager):
         place (same PID/PGID). Any subprocesses claude spawns (exploits,
         background jobs) inherit that PGID, so the on-timeout
         `kill_session` does `kill -KILL -- -<pgid>` and reaps the whole
-        group — no orphans, no race with a sibling claude that the next
-        phase just started in the same container.
+        group.
+
+        It also exports `CYBERARENA_PHASE=<marker>` into claude's
+        environment. A timed-out Claude Code process can escape the launch
+        process group (a PGID-only kill then reports success while the
+        agent keeps running — verified 2026-06-10), so `kill_session`
+        reaps by scanning `/proc/<pid>/environ` for this marker: it's
+        group-independent, catches claude's children (they inherit the
+        env), and is safe against the sibling claude the next phase starts
+        in the same container because the marker is unique per invocation.
         """
         model_arg = (
             f"--model {shlex.quote(model)} "
@@ -202,7 +210,14 @@ class ClaudeAgentManager(AgentManager):
         )
         if session_marker:
             pid_file = f"/tmp/cyberarena_phase_{session_marker}.pid"
-            inner = f"echo $$ > {shlex.quote(pid_file)} && exec {claude_argv}"
+            # Export the marker into claude's env so kill_session can reap
+            # by scanning /proc/<pid>/environ (group-independent). The
+            # pidfile/PGID is kept as a best-effort fast path.
+            inner = (
+                f"echo $$ > {shlex.quote(pid_file)} && "
+                f"export CYBERARENA_PHASE={shlex.quote(session_marker)} && "
+                f"exec {claude_argv}"
+            )
             launch = f"exec setsid -w bash -c {shlex.quote(inner)}"
         else:
             launch = claude_argv

@@ -15,6 +15,14 @@ class EventType(str, Enum):
     PHASE_CHANGE = "PHASE_CHANGE"
     ROUND_STOP = "ROUND_STOP"
     SERVICE_DEPLOYED = "SERVICE_DEPLOYED"
+    # Arena bring-up telemetry (pre-round-loop), so the live panel shows
+    # the arena coming online instead of a blank timeline until round 1.
+    # Emitted by main._run_start as each setup step completes.
+    SETUP_STARTED = "SETUP_STARTED"      # run dir + sink attached; bring-up begins
+    IMAGE_BUILT = "IMAGE_BUILT"          # one per challenge image (built or cached)
+    CONTAINER_READY = "CONTAINER_READY"  # one per arena container created + started
+    FACILITY_READY = "FACILITY_READY"    # a facility (flag / health) is constructed
+    SETUP_COMPLETE = "SETUP_COMPLETE"    # bring-up done (payload: containers/services/facilities); round loop next
     # Agent lifecycle: host-emitted INSTALLED (prep done — env / mcp.json /
     # SSH pivot / workdir staged) → MCP-emitted READY (LLM proved the
     # channel works by calling report_ready). Per-phase invocation events

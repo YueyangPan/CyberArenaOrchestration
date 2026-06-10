@@ -19,9 +19,19 @@ from challenges.interface import (
     VulboxImage,
     VulboxTarget,
 )
+from facility import FacilityContext, LocalEventSink, LocalStatusPort
 from gamemgr.events import EventType
 from gamemgr.timeline import Timeline
 from health.checker import HealthChecker
+
+
+def _checker(tl: Timeline, *, round: int = 1, phase: str = "ATTACK") -> HealthChecker:
+    return HealthChecker(
+        FacilityContext(
+            status=LocalStatusPort(lambda: {"round": round, "phase": phase}),
+            events=LocalEventSink(tl),
+        )
+    )
 
 
 class _StubFT(FunctionalityTest):
@@ -99,7 +109,7 @@ def test_run_emits_one_event_per_leaf_in_pre_order():
         CheckResult(name="checker", passed=True, detail="checker ok"),
     ])
     tl = Timeline()
-    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+    checker = _checker(tl)
     _run(checker, team_id="team1", service="x", target=_target(), challenge=_StubCh(tree))
 
     levels = [e.payload["level"] for e in _checks(tl)]
@@ -113,7 +123,7 @@ def test_run_propagates_failure_per_leaf():
         CheckResult(name="tcp", passed=False, detail="connection refused"),
     ])
     tl = Timeline()
-    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+    checker = _checker(tl)
     _run(checker, team_id="team1", service="x", target=_target(), challenge=_StubCh(tree))
 
     by_level = {e.payload["level"]: e.payload for e in _checks(tl)}
@@ -127,7 +137,7 @@ def test_run_returns_root_check_result():
         CheckResult(name="single", passed=True, detail=""),
     ])
     tl = Timeline()
-    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+    checker = _checker(tl)
     result = _run(checker, team_id="team1", service="x", target=_target(), challenge=_StubCh(tree))
     assert result is tree
 
@@ -137,7 +147,7 @@ def test_run_handles_single_leaf_tree():
     children) should still emit one event."""
     tree = CheckResult(name="alive", passed=True, detail="ok")
     tl = Timeline()
-    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+    checker = _checker(tl)
     _run(checker, team_id="team1", service="x", target=_target(), challenge=_StubCh(tree))
     checks = _checks(tl)
     assert len(checks) == 1
@@ -154,7 +164,7 @@ def test_run_walks_nested_trees():
         CheckResult(name="checker", passed=True),
     ])
     tl = Timeline()
-    checker = HealthChecker(tl, status_resolver=lambda: {"round": 1, "phase": "ATTACK"})
+    checker = _checker(tl)
     _run(checker, team_id="team1", service="x", target=_target(), challenge=_StubCh(tree))
     levels = [e.payload["level"] for e in _checks(tl)]
     # No "net" or "root" — those are internal rollups.
@@ -164,8 +174,24 @@ def test_run_walks_nested_trees():
 def test_status_resolver_stamps_round_and_phase():
     tree = CheckResult(name="single", passed=True)
     tl = Timeline()
-    checker = HealthChecker(tl, status_resolver=lambda: {"round": 7, "phase": "ATTACK"})
+    checker = _checker(tl, round=7)
     _run(checker, team_id="team1", service="x", target=_target(), challenge=_StubCh(tree))
     ev = _checks(tl)[0]
     assert ev.round_id == 7
     assert ev.phase == "ATTACK"
+
+
+def test_trigger_defaults_to_periodic():
+    tl = Timeline()
+    checker = _checker(tl)
+    _run(checker, team_id="team1", service="x", target=_target(),
+         challenge=_StubCh(CheckResult(name="single", passed=True)))
+    assert _checks(tl)[0].payload["trigger"] == "periodic"
+
+
+def test_explicit_trigger_is_recorded():
+    tl = Timeline()
+    checker = _checker(tl)
+    _run(checker, team_id="team1", service="x", target=_target(),
+         challenge=_StubCh(CheckResult(name="single", passed=True)), trigger="restart")
+    assert _checks(tl)[0].payload["trigger"] == "restart"

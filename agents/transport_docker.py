@@ -190,34 +190,74 @@ class DockerExecBackend(AgentTransport):
             log.exception("kill_process failed on %s pattern=%r", handle.name, pattern)
 
     def kill_session(self, handle: AgentHandle, session_marker: str) -> None:
-        """Read /tmp/cyberarena_phase_<marker>.pid (the PGID written by
-        phase_command's `setsid -w` wrapper) and SIGKILL the whole
-        process group. Reaps claude + any subprocesses it spawned
-        (exploits, background jobs, subshells) without touching a
-        sibling claude in another session.
+        """Reap the timed-out claude by a per-phase env marker, so it works
+        even when the process escapes its launch group.
 
-        Best-effort: missing/stale pidfile is a no-op. The pidfile is
-        removed after the kill so a re-entry under the same marker
-        starts fresh.
+        phase_command exports `CYBERARENA_PHASE=<marker>` into claude's
+        env (inherited by any children). Steps:
+          1. PGID kill from the pidfile — best-effort fast path.
+          2. Scan `/proc/<pid>/environ` for `CYBERARENA_PHASE=<marker>`
+             and SIGKILL every matching PID.
+          3. Re-scan to confirm none survive; ERROR if any do.
+
+        Session-scoped: the marker is unique per invocation, so the
+        sibling claude the next phase just started (different marker) is
+        never touched. Runs as root via docker exec, so /proc and SIGKILL
+        of any PID are permitted.
         """
+        marker = session_marker
+        pidfile = f"/tmp/cyberarena_phase_{marker}.pid"
+        env_line = f"CYBERARENA_PHASE={marker}"
+        # Single script: PGID best-effort, then env-marker scan/kill, then
+        # a re-scan. Emits KILLED=<pids> and REMAIN=<pids> for the host.
+        script = f"""
+pgid=$(cat {pidfile} 2>/dev/null | tr -d ' ')
+[ -n "$pgid" ] && kill -KILL -- -"$pgid" 2>/dev/null
+rm -f {pidfile}
+killed=""
+for d in /proc/[0-9]*; do
+  if tr '\\0' '\\n' < "$d/environ" 2>/dev/null | grep -qxF "{env_line}"; then
+    pid=${{d#/proc/}}
+    kill -KILL "$pid" 2>/dev/null
+    killed="$killed $pid"
+  fi
+done
+sleep 0.1
+remain=""
+for d in /proc/[0-9]*; do
+  if tr '\\0' '\\n' < "$d/environ" 2>/dev/null | grep -qxF "{env_line}"; then
+    remain="$remain ${{d#/proc/}}"
+  fi
+done
+echo "KILLED=$killed"
+echo "REMAIN=$remain"
+"""
         try:
             c = self._client.containers.get(handle.name)
-            pidfile = f"/tmp/cyberarena_phase_{session_marker}.pid"
-            # `kill -KILL -- -<pgid>` signals every process in the group.
-            # The leading `--` and negative arg are the standard idiom
-            # for "this is a PGID, not a PID". Errors are swallowed:
-            # the process group may already be dead by the time we get
-            # here (clean claude exit between timeout decision and kill).
-            c.exec_run([
-                "sh", "-c",
-                f"pgid=$(cat {pidfile} 2>/dev/null); "
-                f"[ -n \"$pgid\" ] && kill -KILL -- -\"$pgid\" 2>/dev/null; "
-                f"rm -f {pidfile}",
-            ])
+            res = c.exec_run(["sh", "-c", script])
+            out = res.output.decode(errors="replace") if res.output else ""
         except Exception:
-            log.exception(
-                "kill_session failed on %s marker=%r",
-                handle.name, session_marker,
+            log.exception("kill_session: docker exec failed on %s marker=%s", handle.name, marker)
+            return
+
+        def _val(prefix: str) -> str:
+            return next(
+                (ln[len(prefix):].strip() for ln in out.splitlines() if ln.startswith(prefix)),
+                "",
+            )
+
+        killed, remain = _val("KILLED="), _val("REMAIN=")
+        if remain:
+            log.error(
+                "kill_session: marker=%s STILL alive after SIGKILL on %s (pids:%s) — agent not reaped",
+                marker, handle.name, remain,
+            )
+        elif killed:
+            log.debug("kill_session: reaped marker=%s on %s (pids:%s)", marker, handle.name, killed)
+        else:
+            log.debug(
+                "kill_session: no live process carried marker=%s on %s (already exited?)",
+                marker, handle.name,
             )
 
     # ── internals ───────────────────────────────────────────────────────

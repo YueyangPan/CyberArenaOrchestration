@@ -90,31 +90,45 @@ def main(argv: list[str] | None = None) -> int:
 
 
 async def _run_start(args) -> int:
-    cfg = load_game_config(args.config)
-    # Build challenge images before Orchestrator.setup() — same reason
-    # as the `setup` subcommand path.
-    _build_challenge_images(args.config)
-    orch = Orchestrator(graph=cfg.topology)
-    orch.setup()
+    from challenges.registry import build_images
 
+    cfg = load_game_config(args.config)
+    orch = Orchestrator(graph=cfg.topology)
     game = GameMgr(config=cfg, orchestrator=orch)
-    game.deploy_challenges()
-    game.plant_initial_flags()
 
     # Persistent-memory v1: install once pre-loop, run_phase per phase.
-    # Wires install + defense/attack kickoff handlers on game; the
-    # install handler runs inside game.start() (after the timeline file sink is attached)
-    # via game.install_all_agents().
+    # Wires install + defense/attack kickoff handlers on game.
     _wire_phase_kickoffs(game)
 
+    # Open the run + bring the API server up BEFORE the arena bring-up so
+    # the live panel can connect and stream the bring-up events.
+    game.begin_run()
     shutdown = asyncio.Event()
     app = build_app(game, shutdown)
-
     uv_config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
     server = uvicorn.Server(uv_config)
+    server_task = asyncio.create_task(server.serve(), name="uvicorn")
+
+    # Arena bring-up. The steps are blocking (docker / image builds), so
+    # run each in a thread executor to keep the event loop free to serve
+    # the panel; emit the per-step events from the loop thread afterwards
+    # (Timeline.record is not thread-safe). build_images is idempotent
+    # (cached tags skip), so on a warm host this is near-instant.
+    loop = asyncio.get_running_loop()
+    tags = await loop.run_in_executor(None, build_images, cfg)
+    for tag in tags:
+        game.record_image_built(tag)
+    await loop.run_in_executor(None, orch.setup)
+    for node in cfg.topology.nodes:
+        game.record_container_ready(node)
+    await loop.run_in_executor(None, game.deploy_challenges)
+    await loop.run_in_executor(None, game.plant_initial_flags)
+    game.emit_setup_events()          # SERVICE_DEPLOYED + FLAG_PLANTED (round 0)
+    game._build_health_facility()
+    game.record_facilities_ready()    # FACILITY_READY (flag, health)
+    game.record_setup_complete()
 
     loop_task = asyncio.create_task(game.start(), name="round-loop")
-    server_task = asyncio.create_task(server.serve(), name="uvicorn")
 
     def _signal_handler():
         shutdown.set()

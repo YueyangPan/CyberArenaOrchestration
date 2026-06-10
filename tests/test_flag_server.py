@@ -19,9 +19,20 @@ from challenges.interface import (
     VulboxImage,
     VulboxTarget,
 )
+from facility import FacilityContext, LocalEventSink, LocalStatusPort
 from flag import FlagServer
 from gamemgr.events import EventType
 from gamemgr.timeline import Timeline
+
+
+def _ctx(timeline: Timeline, *, round: int = 7, phase: str = "ATTACK") -> FacilityContext:
+    """Local in-process FacilityContext for FlagServer tests. No exec
+    port — FlagServer drives exec through the target's callable, which
+    `_target_factory` stubs."""
+    return FacilityContext(
+        status=LocalStatusPort(lambda: {"round": round, "phase": phase}),
+        events=LocalEventSink(timeline),
+    )
 
 
 class _StubFlagHandler(FlagHandler):
@@ -99,10 +110,9 @@ def _target_factory(team_id: str, ch: Challenge) -> VulboxTarget:
 def _server(challenge_by_owner: dict | None = None, *, phase: str = "ATTACK"):
     timeline = Timeline()
     server = FlagServer(
-        timeline,
+        _ctx(timeline, phase=phase),
         challenge_by_owner=challenge_by_owner if challenge_by_owner is not None else {},
         target_factory=_target_factory,
-        status_resolver=lambda: {"round": 7, "phase": phase},
     )
     return server, timeline
 
@@ -249,11 +259,14 @@ def test_submit_during_defense_then_attack_resubmit_accepted():
     ch = _StubChallenge()
     timeline = Timeline()
     current = {"phase": "DEFENSE"}
+    ctx = FacilityContext(
+        status=LocalStatusPort(lambda: {"round": 7, "phase": current["phase"]}),
+        events=LocalEventSink(timeline),
+    )
     server = FlagServer(
-        timeline,
+        ctx,
         challenge_by_owner={("team1", "notes"): ch, ("team2", "notes"): ch},
         target_factory=_target_factory,
-        status_resolver=lambda: {"round": 7, "phase": current["phase"]},
     )
     server.plant_flags(round_id=1)
     target_flag = server.store.planted[("team1", "notes")]
