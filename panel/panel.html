@@ -880,7 +880,7 @@
     const byTeam = {};
     for (const t of transcripts) (byTeam[t.team_id] = byTeam[t.team_id] || []).push(t);
 
-    let totalTokIn = 0, totalTokOut = 0;
+    let totalTokIn = 0, totalTokCached = 0, totalTokOut = 0;
     body.innerHTML = '';
     for (const team of Object.keys(byTeam).sort()) {
       const wrap = document.createElement('div');
@@ -893,7 +893,8 @@
 
       for (const tr of byTeam[team]) {
         const s = tr.stats;
-        totalTokIn += s.tokens_in; totalTokOut += s.tokens_out;
+        const cached = s.tokens_cached || 0;
+        totalTokIn += s.tokens_in; totalTokCached += cached; totalTokOut += s.tokens_out;
         const det = document.createElement('details');
         det.className = 'transcript-host';
         det.open = true;
@@ -902,7 +903,7 @@
             <span class="host-name">R${tr.round_id} · ${escapeHtml(tr.phase)}</span>
             <span class="host-stats">${s.events} events · ${s.tools} tools `
             + `(${escapeHtml(s.tools_breakdown)}) · ${s.errors} err · `
-            + `${s.tokens_in.toLocaleString()}↓ / ${s.tokens_out.toLocaleString()}↑ tok</span>
+            + `${s.tokens_in.toLocaleString()} in / ${cached.toLocaleString()} cached / ${s.tokens_out.toLocaleString()} out tok</span>
           </summary>
           <div class="cards"></div>`;
         const cards = det.querySelector('.cards');
@@ -912,7 +913,8 @@
       body.appendChild(wrap);
     }
     $('transcripts-sub').textContent =
-      `${transcripts.length} transcript(s) · ${totalTokIn.toLocaleString()}↓ / ${totalTokOut.toLocaleString()}↑ tokens`;
+      `${transcripts.length} transcript(s) · ${totalTokIn.toLocaleString()} in / `
+      + `${totalTokCached.toLocaleString()} cached / ${totalTokOut.toLocaleString()} out tokens`;
   }
 
   function signatureOf(transcripts) {

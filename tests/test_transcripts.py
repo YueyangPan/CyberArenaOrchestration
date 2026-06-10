@@ -33,6 +33,16 @@ _ASSISTANT = {
         ],
     },
 }
+_ASSISTANT_CACHED = {
+    "type": "assistant",
+    "message": {
+        "usage": {
+            "input_tokens": 10, "output_tokens": 2,
+            "cache_read_input_tokens": 500, "cache_creation_input_tokens": 50,
+        },
+        "content": [{"type": "text", "text": "hi"}],
+    },
+}
 _TOOL_OK = {"type": "user", "message": {"content": [
     {"type": "tool_result", "content": "file1\nfile2", "is_error": False},
 ]}}
@@ -96,6 +106,18 @@ def test_summary_stats_counts_tools_tokens_errors(tmp_path):
     assert "Bash" in stats["tools_breakdown"]
     assert stats["errors"] == 1
     assert stats["tokens_in"] == 100 and stats["tokens_out"] == 20
+    assert stats["tokens_cached"] == 0   # no cache fields in this sample
+
+
+def test_summary_stats_sums_cached_tokens(tmp_path):
+    """cache_read + cache_creation input tokens roll up into tokens_cached,
+    separate from the uncached tokens_in."""
+    p = tmp_path / "stream-defense.jsonl"
+    _write_stream(p, [_ASSISTANT_CACHED])
+    stats = summary_stats(parse_stream_json(p))
+    assert stats["tokens_in"] == 10
+    assert stats["tokens_out"] == 2
+    assert stats["tokens_cached"] == 550   # 500 read + 50 creation
 
 
 # ── collect_transcripts ────────────────────────────────────────────────

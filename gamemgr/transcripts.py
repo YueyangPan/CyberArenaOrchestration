@@ -30,8 +30,9 @@ class AgentEvent:
     body: str  # full content (collapsible in the panel)
     tool_name: str | None  # set on tool_use
     is_error: bool  # tool_result with is_error
-    tokens_in: int | None
-    tokens_out: int | None
+    tokens_in: int | None  # usage.input_tokens (new, uncached input)
+    tokens_out: int | None  # usage.output_tokens (generated)
+    tokens_cached: int | None = None  # cache_read + cache_creation input
 
 
 def _truncate(s: str, n: int = 140) -> str:
@@ -97,6 +98,13 @@ def _unpack_line(obj: dict) -> list[AgentEvent]:
             usage = (obj.get("message") or {}).get("usage") or {}
             out[0].tokens_in = usage.get("input_tokens")
             out[0].tokens_out = usage.get("output_tokens")
+            # Prompt-cache input is reported separately from input_tokens;
+            # most of an agent's context is cache reads (Claude --continue),
+            # so surface it as its own figure rather than hiding it.
+            out[0].tokens_cached = (
+                (usage.get("cache_read_input_tokens") or 0)
+                + (usage.get("cache_creation_input_tokens") or 0)
+            )
         return out
 
     if top == "user":
@@ -147,7 +155,7 @@ def parse_stream_json(path: Path) -> list[AgentEvent]:
 def summary_stats(events: list[AgentEvent]) -> dict:
     """Per-transcript headline shown in the panel's `<summary>`."""
     tool_counts: dict[str, int] = {}
-    tin = tout = 0
+    tin = tout = tcached = 0
     n_err = 0
     for ev in events:
         if ev.kind == "tool_use" and ev.tool_name:
@@ -158,6 +166,8 @@ def summary_stats(events: list[AgentEvent]) -> dict:
             tin += ev.tokens_in
         if ev.tokens_out:
             tout += ev.tokens_out
+        if ev.tokens_cached:
+            tcached += ev.tokens_cached
     return {
         "events": len(events),
         "tools": sum(tool_counts.values()),
@@ -166,6 +176,7 @@ def summary_stats(events: list[AgentEvent]) -> dict:
         ) or "(none)",
         "errors": n_err,
         "tokens_in": tin,
+        "tokens_cached": tcached,
         "tokens_out": tout,
     }
 
