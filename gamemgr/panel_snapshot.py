@@ -7,6 +7,8 @@ the live panel — no server, no WebSocket, no `/game/status` fetch.
 
 The trick is on the panel side: if `window.INITIAL_EVENTS` is defined
 (an array), the boot block replays it and skips the live connection.
+`window.INITIAL_TRANSCRIPTS` is the same idea for the agent-transcript
+section (which is otherwise fed by the live `/game/agents` endpoint).
 Here we just inject one `<script>` tag right before `</body>`.
 """
 
@@ -15,6 +17,8 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+
+from .transcripts import collect_transcripts
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +52,15 @@ def write_snapshot(run_dir: Path, out_path: Path | None = None) -> Path:
     else:
         log.warning("panel_snapshot: %s missing; writing empty snapshot", events_path)
 
+    # Parse the run's agent transcripts so the offline snapshot shows the
+    # same card stack the live panel does. Best-effort: a parse failure
+    # must not cost us the (more important) events snapshot.
+    try:
+        transcripts = collect_transcripts(run_dir)
+    except Exception:
+        log.exception("panel_snapshot: transcript collection failed; embedding none")
+        transcripts = []
+
     template = _PANEL_TEMPLATE.read_text()
     # Inject before the LAST </body> in the template. The first match
     # might be inside an HTML comment or JS string — bug-bait that
@@ -63,14 +76,19 @@ def write_snapshot(run_dir: Path, out_path: Path | None = None) -> Path:
     # additionally close any `</script>` literal that could appear in a
     # payload string. (Browsers terminate inline <script> on the literal
     # bytes `</script>` regardless of JSON quoting.)
-    payload = json.dumps(events).replace("</", "<\\/")
+    events_payload = json.dumps(events).replace("</", "<\\/")
+    transcripts_payload = json.dumps(transcripts).replace("</", "<\\/")
     injection = (
         '<script id="snapshot-events">\n'
-        f"window.INITIAL_EVENTS = {payload};\n"
+        f"window.INITIAL_EVENTS = {events_payload};\n"
+        f"window.INITIAL_TRANSCRIPTS = {transcripts_payload};\n"
         "</script>\n"
     )
     snapshot = template[:inject_at] + injection + template[inject_at:]
 
     out_path.write_text(snapshot)
-    log.info("panel snapshot written: %s (%d events)", out_path, len(events))
+    log.info(
+        "panel snapshot written: %s (%d events, %d transcripts)",
+        out_path, len(events), len(transcripts),
+    )
     return out_path

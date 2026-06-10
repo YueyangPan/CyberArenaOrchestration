@@ -38,6 +38,7 @@ from .events import EventType, new_event, new_run_dir
 from .round import Phase, RoundLoop
 from .timeline import Timeline
 
+from facility import FacilityContext, LocalEventSink, LocalExecPort, LocalStatusPort
 from flag import FlagServer, SubmitResult
 from health.checker import HealthChecker, leaves
 from health.poller import HealthPoller, build_targets
@@ -46,6 +47,11 @@ log = logging.getLogger(__name__)
 
 
 class GameMgr:
+    # Max time stop() waits for in-flight kickoff agent tasks to settle
+    # (write their transcript + emit their terminal AGENT_* event) before
+    # closing the timeline. Bounded so a wedged agent can't hang teardown.
+    _STOP_DRAIN_GRACE_SECS = 30.0
+
     def __init__(self, config: GameConfig, orchestrator: Orchestrator) -> None:
         self.config = config
         self.orchestrator = orchestrator
@@ -60,13 +66,28 @@ class GameMgr:
         # restart_service / emit_setup_events. Mutable dict passed by
         # reference so the facilities see deploy mutations.
         self._challenge_by_owner: dict[tuple[str, str], Challenge] = {}
+        # FacilityContext — the boundary each facility talks through
+        # (status / events / exec). In-process today via Local* adapters;
+        # swappable for HTTP adapters once a facility is containerized.
+        # `exec` resolves (team_id, role) -> container host-side, so
+        # facilities address targets by identity, never by raw name.
+        self._facility_ctx = FacilityContext(
+            status=LocalStatusPort(self.status),
+            events=LocalEventSink(self.timeline),
+            exec=LocalExecPort(
+                container_resolver=self._resolve_container,
+                # Late-bound (not `self._exec_in_container` directly) so a
+                # test patching GameMgr._exec_in_container after construction
+                # still takes effect.
+                docker_exec=lambda container, cmd: self._exec_in_container(container, cmd),
+            ),
+        )
         # FlagServer owns plant / rotation / submission; GameMgr keeps
         # the public method shapes and delegates.
         self.flag_server = FlagServer(
-            self.timeline,
+            self._facility_ctx,
             challenge_by_owner=self._challenge_by_owner,
             target_factory=self.target_for,
-            status_resolver=self.status,
         )
         # token -> team_id, populated from config; lookup for API auth.
         self._token_to_team: dict[str, str] = {
@@ -140,6 +161,12 @@ class GameMgr:
         # because they bind to the running event loop.
         self.health_checker: HealthChecker | None = None
         self.health_poller: HealthPoller | None = None
+        # In-flight per-phase agent kickoff tasks (spawned fire-and-forget
+        # by _spawn_*_kickoff). Tracked so stop() can drain them before the
+        # timeline closes — otherwise the final round's attack agents, which
+        # are usually still wrapping up when the loop ends, lose their
+        # transcript + terminal AGENT_* event to the shutdown.
+        self._kickoff_tasks: set[asyncio.Task] = set()
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
@@ -196,18 +223,77 @@ class GameMgr:
 
     # ── round loop ──────────────────────────────────────────────────────
 
-    async def start(self, run_dir: Path | None = None) -> None:
+    def begin_run(self, run_dir: Path | None = None) -> Path:
+        """Open the run: create run_dir, attach the timeline file sink +
+        artifact store, and emit SETUP_STARTED.
+
+        Called by main._run_start BEFORE the (blocking) arena bring-up so
+        the whole bring-up is recorded + persisted and the live panel can
+        stream it. Idempotent: a second call (or start()'s fallback) is a
+        no-op once run_dir is set."""
+        if self.run_dir is not None:
+            return self.run_dir
         self.run_dir = run_dir or new_run_dir()
         events_path = self.run_dir / "events.jsonl"
         self.timeline.attach_file_sink(events_path)
         # Artifact persistence under the same run_dir as events.jsonl.
-        # Each ArtifactKind gets a reserved subdir (created on construction);
-        # api-logs / agent-logs / service-logs get filled as the round loop
-        # runs. See gamemgr/artifacts.py for the layout.
         self.artifacts = ArtifactStore(self.run_dir)
-        log.info("game start; events -> %s ; artifacts -> %s", events_path, self.artifacts.root)
+        log.info("run begin; events -> %s ; artifacts -> %s", events_path, self.artifacts.root)
+        self.timeline.record(EventType.SETUP_STARTED, payload={"run": self.run_dir.name})
+        return self.run_dir
 
-        self.emit_setup_events()
+    # ── arena bring-up telemetry (emitted from main._run_start) ─────────
+    # These run on the event-loop thread (Timeline.record is not
+    # thread-safe); main does the blocking work in an executor and calls
+    # these afterwards.
+
+    def record_image_built(self, tag: str) -> None:
+        self.timeline.record(EventType.IMAGE_BUILT, payload={"tag": tag})
+
+    def record_container_ready(self, node) -> None:
+        # role is parsed from the node-id suffix (topology convention
+        # team{N}_dev / team{N}_prod) so consumers don't have to re-parse.
+        nid = node.id
+        role = "dev" if nid.endswith("_dev") else "prod" if nid.endswith("_prod") else ""
+        self.timeline.record(
+            EventType.CONTAINER_READY,
+            payload={"node": nid, "role": role, "image": node.image},
+        )
+
+    def record_facilities_ready(self) -> None:
+        """One FACILITY_READY per constructed facility. flag_server exists
+        from __init__; the health poller exists once _build_health_facility
+        has run."""
+        facilities = [self.flag_server]
+        if self.health_poller is not None:
+            facilities.append(self.health_poller)
+        for f in facilities:
+            self.timeline.record(EventType.FACILITY_READY, payload={"facility": f.name})
+
+    def record_setup_complete(self) -> None:
+        """SETUP_COMPLETE with a summary of what came up, so the event says
+        WHAT finished (containers / deployed services / facilities), not
+        just 'done'."""
+        facilities = [self.flag_server.name]
+        if self.health_poller is not None:
+            facilities.append(self.health_poller.name)
+        self.timeline.record(
+            EventType.SETUP_COMPLETE,
+            payload={
+                "containers": len(self.config.topology.nodes),
+                "services": len(self._challenge_by_owner),
+                "facilities": facilities,
+            },
+        )
+
+    async def start(self, run_dir: Path | None = None) -> None:
+        # The setup phase (begin_run + emit_setup_events + facility build)
+        # is normally driven by the caller BEFORE start() so the bring-up
+        # is recorded live. If it wasn't (standalone / test callers), do
+        # the prelude here so start() still works on its own.
+        if self.run_dir is None:
+            self.begin_run(run_dir)
+            self.emit_setup_events()
 
         # Persistent-memory v1: one-shot install across all teams BEFORE
         # the round loop ticks. Parallel via asyncio.gather so a 10s npm
@@ -221,9 +307,9 @@ class GameMgr:
         # per outcome. Best-effort — failures don't halt the round loop.
         await self.dry_run_all_agents()
 
-        # Build HealthChecker + HealthPoller now that the event loop is
-        # running. The poller doesn't start any tasks until enter_attack_phase.
-        self._build_health_facility()
+        # Built during the setup phase normally; fall back here.
+        if self.health_poller is None:
+            self._build_health_facility()
 
         # RoundLoop calls back into GameMgr at each phase / round boundary
         # (enter_defense_phase, enter_attack_phase, on_round_start,
@@ -236,10 +322,7 @@ class GameMgr:
         """Construct HealthChecker + HealthPoller. Pulled out of start()
         so tests can build them against an in-memory GameMgr without
         driving the full round loop."""
-        self.health_checker = HealthChecker(
-            self.timeline,
-            status_resolver=self.status,
-        )
+        self.health_checker = HealthChecker(self._facility_ctx)
         teams_by_id = {t.id: t for t in self.config.topology.teams}
         targets = build_targets(
             challenges=self.config.challenges,
@@ -505,10 +588,9 @@ class GameMgr:
                     team_id, service_name,
                 )
 
-        return [
-            asyncio.create_task(_safe(t, s, c, f))
-            for t, s, c, f in kickoffs
-        ]
+        tasks = [asyncio.create_task(_safe(t, s, c, f)) for t, s, c, f in kickoffs]
+        self._track_kickoffs(tasks)
+        return tasks
 
     # ── DEFCON: attack kickoff on PHASE_CHANGE → ATTACK ─────────────────
 
@@ -575,10 +657,9 @@ class GameMgr:
                     team_id,
                 )
 
-        return [
-            asyncio.create_task(_safe(t, c, f))
-            for t, c, f in kickoffs
-        ]
+        tasks = [asyncio.create_task(_safe(t, c, f)) for t, c, f in kickoffs]
+        self._track_kickoffs(tasks)
+        return tasks
 
     # ── DEFCON: end-of-round service-log snapshots ──────────────────────
 
@@ -623,9 +704,14 @@ class GameMgr:
     # ── RoundLoop dispatch — direct method calls, no pub-sub ────────────
 
     def on_round_start(self, round_id: int, phase: str) -> None:
-        """RoundLoop callback: record ROUND_START. No side effects."""
+        """RoundLoop callback: record ROUND_START. Carries total_rounds so
+        the panel header can show `round N / total` from round 1 (the only
+        other carrier was GAME_END, which is too late)."""
         self.timeline.record(
-            EventType.ROUND_START, round_id=round_id, phase=phase,
+            EventType.ROUND_START,
+            round_id=round_id,
+            phase=phase,
+            payload={"total_rounds": self.config.rounds.total_rounds},
         )
 
     def enter_defense_phase(self, round_id: int) -> list[asyncio.Task]:
@@ -678,9 +764,39 @@ class GameMgr:
             EventType.GAME_END, round_id=round_id, phase=phase, payload=payload,
         )
 
+    def _track_kickoffs(self, tasks: list[asyncio.Task]) -> None:
+        """Register fire-and-forget kickoff tasks so stop() can drain them.
+        The done-callback keeps the set from growing across rounds."""
+        for t in tasks:
+            self._kickoff_tasks.add(t)
+            t.add_done_callback(self._kickoff_tasks.discard)
+
+    async def _drain_kickoffs(self) -> None:
+        """Wait (bounded) for in-flight kickoff tasks to settle, so their
+        record_phase_done — transcript write + terminal AGENT_* event —
+        completes before the timeline closes. A straggler past the grace
+        is cancelled rather than hanging teardown."""
+        pending = [t for t in self._kickoff_tasks if not t.done()]
+        if not pending:
+            return
+        log.info("stop: draining %d in-flight kickoff task(s)", len(pending))
+        _done, still = await asyncio.wait(pending, timeout=self._STOP_DRAIN_GRACE_SECS)
+        if still:
+            log.warning(
+                "stop: %d kickoff task(s) exceeded %.0fs drain grace; cancelling",
+                len(still), self._STOP_DRAIN_GRACE_SECS,
+            )
+            for t in still:
+                t.cancel()
+
     async def stop(self) -> None:
         if self.round_loop is not None:
             self.round_loop.stop()
+        # Drain in-flight per-phase agent tasks BEFORE closing the timeline,
+        # so the final round's transcripts + terminal AGENT_* events are
+        # captured (the last attack agents are typically still wrapping up
+        # when the round loop ends).
+        await self._drain_kickoffs()
         if self.health_poller is not None:
             await self.health_poller.stop()
         self.timeline.close()
@@ -1237,11 +1353,37 @@ class GameMgr:
         )
         if host is None:
             raise KeyError(f"target_for: unknown team_id {team_id!r}")
+
+        # Adapt ExecPort (identity-addressed, ExecResult) down to the
+        # challenge-facing `(container_name, cmd) -> (rc, output)` contract
+        # documented in challenges/interface/probe.py. The container_name
+        # arg is ignored: this is the privileged prod target, so the port
+        # resolves (team_id, "prod") to the same host the handler passes.
+        exec_port = self._facility_ctx.exec
+
+        def _exec_via_port(_container_name: str, cmd: str) -> tuple[int, str]:
+            r = exec_port.exec(team_id, "prod", cmd)
+            return r.exit_code, r.stdout
+
         return VulboxTarget(
             host=host,
             ports=dict(challenge.vulbox.exposed_ports),
             meta={
                 "team_id": team_id,
-                "exec_in_container": self._exec_in_container,
+                "exec_in_container": _exec_via_port,
             },
         )
+
+    def _resolve_container(self, team_id: str, role: str = "prod") -> str:
+        """Map an exec identity (team_id, role) to a concrete container
+        name. Host-owned so the ExecPort never trusts a caller-supplied
+        container name (see facility/ports.py::ExecPort)."""
+        team = next((t for t in self.config.topology.teams if t.id == team_id), None)
+        if team is None:
+            raise KeyError(f"_resolve_container: unknown team_id {team_id!r}")
+        name = {"prod": team.prod, "dev": team.dev}.get(role)
+        if not name:
+            raise KeyError(
+                f"_resolve_container: no {role!r} container for team {team_id!r}"
+            )
+        return name

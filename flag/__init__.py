@@ -7,7 +7,8 @@ Two pieces:
   * `FlagServer` — orchestration over the store. Plants flags into
     challenge containers (SERVICE_PROTOCOL via adapter, FILE_AT_PATH
     via docker exec), runs per-round rotation, verifies submissions
-    and records FLAG_PLANTED / FLAG_SUBMITTED on the Timeline.
+    and records FLAG_PLANTED / FLAG_SUBMITTED via its FacilityContext
+    event sink.
 
 GameMgr keeps the public surface (`plant_initial_flags`, `plant_flags`,
 `submit_flag`, `flags` property) but delegates all logic to FlagServer.

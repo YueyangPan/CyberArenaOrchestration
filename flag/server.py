@@ -4,14 +4,16 @@ Independent facility consumed by GameMgr. Plant goes through
 `Challenge.flag_handler.plant(target, flag)`; FlagServer doesn't know
 the per-challenge mechanism.
 
-Dependencies (injected at construction):
-  timeline           — receives FLAG_PLANTED / FLAG_SUBMITTED records
+Dependencies:
+  ctx                — FacilityContext: `ctx.events` receives
+                       FLAG_PLANTED / FLAG_SUBMITTED records, `ctx.status`
+                       supplies round/phase for stamping + phase gating
   challenge_by_owner — (team, service) -> Challenge; mutable dict
                        reference, populated by GameMgr.deploy_challenges
   target_factory     — (team_id, challenge) -> VulboxTarget; typically
                        GameMgr.target_for, so FlagServer doesn't need
-                       to know about topology
-  status_resolver    — () -> {round, phase} for FLAG_SUBMITTED stamping
+                       to know about topology. The target's exec callable
+                       is itself backed by `ctx.exec`.
 """
 
 from __future__ import annotations
@@ -20,30 +22,28 @@ import logging
 from typing import Callable
 
 from challenges.interface import Challenge, VulboxTarget
+from facility import Facility, FacilityContext
 from gamemgr.events import EventType
-from gamemgr.timeline import Timeline
 
 from .store import FlagStore, SubmitResult, new_flag
 
 log = logging.getLogger(__name__)
 
 TargetFactory = Callable[[str, Challenge], VulboxTarget]
-StatusResolver = Callable[[], dict]
 
 
-class FlagServer:
+class FlagServer(Facility):
     def __init__(
         self,
-        timeline: Timeline,
+        ctx: FacilityContext,
         *,
         challenge_by_owner: dict[tuple[str, str], Challenge],
         target_factory: TargetFactory,
-        status_resolver: StatusResolver,
     ) -> None:
-        self.timeline = timeline
+        self._events = ctx.events
+        self._status = ctx.status
         self._challenge_by_owner = challenge_by_owner
         self._target = target_factory
-        self._status = status_resolver
         self.store = FlagStore()
         # Handle returned by the most recent plant per (team, service).
         # Reserved for future retrieve() paths (own-team verify, attack
@@ -52,6 +52,10 @@ class FlagServer:
         # Idempotency guard for rotate(): a re-entry on the same round
         # must not re-plant (defensive against any caller firing twice).
         self._last_planted_round: int = -1
+
+    @property
+    def name(self) -> str:
+        return "flag"
 
     # ── planting ────────────────────────────────────────────────────────
 
@@ -90,7 +94,7 @@ class FlagServer:
             return
         planted = self.plant_flags(round_id=round_id)
         for team_id, service_name, _flag in planted:
-            self.timeline.record(
+            self._events.record(
                 EventType.FLAG_PLANTED,
                 team_id=team_id,
                 round_id=round_id,
@@ -109,13 +113,13 @@ class FlagServer:
         FlagStore is consulted, so a confused defense agent doesn't
         burn its DUPLICATE slot for the next ATTACK retry.
         """
-        st = self._status()
+        st = self._status.status()
         phase = (st.get("phase") or "").upper()
         if phase == "DEFENSE":
             result = SubmitResult(accepted=False, reason="WRONG_PHASE")
         else:
             result = self.store.submit(team_id, flag)
-        self.timeline.record(
+        self._events.record(
             EventType.FLAG_SUBMITTED,
             team_id=team_id,
             round_id=st.get("round", 0),
@@ -138,7 +142,7 @@ class FlagServer:
         at round_id=0. Used by GameMgr.emit_setup_events for the pre-loop
         snapshot the panel reads when it boots."""
         for (team_id, service_name) in self.store.planted.keys():
-            self.timeline.record(
+            self._events.record(
                 EventType.FLAG_PLANTED,
                 team_id=team_id,
                 round_id=0,

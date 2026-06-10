@@ -77,6 +77,24 @@ def test_events_route_is_json_array(app_client):
     assert isinstance(body, list)   # empty pre-start, but valid JSON
 
 
+def test_events_stream_closes_when_shutting_down():
+    """The /events/stream WS must return (close) once shutdown is signalled,
+    instead of blocking forever — otherwise it stalls uvicorn's graceful
+    drain at end-of-match. Here shutdown is pre-set, so the handler should
+    close promptly rather than hang on queue.get()."""
+    from fastapi import WebSocketDisconnect
+
+    cfg = load_game_config(CONFIG)
+    game = GameMgr(config=cfg, orchestrator=Orchestrator(graph=cfg.topology))
+    shutdown = asyncio.Event()
+    shutdown.set()
+    client = TestClient(build_app(game, shutdown))
+
+    with client.websocket_connect("/events/stream") as ws:
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
 # ── layer 3: real chrome render (skipped if chrome absent) ──
 
 

@@ -291,3 +291,68 @@ def test_kill_process_is_best_effort_swallows_exceptions():
 
     # Should not raise.
     backend.kill_process(_handle(), "claude -p")
+
+
+# ── kill_session: env-marker reap (group-independent) ─────────────────
+
+
+def _backend_with_kill_output(output: bytes):
+    container = MagicMock()
+    container.exec_run.return_value = MagicMock(output=output)
+    client = MagicMock()
+    client.containers.get.return_value = container
+    return DockerExecBackend(client=client), container
+
+
+def test_kill_session_script_does_pgid_then_environ_scan_and_reverify():
+    backend, container = _backend_with_kill_output(b"KILLED= 4242\nREMAIN=\n")
+    backend.kill_session(_handle(), "deadbeef0001")
+
+    argv = container.exec_run.call_args.args[0]
+    assert argv[:2] == ["sh", "-c"]
+    script = argv[2]
+    # (1) PGID best-effort from the pidfile.
+    assert "/tmp/cyberarena_phase_deadbeef0001.pid" in script
+    assert "kill -KILL -- -" in script
+    # (2) env-marker scan over /proc + SIGKILL by PID.
+    assert "/proc/[0-9]*" in script
+    assert "/environ" in script
+    assert "CYBERARENA_PHASE=deadbeef0001" in script
+    assert "kill -KILL \"$pid\"" in script
+    # (3) re-scan readout for the host.
+    assert "KILLED=" in script and "REMAIN=" in script
+
+
+def test_kill_session_clean_reap_is_quiet(caplog):
+    # Killed a pid, nothing remains carrying the marker.
+    backend, _ = _backend_with_kill_output(b"KILLED= 4242\nREMAIN=\n")
+    with caplog.at_level("WARNING", logger="agents.transport_docker"):
+        backend.kill_session(_handle(), "aaaa00000000")
+    assert not caplog.records, [r.getMessage() for r in caplog.records]
+
+
+def test_kill_session_quiet_when_nothing_matched(caplog):
+    # Agent already exited in the gap → no pids killed, none remain.
+    backend, _ = _backend_with_kill_output(b"KILLED=\nREMAIN=\n")
+    with caplog.at_level("WARNING", logger="agents.transport_docker"):
+        backend.kill_session(_handle(), "bbbb00000000")
+    assert not caplog.records, [r.getMessage() for r in caplog.records]
+
+
+def test_kill_session_errors_when_marker_survives(caplog):
+    """The real failure signal: a process still carries the marker after
+    SIGKILL → the reap genuinely failed. Must ERROR, not pass silently."""
+    backend, _ = _backend_with_kill_output(b"KILLED= 4242\nREMAIN= 4242 4243\n")
+    with caplog.at_level("ERROR", logger="agents.transport_docker"):
+        backend.kill_session(_handle(), "cccc00000000")
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "STILL alive" in msg and "4242 4243" in msg
+
+
+def test_kill_session_swallows_docker_exception(caplog):
+    client = MagicMock()
+    client.containers.get.side_effect = RuntimeError("docker is down")
+    backend = DockerExecBackend(client=client)
+    # Should not raise.
+    backend.kill_session(_handle(), "dddd00000000")

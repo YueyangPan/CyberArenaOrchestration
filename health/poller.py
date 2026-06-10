@@ -18,6 +18,7 @@ import logging
 from dataclasses import dataclass
 
 from challenges.interface import Challenge, VulboxTarget
+from facility import Facility
 
 from .checker import HealthChecker
 
@@ -36,7 +37,7 @@ class PollTarget:
     interval_secs: float
 
 
-class HealthPoller:
+class HealthPoller(Facility):
     def __init__(self, checker: HealthChecker, targets: list[PollTarget]) -> None:
         self.checker = checker
         self.targets = targets
@@ -44,6 +45,10 @@ class HealthPoller:
         # cancelled on on_attack_exit / stop.
         self._tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._running = False
+
+    @property
+    def name(self) -> str:
+        return "health"
 
     def on_attack_enter(self, round_id: int) -> list[asyncio.Task]:
         """Fire one immediate probe per target (fire-and-forget), then
@@ -56,7 +61,7 @@ class HealthPoller:
 
         immediate: list[asyncio.Task] = []
         for t in self.targets:
-            immediate.append(asyncio.create_task(self._safe_run(t)))
+            immediate.append(asyncio.create_task(self._safe_run(t, trigger="attack_enter")))
             self._tasks[(t.team_id, t.service)] = asyncio.create_task(
                 self._periodic_loop(t)
             )
@@ -83,21 +88,34 @@ class HealthPoller:
                 team_id, service,
             )
             return
-        await self._safe_run(target)
+        await self._safe_run(target, trigger="restart")
 
     async def stop(self) -> None:
         """Cancel everything. Safe to call multiple times."""
         self.on_attack_exit()
 
     async def _periodic_loop(self, target: PollTarget) -> None:
+        """Fixed-rate poll: probes land on a stable `start + n·interval`
+        grid regardless of how long each probe takes, so the cadence
+        doesn't drift by the probe duration. A probe that overruns a whole
+        interval skips the missed tick(s) rather than bursting to catch up.
+        """
+        loop = asyncio.get_running_loop()
+        next_at = loop.time() + target.interval_secs
         try:
             while True:
-                await asyncio.sleep(target.interval_secs)
-                await self._safe_run(target)
+                delay = next_at - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await self._safe_run(target, trigger="periodic")
+                next_at += target.interval_secs
+                now = loop.time()
+                while next_at <= now:  # skip missed ticks if a probe overran
+                    next_at += target.interval_secs
         except asyncio.CancelledError:
             return
 
-    async def _safe_run(self, target: PollTarget) -> None:
+    async def _safe_run(self, target: PollTarget, *, trigger: str) -> None:
         """Log exceptions instead of propagating so one bad probe
         doesn't kill the periodic task."""
         try:
@@ -106,6 +124,7 @@ class HealthPoller:
                 service=target.service,
                 target=target.target,
                 challenge=target.challenge,
+                trigger=trigger,
             )
         except asyncio.CancelledError:
             raise

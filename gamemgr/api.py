@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from .events import Event
 from .game_mgr import GameMgr
 from .mcp_server import MCP_MOUNT_PATH, MCP_PUBLIC_ENDPOINT, build_mcp_app
+from .transcripts import collect_transcripts
 
 PANEL_HTML_PATH = Path(__file__).parent.parent / "panel" / "panel.html"
 
@@ -54,6 +55,21 @@ def build_app(game: GameMgr, shutdown_event: asyncio.Event) -> FastAPI:
     async def rounds():
         st = game.status()
         return {"current_round": st["round"], "total_rounds": st["total_rounds"]}
+
+    @app.get("/game/agents")
+    async def agents() -> dict[str, Any]:
+        """Parsed agent stream-json transcripts for the current run,
+        grouped by team → round → phase. Read live from the run's
+        artifact dir; empty until the first phase completes (transcripts
+        are written at phase end by record_phase_done). Carries full
+        agent output — tool commands, reasoning, flag strings — so it
+        shares the panel's open posture and is not flag-redacted."""
+        if game.run_dir is None:
+            return {"run": None, "transcripts": []}
+        return {
+            "run": game.run_dir.name,
+            "transcripts": collect_transcripts(game.run_dir),
+        }
 
     @app.get("/game/events")
     async def events(since: float | None = None) -> list[dict[str, Any]]:
@@ -98,15 +114,34 @@ def build_app(game: GameMgr, shutdown_event: asyncio.Event) -> FastAPI:
         # attach_stream gives this connection its own queue; record() fans
         # out via put_nowait so a slow client cannot back-pressure the game.
         queue = game.timeline.attach_stream()
+        # Race each receive against shutdown_event so this long-lived stream
+        # CLOSES promptly when the server is winding down. Without it the
+        # handler blocks on queue.get() forever, stalling uvicorn's graceful
+        # drain → force_exit → a CancelledError logged from the cancelled
+        # lifespan/MCP task on an otherwise-clean end-of-match.
+        stopper = asyncio.ensure_future(shutdown_event.wait())
         try:
             for past in game.timeline.history():
                 await websocket.send_json(asdict(past))
-            while True:
-                event = await queue.get()
-                await websocket.send_json(asdict(event))
-        except WebSocketDisconnect:
+            while not shutdown_event.is_set():
+                getter = asyncio.ensure_future(queue.get())
+                done, _pending = await asyncio.wait(
+                    {getter, stopper}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if stopper in done:
+                    getter.cancel()
+                    break
+                await websocket.send_json(asdict(getter.result()))
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            # Client closed, or the server force-cancelled this stream —
+            # both are clean exits, not errors.
             pass
         finally:
+            stopper.cancel()
             game.timeline.detach_stream(queue)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     return app

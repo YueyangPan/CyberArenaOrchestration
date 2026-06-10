@@ -28,6 +28,20 @@ log = logging.getLogger("main")
 
 DEFAULT_CONFIG = Path(__file__).parent / "config" / "game.yaml"
 
+
+class _DropAccessPaths(logging.Filter):
+    """Drop uvicorn access-log lines for high-frequency poll endpoints (the
+    panel's /game/agents transcript poll) to keep the log readable. Other
+    requests — MCP tool calls, flag submits — still log normally."""
+
+    def __init__(self, *needles: str) -> None:
+        super().__init__()
+        self._needles = needles
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(n in msg for n in self._needles)
+
 # Pre-R1 dry-run readiness probe. Sent as the prompt to a tiny one-turn
 # claude invocation per team before the round loop starts. Body kept
 # minimal: success path is one MCP call. Failure path doesn't need the
@@ -90,31 +104,47 @@ def main(argv: list[str] | None = None) -> int:
 
 
 async def _run_start(args) -> int:
-    cfg = load_game_config(args.config)
-    # Build challenge images before Orchestrator.setup() — same reason
-    # as the `setup` subcommand path.
-    _build_challenge_images(args.config)
-    orch = Orchestrator(graph=cfg.topology)
-    orch.setup()
+    from challenges.registry import build_images
 
+    cfg = load_game_config(args.config)
+    orch = Orchestrator(graph=cfg.topology)
     game = GameMgr(config=cfg, orchestrator=orch)
-    game.deploy_challenges()
-    game.plant_initial_flags()
 
     # Persistent-memory v1: install once pre-loop, run_phase per phase.
-    # Wires install + defense/attack kickoff handlers on game; the
-    # install handler runs inside game.start() (after the timeline file sink is attached)
-    # via game.install_all_agents().
+    # Wires install + defense/attack kickoff handlers on game.
     _wire_phase_kickoffs(game)
 
+    # Open the run + bring the API server up BEFORE the arena bring-up so
+    # the live panel can connect and stream the bring-up events.
+    game.begin_run()
     shutdown = asyncio.Event()
     app = build_app(game, shutdown)
-
     uv_config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
     server = uvicorn.Server(uv_config)
+    # Keep the panel's recurring transcript poll out of the access log.
+    logging.getLogger("uvicorn.access").addFilter(_DropAccessPaths("/game/agents"))
+    server_task = asyncio.create_task(server.serve(), name="uvicorn")
+
+    # Arena bring-up. The steps are blocking (docker / image builds), so
+    # run each in a thread executor to keep the event loop free to serve
+    # the panel; emit the per-step events from the loop thread afterwards
+    # (Timeline.record is not thread-safe). build_images is idempotent
+    # (cached tags skip), so on a warm host this is near-instant.
+    loop = asyncio.get_running_loop()
+    tags = await loop.run_in_executor(None, build_images, cfg)
+    for tag in tags:
+        game.record_image_built(tag)
+    await loop.run_in_executor(None, orch.setup)
+    for node in cfg.topology.nodes:
+        game.record_container_ready(node)
+    await loop.run_in_executor(None, game.deploy_challenges)
+    await loop.run_in_executor(None, game.plant_initial_flags)
+    game.emit_setup_events()          # SERVICE_DEPLOYED + FLAG_PLANTED (round 0)
+    game._build_health_facility()
+    game.record_facilities_ready()    # FACILITY_READY (flag, health)
+    game.record_setup_complete()
 
     loop_task = asyncio.create_task(game.start(), name="round-loop")
-    server_task = asyncio.create_task(server.serve(), name="uvicorn")
 
     def _signal_handler():
         shutdown.set()
@@ -147,26 +177,40 @@ async def _run_start(args) -> int:
         except Exception:
             log.exception("failed to write panel snapshot")
 
+    # Signal the long-lived panel WebSocket(s) to close so uvicorn's graceful
+    # drain can actually complete. On a natural end-of-game (loop_task done)
+    # `shutdown` was never set; setting it now lets /events/stream return
+    # instead of blocking on queue.get() forever — without this the drain
+    # times out, we force_exit, and uvicorn logs a CancelledError from the
+    # cancelled lifespan/MCP task even though the match ended cleanly.
+    shutdown.set()
+
     # Tell uvicorn to wind down. `should_exit` triggers graceful shutdown
-    # (drains in-flight requests + closes idle keep-alives), but it can
-    # hang indefinitely on long-lived streams — panel WebSockets and the
-    # MCP StreamableHTTP SSE sessions are both "long-lived" by design.
-    # Escalate to `force_exit` (drops connections) after a short grace,
-    # then to outright task cancellation if even that doesn't fire.
+    # (drains in-flight requests + closes idle keep-alives). With the WS
+    # streams now closing on `shutdown`, this normally completes well within
+    # the grace; force_exit below is the belt-and-suspenders for any other
+    # long-lived stream (e.g. a lingering MCP SSE session).
+    # Note: force_exit makes uvicorn's serve() finish by raising
+    # CancelledError, so every wait below must catch CancelledError as well
+    # as TimeoutError — otherwise it escapes _run_start and asyncio.run
+    # dumps the whole stack on an otherwise-clean shutdown.
     server.should_exit = True
     try:
         await asyncio.wait_for(server_task, timeout=10)
-    except asyncio.TimeoutError:
-        log.warning("uvicorn didn't exit within 10s; setting force_exit")
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        log.warning(
+            "uvicorn didn't exit within 10s (a live panel WebSocket / MCP SSE "
+            "session is still open); forcing exit"
+        )
         server.force_exit = True
         try:
             await asyncio.wait_for(server_task, timeout=5)
-        except asyncio.TimeoutError:
-            log.error("uvicorn force_exit also stalled; cancelling task")
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            log.warning("uvicorn force_exit didn't settle in 5s; cancelling the server task")
             server_task.cancel()
             try:
                 await server_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
 
     if not loop_task.done():

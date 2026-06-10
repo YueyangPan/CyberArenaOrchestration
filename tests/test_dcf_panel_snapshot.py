@@ -12,15 +12,19 @@ import json
 from gamemgr.panel_snapshot import write_snapshot
 
 
-def _read_events_from_snapshot(html: str) -> list[dict]:
-    """Parse the INITIAL_EVENTS = [...] payload back out of a snapshot."""
-    needle = "window.INITIAL_EVENTS = "
+def _read_var_from_snapshot(html: str, var: str) -> list[dict]:
+    """Parse a `window.<var> = [...];` payload back out of a snapshot.
+    The payload is single-line JSON (json.dumps escapes any newline), so
+    the statement's own `;\\n` is an unambiguous terminator."""
+    needle = f"window.{var} = "
     start = html.index(needle) + len(needle)
-    end = html.index(";\n</script>", start)
-    raw = html[start:end]
-    # Reverse the </ → <\/ escape we applied at write time.
-    raw = raw.replace("<\\/", "</")
+    end = html.index(";\n", start)
+    raw = html[start:end].replace("<\\/", "</")  # reverse the </ → <\/ escape
     return json.loads(raw)
+
+
+def _read_events_from_snapshot(html: str) -> list[dict]:
+    return _read_var_from_snapshot(html, "INITIAL_EVENTS")
 
 
 def test_write_snapshot_creates_panel_html_with_embedded_events(tmp_path):
@@ -43,6 +47,34 @@ def test_write_snapshot_creates_panel_html_with_embedded_events(tmp_path):
     assert len(events) == 2
     assert events[0]["type"] == "ROUND_START"
     assert events[1]["type"] == "PHASE_CHANGE"
+
+
+def test_write_snapshot_embeds_transcripts(tmp_path):
+    """The offline snapshot inlines parsed agent transcripts (window.
+    INITIAL_TRANSCRIPTS) so it shows the same card stack as the live
+    panel — not just the timeline."""
+    (tmp_path / "events.jsonl").write_text(
+        '{"id": "a", "ts": 1.0, "type": "ROUND_START", "team_id": null, "round_id": 1, "phase": "INIT", "payload": {}}\n'
+    )
+    stream = tmp_path / "artifacts" / "team1" / "round-1" / "stream-defense.jsonl"
+    stream.parent.mkdir(parents=True)
+    stream.write_text(
+        '{"type":"system","subtype":"init","model":"m","tools":["Bash"]}\n'
+        '{"type":"assistant","message":{"usage":{"input_tokens":5,"output_tokens":1},'
+        '"content":[{"type":"text","text":"hi"}]}}\n'
+    )
+
+    html = write_snapshot(tmp_path).read_text()
+    transcripts = _read_var_from_snapshot(html, "INITIAL_TRANSCRIPTS")
+    assert len(transcripts) == 1
+    assert (transcripts[0]["team_id"], transcripts[0]["round_id"], transcripts[0]["phase"]) == ("team1", 1, "defense")
+    assert [e["kind"] for e in transcripts[0]["events"]] == ["system", "text"]
+
+
+def test_write_snapshot_embeds_empty_transcripts_when_no_artifacts(tmp_path):
+    (tmp_path / "events.jsonl").write_text("")
+    html = write_snapshot(tmp_path).read_text()
+    assert _read_var_from_snapshot(html, "INITIAL_TRANSCRIPTS") == []
 
 
 def test_write_snapshot_handles_missing_events_file(tmp_path):

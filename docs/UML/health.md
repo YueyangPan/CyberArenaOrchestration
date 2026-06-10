@@ -5,10 +5,14 @@
 - **`HealthChecker`** — thin wrapper that runs
   `challenge.functionality_test.run(target)` in a thread executor,
   walks the returned `CheckResult` tree, and emits one
-  `SERVICE_HEALTH_CHECK` per leaf on the Timeline. Stateless; the
-  status resolver (round + phase stamping) is the only injected dep.
+  `SERVICE_HEALTH_CHECK` per leaf. Stateless; takes a `FacilityContext`
+  and uses `ctx.events` (records) + `ctx.status` (round/phase stamping).
+  Each event carries a `trigger` (`periodic` / `attack_enter` /
+  `restart`) so off-cadence one-shots are distinguishable from periodic
+  ticks.
 
-- **`HealthPoller`** — periodic scheduler. Driven by GameMgr at phase
+- **`HealthPoller`** — periodic scheduler and the health `Facility`
+  (`name="health"`, overrides `stop()`). Driven by GameMgr at phase
   boundaries; does not subscribe to anything. Owns per-target periodic
   tasks (one per (team, defense-capable service)). Also exposes
   `trigger_now(team, service)` for the restart-post one-shot probe.
@@ -22,12 +26,13 @@ checker only knows to call `challenge.functionality_test.run(target)`.
 ```mermaid
 classDiagram
   class HealthChecker {
-    -timeline: Timeline
-    -_status: StatusResolver
-    +run(*, team_id, service, target, challenge) CheckResult
+    -_events: EventSink
+    -_status: StatusPort
+    +run(*, team_id, service, target, challenge, trigger) CheckResult
   }
 
   class HealthPoller {
+    +name: str = "health"
     +checker: HealthChecker
     +targets: list~PollTarget~
     -_tasks: dict
@@ -58,7 +63,7 @@ classDiagram
   HealthPoller "1" *-- "1" HealthChecker : uses
   HealthPoller "1" o-- "*" PollTarget : polls
   HealthChecker ..> Challenge : runs functionality_test
-  HealthChecker ..> Timeline : records SERVICE_HEALTH_CHECK per leaf
+  HealthChecker ..> EventSink : records SERVICE_HEALTH_CHECK per leaf
   HealthChecker ..> HealthLevel : convention for leaf names
 ```
 
@@ -68,19 +73,37 @@ classDiagram
 stateDiagram-v2
   [*] --> Idle
   Idle --> Polling : enter_attack_phase\non_attack_enter(round_id)
-  Polling --> Polling : every interval_secs\n→ checker.run
+  Polling --> Polling : fixed-rate tick\n→ checker.run (trigger=periodic)
   Polling --> Idle : enter_defense_phase\non_attack_exit()
   Polling --> Idle : on_game_end / stop()
   note right of Polling
-    immediate probe per target on entry
-    then per-target periodic task:
-    while True: sleep(interval); run()
+    on entry: one immediate probe per target (trigger=attack_enter)
+    then a fixed-rate poll per target (trigger=periodic):
+    probes land on start + n·interval, NOT interval+probe_duration,
+    so the cadence doesn't drift; a probe that overruns an
+    interval skips the missed tick(s) rather than bursting
   end note
 ```
 
 `trigger_now` is allowed in **either** state — used by `_run_restart_job`
 in `GameMgr` to surface a fresh check right after a successful restart,
-even during DEFENSE.
+even during DEFENSE. That probe is tagged `trigger="restart"`.
+
+### Trigger tagging
+
+Every `SERVICE_HEALTH_CHECK` carries a `trigger` in its payload:
+
+| trigger | source | on the poll grid? |
+|---|---|---|
+| `periodic` | the fixed-rate poll loop | yes |
+| `attack_enter` | the one immediate probe at ATTACK entry | no (t≈0 of ATTACK) |
+| `restart` | `trigger_now`, post-`restart_service` | no (whenever the restart finished) |
+
+The two one-shots land off the periodic grid **by design** (a probe is
+wanted at attack entry and right after a restart). The tag is how a
+reader — and the panel, which draws off-cadence probes as a diamond
+(periodic ticks are circles) — tells an intentional one-shot from a
+drifting periodic tick.
 
 ## Configuration
 
@@ -103,7 +126,7 @@ even during DEFENSE.
 ## What it does NOT do
 
 - **Does not subscribe to anything.** GameMgr drives all entry/exit;
-  the poller has no Timeline / pub-sub coupling beyond `record()`.
+  the checker has no event coupling beyond `ctx.events.record()`.
 - **Does not run during DEFENSE.** `on_attack_exit` cancels all tasks
   on every DEFENSE entry; `trigger_now` is the only DEFENSE-time path.
 - **Does not deduplicate** a `trigger_now` racing the periodic loop.

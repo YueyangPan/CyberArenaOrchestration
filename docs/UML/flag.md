@@ -9,7 +9,9 @@
 - **`FlagServer`** — orchestration over the store. Plants flags via
   the per-challenge `FlagHandler.plant(target, flag)`, runs per-round
   rotation, verifies submissions, and records `FLAG_PLANTED` /
-  `FLAG_SUBMITTED` on the Timeline.
+  `FLAG_SUBMITTED`. A `Facility` (`name="flag"`) that talks to its host
+  through a `FacilityContext` — `ctx.events` for records, `ctx.status`
+  for round/phase. See [facility.md](facility.md).
 
 GameMgr keeps the public surface (`plant_initial_flags`, `plant_flags`,
 `submit_flag`, `flags`) and delegates every call to FlagServer.
@@ -37,11 +39,12 @@ classDiagram
   }
 
   class FlagServer {
-    +timeline: Timeline
+    +name: str = "flag"
     +store: FlagStore
+    -_events: EventSink
+    -_status: StatusPort
     -_challenge_by_owner: dict
     -_target: TargetFactory
-    -_status: StatusResolver
     -_handles: dict
     -_last_planted_round: int
     +plant_initial_flags() list
@@ -54,7 +57,8 @@ classDiagram
   FlagServer "1" *-- "1" FlagStore : owns
   FlagStore ..> SubmitResult : returns
   FlagServer ..> Challenge : delegates to flag_handler
-  FlagServer ..> Timeline : records FLAG_PLANTED / FLAG_SUBMITTED
+  FlagServer ..> EventSink : records FLAG_PLANTED / FLAG_SUBMITTED
+  FlagServer ..> StatusPort : round/phase for stamping + gating
 ```
 
 ## Plant dispatch
@@ -124,4 +128,4 @@ sequenceDiagram
 |---|---|
 | `flag/__init__.py` | re-exports `FlagServer`, `FlagStore`, `SubmitResult`, `new_flag` |
 | `flag/store.py` | `FlagStore` + `SubmitResult` + `new_flag` (state + decision logic) |
-| `flag/server.py` | `FlagServer` (plant/rotate/submit + timeline records) |
+| `flag/server.py` | `FlagServer` (plant/rotate/submit; records via `ctx.events`) |
