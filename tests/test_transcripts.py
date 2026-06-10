@@ -132,6 +132,22 @@ def test_collect_no_artifacts_dir_returns_empty(tmp_path):
     assert collect_transcripts(tmp_path) == []
 
 
+def test_collect_transcripts_caches_then_invalidates_on_change(tmp_path):
+    """A poll with no file change reuses the parsed result (same object);
+    a new/changed stream file invalidates the cache and re-parses."""
+    arts = tmp_path / "artifacts"
+    _write_stream(arts / "team1" / "round-1" / "stream-defense.jsonl", [_SYSTEM])
+    out1 = collect_transcripts(tmp_path)
+    assert len(out1) == 1
+    # Unchanged → cache hit returns the very same object (no re-parse).
+    assert collect_transcripts(tmp_path) is out1
+    # New file → signature changes → re-parse, now reflects both.
+    _write_stream(arts / "team1" / "round-1" / "stream-attack.jsonl", [_TOOL_OK])
+    out2 = collect_transcripts(tmp_path)
+    assert len(out2) == 2
+    assert out2 is not out1
+
+
 # ── /game/agents endpoint ──────────────────────────────────────────────
 
 

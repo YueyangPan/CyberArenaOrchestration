@@ -176,6 +176,12 @@ _ROUND_RE = re.compile(r"^round-(?P<round>\d+)$")
 # put "attack" before "defense". Rank so transcripts list chronologically.
 _PHASE_RANK = {"defense": 0, "attack": 1}
 
+# Parsed-result cache keyed by run dir → ((path, mtime_ns, size) signature,
+# transcripts). The panel polls collect_transcripts every few seconds and
+# transcripts are append-once at phase end, so most polls hit the cache and
+# skip re-reading/parsing thousands of JSONL lines.
+_CACHE: dict[str, tuple[tuple, list[dict]]] = {}
+
 
 def collect_transcripts(run_dir: Path | str) -> list[dict]:
     """Walk `runs/<ts>/artifacts/<team>/round-<N>/stream-<phase>.jsonl`
@@ -185,8 +191,24 @@ def collect_transcripts(run_dir: Path | str) -> list[dict]:
     root = Path(run_dir) / "artifacts"
     if not root.is_dir():
         return []
+    paths = sorted(root.glob("*/round-*/stream-*.jsonl"))
+
+    # Cheap change-signature: stat (not read) each file. Re-parse only when
+    # a file appears or changes; otherwise return the cached result.
+    sig_list = []
+    for p in paths:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        sig_list.append((str(p), st.st_mtime_ns, st.st_size))
+    sig = tuple(sig_list)
+    cached = _CACHE.get(str(run_dir))
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+
     out: list[dict] = []
-    for stream_path in root.glob("*/round-*/stream-*.jsonl"):
+    for stream_path in paths:
         m = _STREAM_RE.match(stream_path.name)
         rm = _ROUND_RE.match(stream_path.parent.name)
         if not m or not rm:
@@ -202,4 +224,5 @@ def collect_transcripts(run_dir: Path | str) -> list[dict]:
             "events": [asdict(e) for e in events],
         })
     out.sort(key=lambda t: (t["team_id"], t["round_id"], _PHASE_RANK.get(t["phase"], 99)))
+    _CACHE[str(run_dir)] = (sig, out)
     return out

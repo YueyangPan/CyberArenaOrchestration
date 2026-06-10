@@ -28,6 +28,20 @@ log = logging.getLogger("main")
 
 DEFAULT_CONFIG = Path(__file__).parent / "config" / "game.yaml"
 
+
+class _DropAccessPaths(logging.Filter):
+    """Drop uvicorn access-log lines for high-frequency poll endpoints (the
+    panel's /game/agents transcript poll) to keep the log readable. Other
+    requests — MCP tool calls, flag submits — still log normally."""
+
+    def __init__(self, *needles: str) -> None:
+        super().__init__()
+        self._needles = needles
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(n in msg for n in self._needles)
+
 # Pre-R1 dry-run readiness probe. Sent as the prompt to a tiny one-turn
 # claude invocation per team before the round loop starts. Body kept
 # minimal: success path is one MCP call. Failure path doesn't need the
@@ -107,6 +121,8 @@ async def _run_start(args) -> int:
     app = build_app(game, shutdown)
     uv_config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
     server = uvicorn.Server(uv_config)
+    # Keep the panel's recurring transcript poll out of the access log.
+    logging.getLogger("uvicorn.access").addFilter(_DropAccessPaths("/game/agents"))
     server_task = asyncio.create_task(server.serve(), name="uvicorn")
 
     # Arena bring-up. The steps are blocking (docker / image builds), so
