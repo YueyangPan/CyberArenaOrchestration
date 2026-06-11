@@ -53,7 +53,7 @@ ExecResult(exit_code, stdout, stderr="", timed_out=False)
 
 Challenge handlers consume `target.meta["exec_in_container"]`, contracted as
 `(container_name, cmd) -> (rc, output)` in
-[`challenges/interface/probe.py`](UML/challenges.md). That's a public
+[`challenges/interface/probe.py`](../UML/challenges.md). That's a public
 challenge-author interface and is byte-frozen. So `ExecPort` is a *separate*
 boundary primitive; `GameMgr.target_for` injects a thin shim that adapts
 `ExecPort` → the tuple callable:
@@ -143,4 +143,4 @@ endpoints above.
 | `facility/adapters_local.py` | `LocalStatusPort` / `LocalEventSink` / `LocalExecPort` |
 | `facility/__init__.py` | package re-exports |
 
-See [UML/facility.md](UML/facility.md) for the live class/sequence diagrams.
+See [UML/facility.md](../UML/facility.md) for the live class/sequence diagrams.

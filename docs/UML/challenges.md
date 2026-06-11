@@ -20,7 +20,7 @@ and DEFCON `nautilus-ico` (full attack + defense workflow).
 > and [`challenges/nautilus_ico/`](../../challenges/nautilus_ico/) drive
 > all flag / health / restart paths. The v1 `ChallengeSource` /
 > `ChallengeSpec` / `FlagMechanism` / `Service` layer is deleted; see
-> [docs/challenge_interface_v2_plan.md](../challenge_interface_v2_plan.md)
+> [docs/archived/challenge_interface_v2_plan.md](../archived/challenge_interface_v2_plan.md)
 > for the staged history.
 
 ## Class diagram

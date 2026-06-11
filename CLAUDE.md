@@ -6,16 +6,16 @@ All design lives in [docs/](docs/). Read the relevant doc before changing relate
 
 **Current (load-bearing):**
 
-- [docs/design_v1.7.md](docs/design_v1.7.md) — overall system design
-- [docs/challenge_interface_v2_plan.md](docs/challenge_interface_v2_plan.md) — Challenge interface v2 (shipped 2026-06-03): per-challenge `Challenge` ABC (VulboxImage + FunctionalityTest + FlagHandler + RestartHandler + ChallengeDocs) under `challenges/<name>/`. Live design lives in [docs/UML/challenges.md](docs/UML/challenges.md).
-- [docs/persistent_memory_agent_plan_v1.md](docs/persistent_memory_agent_plan_v1.md) — install once, `claude -p --continue` per phase via `AgentTransport`
-- [docs/facility_abstraction_plan_v1.md](docs/facility_abstraction_plan_v1.md) — Facility boundary (Phase 1 shipped 2026-06-09): FlagServer/HealthPoller talk to GameMgr through three ports (`StatusPort`/`EventSink`/`ExecPort`) bundled in a `FacilityContext`, in-process today, container-ready. Live design in [docs/UML/facility.md](docs/UML/facility.md). Phases 2–3 (HTTP ingest/exec API, container scaffolding) designed but not built.
 - [docs/CHALLENGE_AUTHORING_SOP.md](docs/CHALLENGE_AUTHORING_SOP.md) — SOP for collaborators packaging new challenges. Hand to outside contributors before they start.
 - [docs/RUN_SAMPLE_CHALLENGE.md](docs/RUN_SAMPLE_CHALLENGE.md) — End-to-end recipe for running the bundled DEF CON ico sample challenge from a blank Linux host. Tested on Amazon Linux 2023; works on Debian / Ubuntu with the same steps.
-- [docs/UML/overview.md](docs/UML/overview.md) — system-level UML; drills into [agent_manager.md](docs/UML/agent_manager.md) · [game_manager.md](docs/UML/game_manager.md) · [timeline.md](docs/UML/timeline.md) · [flag.md](docs/UML/flag.md) · [health.md](docs/UML/health.md) · [facility.md](docs/UML/facility.md) · [orchestrator.md](docs/UML/orchestrator.md) · [challenges.md](docs/UML/challenges.md)
+- [docs/UML/overview.md](docs/UML/overview.md) — system-level UML, **the live design**; drills into [agent_manager.md](docs/UML/agent_manager.md) · [game_manager.md](docs/UML/game_manager.md) · [timeline.md](docs/UML/timeline.md) · [flag.md](docs/UML/flag.md) · [health.md](docs/UML/health.md) · [facility.md](docs/UML/facility.md) · [orchestrator.md](docs/UML/orchestrator.md) · [challenges.md](docs/UML/challenges.md)
 
-**Archived** (superseded designs + per-milestone plans/reports, kept for lineage):
+**Archived** (superseded designs + per-milestone plans/reports, kept for lineage — the live design is the UML set above):
 
+- [docs/archived/design_v1.7.md](docs/archived/design_v1.7.md) — overall system design (plan snapshot; superseded by the UML set above).
+- [docs/archived/challenge_interface_v2_plan.md](docs/archived/challenge_interface_v2_plan.md) — Challenge interface v2 (shipped 2026-06-03): per-challenge `Challenge` ABC (VulboxImage + FunctionalityTest + FlagHandler + RestartHandler + ChallengeDocs) under `challenges/<name>/`. Live design in [docs/UML/challenges.md](docs/UML/challenges.md).
+- [docs/archived/persistent_memory_agent_plan_v1.md](docs/archived/persistent_memory_agent_plan_v1.md) — install once, `claude -p --continue` per phase via `AgentTransport`. Live design in [docs/UML/agent_manager.md](docs/UML/agent_manager.md).
+- [docs/archived/facility_abstraction_plan_v1.md](docs/archived/facility_abstraction_plan_v1.md) — Facility boundary (Phase 1 shipped 2026-06-09): FlagServer/HealthPoller talk to GameMgr through three ports (`StatusPort`/`EventSink`/`ExecPort`) bundled in a `FacilityContext`; Phases 2–3 designed, not built. Live design in [docs/UML/facility.md](docs/UML/facility.md).
 - [docs/archived/](docs/archived/) — `design_v1.md`, `design_v1.6.md`, per-milestone `m{1..6}_*_plan.md` / `_report.md` (M1 topology → M6 panel, incl. M4.5 MCP and M5.5 / M5.6), and the original `DEFCON_challenge_framework_plan_v1.md` / `_report_v1.md` (superseded by `challenge_interface_v2_plan.md`).
 
 ## Update Rule

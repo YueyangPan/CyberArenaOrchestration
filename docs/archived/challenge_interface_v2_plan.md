@@ -3,8 +3,8 @@
 > **Status: shipped 2026-06-03.** The v1 `ChallengeSource` /
 > `ChallengeSpec` / `FlagMechanism` / `Service` surface was deleted in
 > the same change. The live architecture lives in
-> [docs/UML/challenges.md](UML/challenges.md); contributor-facing
-> instructions live in [docs/CHALLENGE_AUTHORING_SOP.md](CHALLENGE_AUTHORING_SOP.md).
+> [docs/UML/challenges.md](../UML/challenges.md); contributor-facing
+> instructions live in [docs/CHALLENGE_AUTHORING_SOP.md](../CHALLENGE_AUTHORING_SOP.md).
 > This document is kept as a short record of what changed and why.
 
 ## Why v2
@@ -50,9 +50,9 @@ callable, not the handler code.
 ## After v2
 
 Adding a new challenge is one PR touching only `challenges/<snake>/`
-plus 2-4 lines in [`challenges/registry.py`](../challenges/registry.py).
+plus 2-4 lines in [`challenges/registry.py`](../../challenges/registry.py).
 Zero touches to `gamemgr/`, `flag/`, `health/`, or
 `agents/prompts/__init__.py`. That's the test of whether v2 worked.
 
-See [CHALLENGE_AUTHORING_SOP](CHALLENGE_AUTHORING_SOP.md) for the
+See [CHALLENGE_AUTHORING_SOP](../CHALLENGE_AUTHORING_SOP.md) for the
 contributor-facing instructions.

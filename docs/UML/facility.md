@@ -5,7 +5,7 @@ HealthPoller, …) and its host (GameMgr): three ports bundled in a
 `FacilityContext`, plus a thin `Facility` ABC. Stdlib-only; imports
 nothing from `gamemgr` / `flag` / `health`, so the boundary stays
 acyclic. Design rationale + the deferred Phase 2/3 lives in
-[../facility_abstraction_plan_v1.md](../facility_abstraction_plan_v1.md).
+[facility_abstraction_plan_v1.md](../archived/facility_abstraction_plan_v1.md).
 
 ## Class diagram
 

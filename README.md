@@ -5,7 +5,7 @@ networks + per-team containers, plants flags, runs an ATTACK/DEFENSE
 round loop, and drives LLM agents (Claude Code today) for both sides
 through an MCP channel.
 
-System design: [docs/design_v1.7.md](docs/design_v1.7.md). Writing a
+System design: [docs/archived/design_v1.7.md](docs/archived/design_v1.7.md). Writing a
 new challenge: [docs/CHALLENGE_AUTHORING_SOP.md](docs/CHALLENGE_AUTHORING_SOP.md).
 
 ## Repository layout

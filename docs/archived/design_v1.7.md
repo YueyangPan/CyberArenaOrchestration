@@ -1,9 +1,9 @@
 # Cyber Arena — System Design (v1.7)
 
 > Current system design. Supersedes
-> [design_v1.6.md](archived/design_v1.6.md); milestone-by-milestone
-> lineage lives under [archived/](archived/). The live architectural
-> diagrams live in [UML/](UML/).
+> [design_v1.6.md](design_v1.6.md); milestone-by-milestone
+> lineage lives under [archived/](./). The live architectural
+> diagrams live in [UML/](../UML/).
 
 ## What it is
 
@@ -23,7 +23,7 @@ live observation panel is at `http://localhost:8000/panel`.
 | `gamemgr/` | Round loop, `Timeline` (append-only telemetry), MCP server, REST API, panel server |
 | `flag/` | `FlagStore` (state + submit decision) + `FlagServer` (plant / rotate / submit verify) |
 | `health/` | `HealthChecker` (`CheckResult` tree probe) + `HealthPoller` (ATTACK-only periodic + on-demand) |
-| `challenges/` | Pluggable `Challenge` ABC; one directory per challenge. See [challenge_interface_v2_plan.md](challenge_interface_v2_plan.md) + [CHALLENGE_AUTHORING_SOP.md](CHALLENGE_AUTHORING_SOP.md). |
+| `challenges/` | Pluggable `Challenge` ABC; one directory per challenge. See [challenge_interface_v2_plan.md](challenge_interface_v2_plan.md) + [CHALLENGE_AUTHORING_SOP.md](../CHALLENGE_AUTHORING_SOP.md). |
 | `agents/` | Pluggable agent CLIs (Claude Code today); install once + `claude -p --continue` per phase via `AgentTransport`. See [persistent_memory_agent_plan_v1.md](persistent_memory_agent_plan_v1.md). |
 | `panel/` | Live SVG swim-lane UI; consumes Timeline via `attach_stream` |
 
@@ -96,7 +96,7 @@ user mid-fork) — that's owned by the challenge image.
 `<svc>` is the in-image service slug chosen by the challenge author
 (e.g. `ico`); it does not need to match either the snake-case
 directory or kebab-case `Challenge.name`. See
-[CHALLENGE_AUTHORING_SOP.md](CHALLENGE_AUTHORING_SOP.md) for the
+[CHALLENGE_AUTHORING_SOP.md](../CHALLENGE_AUTHORING_SOP.md) for the
 contributor-facing version of this layout.
 
 ## Event types

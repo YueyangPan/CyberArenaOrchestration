@@ -109,5 +109,5 @@ Two cross-cutting concerns:
 - [docs/UML/health.md](health.md) — HealthChecker + HealthPoller (per-challenge probe tree + ATTACK polling)
 - [docs/UML/orchestrator.md](orchestrator.md) — Docker / network lifecycle
 - [docs/UML/challenges.md](challenges.md) — pluggable challenge sources
-- [docs/persistent_memory_agent_plan_v1.md](../persistent_memory_agent_plan_v1.md) — design rationale for the agent layer
-- [docs/design_v1.7.md](../design_v1.7.md) — overall system design
+- [docs/archived/persistent_memory_agent_plan_v1.md](../archived/persistent_memory_agent_plan_v1.md) — design rationale for the agent layer
+- [docs/archived/design_v1.7.md](../archived/design_v1.7.md) — overall system design
