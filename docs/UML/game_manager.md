@@ -234,7 +234,7 @@ sequenceDiagram
 | `gamemgr/artifacts.py` | `ArtifactStore` + `ArtifactKind` |
 | `gamemgr/config.py` | `GameConfig` + `ChallengeConfig` + `RoundConfig` + YAML loader |
 | `gamemgr/api.py` | FastAPI `build_app(game, shutdown)` |
-| `gamemgr/mcp_server.py` | MCP tools (submit_flag, report_ready, restart_service, …) |
+| `gamemgr/mcp_server.py` | MCP tools (submit_flag, get_game_state, report_ready, report_deploy_complete, restart_service) — `get_game_state` is a read-only round/phase snapshot wrapping `GameMgr.status()` (same data as REST `GET /game/status`) |
 | `gamemgr/panel_snapshot.py` | `write_snapshot(run_dir)` |
 | `health/checker.py` | `HealthChecker` — runs the challenge's `FunctionalityTest`, emits one event per `CheckResult` leaf |
 | `health/poller.py` | `HealthPoller` (ATTACK-only periodic + trigger_now) |

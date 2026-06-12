@@ -14,6 +14,7 @@ on the wire (don't be a token oracle).
 
 Tools:
   - submit_flag(flag)              shared with REST /game/flag/submit
+  - get_game_state()               read-only round/phase snapshot
   - report_ready()                 LLM ack that the channel works
   - report_deploy_complete(...)    agent self-reports defense finish
   - restart_service(service)       agent triggers post-edit restart
@@ -128,6 +129,24 @@ def build_mcp_app(game: "GameMgr") -> tuple[FastMCP, "Starlette"]:
             "reason": result.reason,
             "detail": result.detail,
         }
+
+    @mcp.tool()
+    async def get_game_state(ctx: Context) -> dict:
+        """Query the live game state. Returns {phase, round, total_rounds}.
+
+        Read-only. Agents get a state snapshot baked into their startup
+        prompt, but that snapshot goes stale during a long task — call this
+        to confirm the current round/phase before a phase-sensitive action
+        (e.g. to avoid burning a WRONG_PHASE submit during DEFENSE).
+
+        Requires a valid X-Team-Token like every other tool, but the
+        response is identical for all teams — it carries no team-specific
+        or opponent information, so it's safe to expose to any live agent.
+
+        phase is one of: INIT, PREFLIGHT, SETUP, DEFENSE, ATTACK, STOPPED.
+        """
+        _team_id_from_ctx(ctx)
+        return game.status()
 
     @mcp.tool()
     async def report_ready(ctx: Context) -> dict:

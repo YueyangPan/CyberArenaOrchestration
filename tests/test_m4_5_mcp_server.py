@@ -225,7 +225,17 @@ def test_submit_flag_via_mcp_round_trips(server, game):
 # ── auth / oracle hardening ────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("tool", ["submit_flag", "report_ready", "report_deploy_complete"])
+def test_get_game_state_returns_snapshot(server, game):
+    """get_game_state mirrors GameMgr.status() — round/phase/total_rounds.
+    The test fixture has no running round loop, so status() reports the
+    INIT snapshot."""
+    res = asyncio.run(_call_tool(TOKEN_TEAM1, "get_game_state"))
+    state = _result_dict(res)
+    assert state == game.status(), f"get_game_state diverged from status(): {state}"
+    assert set(state) == {"phase", "round", "total_rounds"}, state
+
+
+@pytest.mark.parametrize("tool", ["submit_flag", "get_game_state", "report_ready", "report_deploy_complete"])
 def test_bad_token_returns_generic_unauthorized(server, game, tool):
     """Every tool, bad token: returns an isError tool result with the
     generic Unauthorized message; nothing in the wire message leaks
