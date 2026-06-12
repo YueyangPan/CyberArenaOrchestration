@@ -438,6 +438,25 @@ def test_collect_transcripts_async_flat_layout(tmp_path):
     ]
 
 
+def test_async_chunk_teardown_kill_recorded_as_stopped_not_failed():
+    """A non-zero exit BEFORE game-over is a real crash (AGENT_FAILED); the
+    same exit AFTER game-over is our teardown SIGKILL (AGENT_STOPPED). A clean
+    exit is always AGENT_COMPLETED."""
+    game = _make_game()
+    # crash mid-game → FAILED
+    asyncio.run(game.record_async_chunk_done("team1", 0, _Result(exit_code=1), 0.0, 1.0))
+    # game over → teardown kill → STOPPED, not FAILED
+    game._game_over.set()
+    asyncio.run(game.record_async_chunk_done("team1", 1, _Result(exit_code=137), 0.0, 1.0))
+    asyncio.run(game.record_async_chunk_done("team1", 2, _Result(exit_code=0), 0.0, 1.0))
+
+    seen = [(e.type, (e.payload or {}).get("reason")) for e in game.timeline.history()
+            if e.type.startswith("AGENT_")]
+    assert ("AGENT_FAILED", None) in seen
+    assert ("AGENT_STOPPED", "teardown") in seen
+    assert any(t == "AGENT_COMPLETED" for t, _ in seen)   # clean exit unaffected
+
+
 def test_supervisor_exits_when_game_over():
     """If the game is already over, the supervisor runs zero chunks."""
     game = _make_game(agents=_agents("team1"))

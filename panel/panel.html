@@ -381,8 +381,9 @@
       const first = p.prompt_first_line || '';
       return `${ev.team_id} first=${p.is_first} · ${first.slice(0, 80)}`;
     }
-    if (t === 'AGENT_COMPLETED' || t === 'AGENT_TIMEOUT' || t === 'AGENT_FAILED') {
-      return `${ev.team_id} exit=${p.exit_code} dur=${p.duration_ms}ms`;
+    if (t === 'AGENT_COMPLETED' || t === 'AGENT_TIMEOUT' || t === 'AGENT_FAILED' || t === 'AGENT_STOPPED') {
+      const why = t === 'AGENT_STOPPED' ? ' (teardown)' : '';
+      return `${ev.team_id} exit=${p.exit_code} dur=${p.duration_ms}ms${why}`;
     }
     if (t === 'DRY_RUN_OK' || t === 'DRY_RUN_FAILED') return p.error || 'ok';
     if (t === 'AGENT_INSTALLED' || t === 'AGENT_READY' || t === 'DRY_RUN_START') return ev.team_id || '';

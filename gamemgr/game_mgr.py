@@ -828,6 +828,12 @@ class GameMgr:
             event_type = EventType.AGENT_TIMEOUT
         elif result.exit_code == 0:
             event_type = EventType.AGENT_COMPLETED
+        elif self.is_game_over():
+            # Non-zero exit AFTER game-over = our own teardown SIGKILL
+            # (kill_all_agents), not a crash. Record it as an intentional
+            # stop so the panel doesn't show end-of-game as a failure.
+            event_type = EventType.AGENT_STOPPED
+            payload["reason"] = "teardown"
         else:
             event_type = EventType.AGENT_FAILED
             payload["error_excerpt"] = f"non-zero exit {result.exit_code}"

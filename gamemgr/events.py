@@ -78,6 +78,10 @@ class EventType(str, Enum):
     AGENT_COMPLETED = "AGENT_COMPLETED"
     AGENT_TIMEOUT = "AGENT_TIMEOUT"
     AGENT_FAILED = "AGENT_FAILED"
+    # Async mode: the orchestrator intentionally SIGKILLs the long-lived
+    # agent at game end. Distinct from AGENT_FAILED (a real mid-game crash)
+    # so the panel doesn't paint normal end-of-game teardown as a failure.
+    AGENT_STOPPED = "AGENT_STOPPED"
     # Pre-R1 dry-run readiness probe.
     # DRY_RUN_START — orchestrator emits per team before invoking the
     #   agent with the dry-run prompt.
