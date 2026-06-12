@@ -432,14 +432,15 @@ async def _run_async_agent(
     """The long-lived async agent loop for one team.
 
     Drives the agent from the SAME combined briefing (`cfg.system_prompt`)
-    every time — given once at the start, and re-sent verbatim if the process
-    exits before the game is over (an accidental/early exit). `--continue` also
-    restores the prior session, so a restart picks up its memory of what it
-    already did while reading the same mission. No special "resume" prompt: the
-    only prompt the agent ever gets is the initial briefing.
-    A crash-loop guard (fast-exit backoff + giveup) stops a broken config from
-    hot-looping the API. Module-level (not a closure) so it's unit-testable
-    with fakes."""
+    every time — given once at the start, and re-sent verbatim ONLY on an
+    accidental exit (crash / non-zero / timeout) before the game is over.
+    A clean exit (exit 0 = the agent reported completion) is taken at face
+    value and left final — no restart. `--continue` restores the prior session
+    on a restart, so it resumes its memory while reading the same mission.
+    No special "resume" prompt: the only prompt the agent ever gets is the
+    initial briefing. A crash-loop guard (fast-exit backoff + giveup) stops a
+    broken config from hot-looping the API. Module-level (not a closure) so
+    it's unit-testable with fakes."""
     from gamemgr.events import EventType
 
     model = cfg.model or None
@@ -468,6 +469,17 @@ async def _run_async_agent(
             await game.record_async_chunk_done(team_id, n, result, started_at, ended_at)
 
         if game.is_game_over():
+            break
+
+        # Only restart on an ACCIDENTAL exit. A clean exit (exit 0, not timed
+        # out) means the agent decided it was done / reported completion —
+        # take it at its word and leave it finished, don't force it to run
+        # again. Restart covers crashes, non-zero exits, and timeouts.
+        if result is not None and result.exit_code == 0 and not result.timed_out:
+            log.info(
+                "async supervisor: team %s agent completed cleanly (exit 0); "
+                "not restarting", team_id,
+            )
             break
 
         # Crash-loop guard: a healthy agent runs for minutes. Repeated

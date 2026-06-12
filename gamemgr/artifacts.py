@@ -109,19 +109,7 @@ class ArtifactStore:
         in filename so a hostile / buggy caller can't write outside the
         run's artifact root.
         """
-        if not isinstance(kind, ArtifactKind):
-            raise TypeError(
-                f"kind must be an ArtifactKind, got {type(kind).__name__}: {kind!r}"
-            )
-        if ".." in Path(filename).parts:
-            raise ValueError(
-                f"filename must not contain '..': {filename!r}"
-            )
-        if Path(filename).is_absolute():
-            raise ValueError(
-                f"filename must be relative: {filename!r}"
-            )
-
+        self._validate(kind, filename)
         dest = (
             self._root
             / team_id
@@ -130,6 +118,37 @@ class ArtifactStore:
         )
         dest.parent.mkdir(parents=True, exist_ok=True)
         return dest
+
+    def team_path_for(
+        self,
+        kind: ArtifactKind,
+        *,
+        team_id: str,
+        filename: str,
+    ) -> Path:
+        """Return runs/<ts>/artifacts/<team_id>/<filename> — NO round subdir.
+
+        For async mode, where the agent runs continuously across the whole
+        game and artifacts aren't per-round (chunk-numbered files like
+        `stream-async-0.jsonl` live directly under the team dir).
+        """
+        self._validate(kind, filename)
+        dest = self._root / team_id / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        return dest
+
+    @staticmethod
+    def _validate(kind: ArtifactKind, filename: str) -> None:
+        """Shared guards: enum kind, no '..' / absolute filename (so a
+        hostile / buggy caller can't write outside the run's artifact root)."""
+        if not isinstance(kind, ArtifactKind):
+            raise TypeError(
+                f"kind must be an ArtifactKind, got {type(kind).__name__}: {kind!r}"
+            )
+        if ".." in Path(filename).parts:
+            raise ValueError(f"filename must not contain '..': {filename!r}")
+        if Path(filename).is_absolute():
+            raise ValueError(f"filename must be relative: {filename!r}")
 
     @property
     def root(self) -> Path:

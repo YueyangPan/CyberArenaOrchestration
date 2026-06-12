@@ -903,7 +903,7 @@
         det.open = true;
         det.innerHTML = `
           <summary>
-            <span class="host-name">R${tr.round_id} · ${escapeHtml(tr.phase)}</span>
+            <span class="host-name">${tr.phase.startsWith('async-') ? escapeHtml(tr.phase) : `R${tr.round_id} · ${escapeHtml(tr.phase)}`}</span>
             <span class="host-stats">${s.events} events · ${s.tools} tools `
             + `(${escapeHtml(s.tools_breakdown)}) · ${s.errors} err · `
             + `${s.tokens_in.toLocaleString()} in / ${cached.toLocaleString()} cached / ${s.tokens_out.toLocaleString()} out tok</span>

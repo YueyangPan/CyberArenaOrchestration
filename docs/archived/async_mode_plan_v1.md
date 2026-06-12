@@ -19,14 +19,17 @@ start with a combined attack+defense briefing; it self-directs by polling
 defense happen **simultaneously** — networks stay connected the whole game (no
 protected patch window). A **round tick still exists** purely to rotate flags every
 `round_secs`; scoring and health checks run continuously. The agent is
-**supervised**: if `claude -p` exits before game-over the orchestrator respawns it
-with `--continue` (memory preserved) plus a short resume nudge; at game end live
-agents are killed. **Sync behavior must not change.**
+**supervised**: on an ACCIDENTAL exit before game-over (crash / non-zero / timeout)
+the orchestrator re-sends the SAME briefing with `--continue` (memory preserved); a
+clean exit (exit 0 = agent reported completion) is left final, no restart. At game
+end live agents are killed. **Sync behavior must not change.**
 
 ### Decisions (user-confirmed)
 1. Always-on networks in async (no safe window).
 2. Periodic flag rotation (round tick = rotation interval); submit/health continuous.
-3. Supervised respawn with `--continue`.
+3. Supervised respawn with `--continue` — only on accidental exit; the agent is
+   given the same briefing once at start and re-sent it on restart (no resume nudge).
+4. Async artifacts are flat under `artifacts/<team>/` (no `round-N` subdir).
 
 ## The elegant part: a `LIVE` phase value
 
@@ -68,7 +71,8 @@ Mirror `RoundLoop`'s constructor `(game, network, config)` and surface so
   branch (AsyncLoop vs RoundLoop, sync arm byte-identical); `register_async_supervisor_handler`,
   `register_kill_all_agents`, `start_async_agents()`; `record_async_chunk_started/done`
   (writes `stream-async-<n>.jsonl` / `agent-async-<n>.log` / `metadata-async-<n>.json`
-  via `path_for(..., round_id=0, ...)`); `is_game_over()`; `stop()` async branch
+  via `team_path_for` — flat under `artifacts/<team>/`, no `round-N`);
+  `is_game_over()`; `stop()` async branch
   (set `_game_over` + `kill_all_agents` before drain); `status()` adds `mode` +
   async `round_secs`/`seconds_to_rotation`; `async_agent_config_for(team_id)`.
 - `agents/prompts/` — `build_async_prompt(cfg, *, service_name, port, defendable)`:
@@ -84,12 +88,14 @@ Mirror `RoundLoop`'s constructor `(game, network, config)` and surface so
   reusing `backend`/`_mgr_for`/`handle_for`): per-team supervisor + `kill_all_agents`
   callback. Branch in `_run_start` on `cfg.rounds.mode`. Constants
   `ASYNC_CHUNK_TIMEOUT` (bounded — **not** whole-game, so end-of-game kill works),
-  `ASYNC_MIN_HEALTHY_SECS`, `ASYNC_MAX_FAST_EXITS`. Supervisor: loop run_phase →
-  record chunk → break if game over → crash-loop backoff/giveup → resume nudge.
+  `ASYNC_MIN_HEALTHY_SECS`, `ASYNC_MAX_FAST_EXITS`. Supervisor (`_run_async_agent`):
+  loop run_phase → record chunk → break if game over → break if clean exit (exit 0)
+  → else accidental exit: crash-loop backoff/giveup → re-send same briefing.
 - `gamemgr/mcp_server.py` — `get_game_state` docstring: add `LIVE` + async fields
   (logic unchanged; returns `game.status()`).
-- `gamemgr/transcripts.py` — order `stream-async-<n>.jsonl` by chunk number (the
-  `_PHASE_RANK` sort currently only knows defense/attack).
+- `gamemgr/transcripts.py` — find async files flat under `artifacts/<team>/`
+  (round_id=None) as well as sync `round-N/`; order `stream-async-<n>.jsonl` by
+  chunk number.
 - `config/game-async.yaml` — new sample (`mode: async`, small `round_secs`); leave
   the default sync `config/game.yaml` untouched.
 - Docs — `docs/RUN_ARTIFACT_SPEC.md` (async subsection), `docs/UML/game_manager.md`,
@@ -97,7 +103,7 @@ Mirror `RoundLoop`'s constructor `(game, network, config)` and surface so
 
 ## Risks (designed-for)
 - **Context-window growth**: one session whole-game via repeated `--continue`.
-  Mitigate with bounded chunk timeout + summarizing resume nudge + modest
+  Mitigate with bounded chunk timeout + modest
   `round_secs*total_rounds`. Biggest behavioral risk.
 - **Crash-loop respawn**: `ASYNC_MIN_HEALTHY_SECS` backoff + `ASYNC_MAX_FAST_EXITS`
   giveup (distinct event so the panel shows the death).

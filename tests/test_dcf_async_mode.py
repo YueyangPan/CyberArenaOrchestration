@@ -403,6 +403,41 @@ def test_drain_cancels_when_no_kill_hook():
     assert task.cancelled()
 
 
+def test_supervisor_no_restart_on_clean_exit():
+    """A clean exit (exit 0 = agent reported completion) is final — the
+    supervisor runs exactly one chunk and does NOT respawn."""
+    game = _make_game(agents=_agents("team1"))
+    cfg = AgentConfig(cli="c", model="m", api_key="k", base_url="u",
+                      system_prompt="briefing")
+
+    class _CleanMgr:
+        def __init__(self): self.calls = 0
+        async def run_phase(self, backend, handle, prompt, *, timeout, model=None):
+            self.calls += 1
+            return _Result(exit_code=0)   # clean completion
+
+    mgr = _CleanMgr()
+    asyncio.run(main._run_async_agent(game, backend=None, mgr=mgr,
+                                      handle=None, team_id="team1", cfg=cfg))
+    assert mgr.calls == 1   # ran once, not restarted
+
+
+def test_collect_transcripts_async_flat_layout(tmp_path):
+    """Async transcripts live flat under the team dir (no round-N), parse
+    with round_id=None and sort by chunk index."""
+    from gamemgr.transcripts import collect_transcripts
+    art = tmp_path / "artifacts" / "team1"
+    art.mkdir(parents=True)
+    line = '{"type": "system", "subtype": "init", "model": "m", "tools": []}\n'
+    (art / "stream-async-0.jsonl").write_text(line)
+    (art / "stream-async-1.jsonl").write_text(line)
+    ts = collect_transcripts(tmp_path)
+    assert [(t["team_id"], t["round_id"], t["phase"]) for t in ts] == [
+        ("team1", None, "async-0"),
+        ("team1", None, "async-1"),
+    ]
+
+
 def test_supervisor_exits_when_game_over():
     """If the game is already over, the supervisor runs zero chunks."""
     game = _make_game(agents=_agents("team1"))

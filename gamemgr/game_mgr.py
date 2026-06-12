@@ -782,17 +782,17 @@ class GameMgr:
     ) -> None:
         """Artifact persistence + terminal AGENT_* event for one finished
         async chunk. Mirrors `record_phase_done` but writes chunk-numbered
-        files into the team's `round-0` dir (async has no per-round phase
-        split) and tags events with `phase=LIVE`."""
+        files directly under the team dir (async has no per-round split — no
+        `round-N` subdir) and tags events with `phase=LIVE`."""
         from .artifacts import ArtifactKind
 
         duration_ms = int((ended_at - started_at) * 1000)
 
         if self.artifacts is not None:
             try:
-                base = self.artifacts.path_for(
+                base = self.artifacts.team_path_for(
                     ArtifactKind.API_LOG,
-                    team_id=team_id, round_id=0,
+                    team_id=team_id,
                     filename=f"stream-async-{chunk_n}.jsonl",
                 ).parent
                 (base / f"stream-async-{chunk_n}.jsonl").write_bytes(result.stdout)

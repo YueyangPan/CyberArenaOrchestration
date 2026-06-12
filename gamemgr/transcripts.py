@@ -208,14 +208,24 @@ _CACHE: dict[str, tuple[tuple, list[dict]]] = {}
 
 
 def collect_transcripts(run_dir: Path | str) -> list[dict]:
-    """Walk `runs/<ts>/artifacts/<team>/round-<N>/stream-<phase>.jsonl`
-    and return one transcript dict per non-empty file, sorted by
-    (team_id, round_id, phase). Each dict is JSON-ready for /game/agents.
+    """Return one transcript dict per non-empty stream file. Two layouts:
+
+      sync:  `artifacts/<team>/round-<N>/stream-<phase>.jsonl`  → round_id=N
+      async: `artifacts/<team>/stream-async-<n>.jsonl`          → round_id=None
+             (the agent runs continuously across the whole game — no per-round
+             split — so async chunks live directly under the team dir)
+
+    Sorted by (team_id, round_id, phase). Each dict is JSON-ready for
+    /game/agents.
     """
     root = Path(run_dir) / "artifacts"
     if not root.is_dir():
         return []
-    paths = sorted(root.glob("*/round-*/stream-*.jsonl"))
+    # sync (round subdir) + async (flat under team). Async files are excluded
+    # from the sync glob's `*/round-*/` shape, so the two sets don't overlap.
+    paths = sorted(root.glob("*/round-*/stream-*.jsonl")) + sorted(
+        root.glob("*/stream-async-*.jsonl")
+    )
 
     # Cheap change-signature: stat (not read) each file. Re-parse only when
     # a file appears or changes; otherwise return the cached result.
@@ -234,19 +244,32 @@ def collect_transcripts(run_dir: Path | str) -> list[dict]:
     out: list[dict] = []
     for stream_path in paths:
         m = _STREAM_RE.match(stream_path.name)
+        if not m:
+            continue
         rm = _ROUND_RE.match(stream_path.parent.name)
-        if not m or not rm:
+        if rm is not None:                       # sync: <team>/round-<N>/...
+            team_id = stream_path.parent.parent.name
+            round_id = int(rm.group("round"))
+        elif _ASYNC_RE.match(m.group("phase")):  # async: <team>/stream-async-<n>
+            team_id = stream_path.parent.name
+            round_id = None
+        else:
             continue
         events = parse_stream_json(stream_path)
         if not events:
             continue
         out.append({
-            "team_id": stream_path.parent.parent.name,
-            "round_id": int(rm.group("round")),
+            "team_id": team_id,
+            "round_id": round_id,
             "phase": m.group("phase"),
             "stats": summary_stats(events),
             "events": [asdict(e) for e in events],
         })
-    out.sort(key=lambda t: (t["team_id"], t["round_id"], _phase_sort_key(t["phase"])))
+    # round_id is None for async; coerce to -1 only for ordering (a run is
+    # all-sync or all-async, so this never interleaves the two).
+    out.sort(key=lambda t: (
+        t["team_id"], t["round_id"] if t["round_id"] is not None else -1,
+        _phase_sort_key(t["phase"]),
+    ))
     _CACHE[str(run_dir)] = (sig, out)
     return out
