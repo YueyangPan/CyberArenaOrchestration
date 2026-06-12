@@ -5,7 +5,7 @@ How one match is laid out on disk. Everything is **static files** — pick a `ru
 **Mental model:** one match = one `runs/<ts>/` folder. It has a few **teams**; each team plays a few **rounds**. There are two modes (`config.yaml` → `round_config.mode`):
 
 - **sync** (default): each round has two **phases** — `defense` (harden your own service) then `attack` (break into the opponent's). Each team runs one fresh agent per phase.
-- **async**: attack and defense happen simultaneously for the whole match (phase is `LIVE` throughout). Each team runs **one long-lived agent**, captured as numbered "chunks" across orchestrator respawns. A "round" is just a flag-rotation tick.
+- **async**: attack and defense happen simultaneously for the whole match (phase is `LIVE` throughout). Each team runs **one long-lived agent** — usually a single "chunk" spanning the whole game; extra chunks appear only if it exits accidentally (crash/timeout) and is restarted (a clean exit is taken as "done"). A "round" is just a flag-rotation tick.
 
 ## Folder layout
 
