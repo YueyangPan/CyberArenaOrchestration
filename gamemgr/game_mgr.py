@@ -1579,9 +1579,9 @@ class GameMgr:
         Combines the attack topology (opposing prods, like `agent_config_for`)
         and the defense context (own service + port, like
         `defense_agent_config_for`) into one config whose `system_prompt` is
-        the combined attack+defense briefing (`build_async_prompt`). Always
-        the full briefing — the supervisor sends the short resume nudge on
-        respawn itself, so there's no `is_first` parameter here.
+        the combined attack+defense briefing (`build_async_prompt`). This is
+        the agent's only prompt — the supervisor re-sends this same briefing
+        verbatim on any restart (no separate resume prompt).
         """
         base = self.config.agents.get(team_id)
         if base is None:
@@ -1627,8 +1627,7 @@ class GameMgr:
         return replace(
             cfg,
             system_prompt=build_async_prompt(
-                cfg, service_name=service, port=port,
-                defendable=defendable, is_first=True,
+                cfg, service_name=service, port=port, defendable=defendable,
             ),
         )
 

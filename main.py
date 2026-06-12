@@ -16,7 +16,6 @@ import docker
 import uvicorn
 
 from agents.manager import AgentManager
-from agents.prompts import ASYNC_RESUME_NUDGE
 from agents.registry import build as build_agent_manager
 from agents.transport_docker import DockerExecBackend
 from gamemgr.api import build_app
@@ -432,16 +431,19 @@ async def _run_async_agent(
 ) -> None:
     """The long-lived async agent loop for one team.
 
-    Prompts the agent ONCE with the combined briefing (`cfg.system_prompt`),
-    then respawns it with the short resume nudge (`--continue` carries the
-    briefing in session memory) whenever it exits before the game is over.
+    Drives the agent from the SAME combined briefing (`cfg.system_prompt`)
+    every time — given once at the start, and re-sent verbatim if the process
+    exits before the game is over (an accidental/early exit). `--continue` also
+    restores the prior session, so a restart picks up its memory of what it
+    already did while reading the same mission. No special "resume" prompt: the
+    only prompt the agent ever gets is the initial briefing.
     A crash-loop guard (fast-exit backoff + giveup) stops a broken config from
     hot-looping the API. Module-level (not a closure) so it's unit-testable
     with fakes."""
     from gamemgr.events import EventType
 
     model = cfg.model or None
-    prompt = cfg.system_prompt or ""   # chunk 0 = full combined briefing
+    prompt = cfg.system_prompt or ""   # same briefing on every (re)start
     n = 0
     fast_exits = 0
     while not game.is_game_over():
@@ -488,7 +490,8 @@ async def _run_async_agent(
         else:
             fast_exits = 0
         n += 1
-        prompt = ASYNC_RESUME_NUDGE
+        # Re-send the same briefing on restart (per design: the agent is only
+        # ever given the initial prompt). --continue restores its memory.
 
 
 def _wire_async_supervisor(game: GameMgr) -> None:

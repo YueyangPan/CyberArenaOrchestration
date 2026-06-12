@@ -29,7 +29,6 @@ from models.agent import AgentConfig
 # Re-export so legacy `from agents.prompts import submit_block` callers
 # keep working. New code should import from `agents.prompts._helpers`.
 from ._helpers import (  # noqa: F401
-    ASYNC_RESUME_NUDGE,
     async_defense_block,
     generic_defense_prompt,
     short_attack_cue,
@@ -118,26 +117,21 @@ def build_async_prompt(
     service_name: str | None = None,
     port: int = 0,
     defendable: bool = True,
-    is_first: bool = True,
 ) -> str:
     """Combined attack+defense briefing for ASYNC mode.
 
-    The agent runs continuously — patching its own service AND stealing
-    opponents' flags — looping until `get_game_state` reports STOPPED. There
-    is no DEFENSE/ATTACK split and no WRONG_PHASE gate, so all phase-exclusivity
+    This is the agent's ONLY prompt: it's given once at the start and re-sent
+    verbatim on any restart (the supervisor never crafts a separate "resume"
+    prompt). The agent runs continuously — patching its own service AND stealing
+    opponents' flags — looping until `get_game_state` reports STOPPED. There is
+    no DEFENSE/ATTACK split and no WRONG_PHASE gate, so all phase-exclusivity
     language is dropped.
 
     `defendable=False` (the team's service has no restart capability, e.g. the
     attack-only `notes` challenge) drops the defense playbook to a one-liner so
     the agent doesn't waste turns calling restart_service on a service that
     rejects it.
-
-    `is_first=False` returns the short `ASYNC_RESUME_NUDGE`, used by the
-    supervisor on respawn (`--continue` carries the full briefing in session
-    memory).
     """
-    if not is_first:
-        return ASYNC_RESUME_NUDGE
     # Reuse the per-challenge attack body (concrete exploit + submit_block) and
     # a phase-neutral defense block; frame both under one continuous loop.
     attack = build_attack_prompt(cfg, service_name=service_name, is_first=True)

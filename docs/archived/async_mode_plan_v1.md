@@ -71,9 +71,11 @@ Mirror `RoundLoop`'s constructor `(game, network, config)` and surface so
   via `path_for(..., round_id=0, ...)`); `is_game_over()`; `stop()` async branch
   (set `_game_over` + `kill_all_agents` before drain); `status()` adds `mode` +
   async `round_secs`/`seconds_to_rotation`; `async_agent_config_for(team_id)`.
-- `agents/prompts/` — `build_async_prompt(cfg, *, service_name, port, is_first)` +
-  `ASYNC_RESUME_NUDGE`. Concatenate existing attack body + defense recipe in a loop
-  wrapper; drop WRONG_PHASE language; reuse per-challenge bodies + `submit_block`.
+- `agents/prompts/` — `build_async_prompt(cfg, *, service_name, port, defendable)`:
+  the agent's ONLY prompt, given once at start and re-sent verbatim on restart (no
+  separate resume prompt). Concatenate existing attack body + a phase-neutral
+  defense block in a loop wrapper; drop WRONG_PHASE language; reuse per-challenge
+  bodies + `submit_block`.
 - `main.py` — `_wire_async_supervisor(game)` (parallel to `_wire_phase_kickoffs`,
   reusing `backend`/`_mgr_for`/`handle_for`): per-team supervisor + `kill_all_agents`
   callback. Branch in `_run_start` on `cfg.rounds.mode`. Constants
