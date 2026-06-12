@@ -71,12 +71,15 @@ _DRY_RUN_PROMPT = (
 DRY_RUN_AGENT_TIMEOUT_SECS = 180.0
 
 # ── async-mode supervisor tuning ────────────────────────────────────────
-# Per-invocation ("chunk") cap on the long-lived async agent. Generous: the
-# agent is meant to loop continuously until the game ends, so this is a hang
-# safety net (and an upper bound on per-process context growth for very long
-# games — a timed-out chunk is respawned with --continue, losing no memory).
-# End-of-game teardown does NOT rely on this — stop() kills agents explicitly.
-ASYNC_CHUNK_TIMEOUT_SECS = 3600.0
+# Per-invocation ("chunk") cap on the long-lived async agent. Bounded on
+# purpose (never whole-game / None): end-of-game teardown hard-kills agents
+# explicitly via stop()→kill_all_agents, but if that pkill ever fails this is
+# the FALLBACK reap — run_command times out → run_phase calls kill_session
+# (in-container SIGKILL). 10 min keeps a healthy agent running effectively
+# continuously for typical (minutes-long) games while bounding both that
+# fallback and per-process context growth (a timed-out chunk respawns with
+# --continue, losing no memory).
+ASYNC_CHUNK_TIMEOUT_SECS = 600.0
 # If a chunk exits faster than this, treat it as an unhealthy/crash exit for
 # backoff purposes (a healthy agent runs for minutes). Cold-start can be slow,
 # so this is well below a normal first-token latency budget but above an

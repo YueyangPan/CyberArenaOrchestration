@@ -321,6 +321,58 @@ def test_supervisor_gives_up_after_fast_exits(monkeypatch):
     assert any("gave up" in (e.payload or {}).get("error", "") for e in failed)
 
 
+def test_drain_rekills_stragglers_before_cancel():
+    """A task still blocked after the grace must trigger a re-kill (which
+    unblocks it) rather than being cancelled (which would orphan the
+    in-container process)."""
+    game = _make_game()
+    game._STOP_DRAIN_GRACE_SECS = 0.05  # don't wait 30s in a test
+    kill_calls: list[bool] = []
+
+    async def run():
+        released = asyncio.Event()
+
+        async def stuck():
+            await released.wait()   # blocks until the "kill" releases it
+
+        async def kill_all():
+            kill_calls.append(True)
+            released.set()          # a real kill makes run_command return
+
+        task = asyncio.create_task(stuck())
+        game._track_kickoffs([task])
+        game.register_kill_all_agents(kill_all)
+        await game._drain_kickoffs()
+        return task
+
+    task = asyncio.run(run())
+    assert kill_calls == [True]
+    assert task.done() and not task.cancelled()   # settled via kill, not cancel
+
+
+def test_drain_cancels_when_no_kill_hook():
+    """Sync mode (no kill hook): a wedged task is still cancelled as the
+    last-resort backstop — behavior unchanged."""
+    game = _make_game()
+    game._STOP_DRAIN_GRACE_SECS = 0.05
+
+    async def run():
+        async def stuck():
+            await asyncio.Event().wait()   # never released
+
+        task = asyncio.create_task(stuck())
+        game._track_kickoffs([task])
+        await game._drain_kickoffs()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return task
+
+    task = asyncio.run(run())
+    assert task.cancelled()
+
+
 def test_supervisor_exits_when_game_over():
     """If the game is already over, the supervisor runs zero chunks."""
     game = _make_game(agents=_agents("team1"))

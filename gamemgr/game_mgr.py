@@ -952,16 +952,35 @@ class GameMgr:
         """Wait (bounded) for in-flight kickoff tasks to settle, so their
         record_phase_done — transcript write + terminal AGENT_* event —
         completes before the timeline closes. A straggler past the grace
-        is cancelled rather than hanging teardown."""
+        is cancelled rather than hanging teardown.
+
+        Async-mode safety net: a straggler usually means the agent's
+        `docker exec` is still blocked because the in-container `claude`
+        wasn't reaped. Cancelling the task then would orphan that process,
+        so before cancelling we re-invoke `_kill_all_agents` (hard SIGKILL)
+        and re-wait — a real kill makes `run_command` return on its own, so
+        cancel becomes a true last resort. Sync mode has no `_kill_all_agents`
+        (None) and falls straight through to cancel — unchanged."""
         pending = [t for t in self._kickoff_tasks if not t.done()]
         if not pending:
             return
         log.info("stop: draining %d in-flight kickoff task(s)", len(pending))
         _done, still = await asyncio.wait(pending, timeout=self._STOP_DRAIN_GRACE_SECS)
+        if still and self._kill_all_agents is not None:
+            log.warning(
+                "stop: %d task(s) still pending after %.0fs; re-killing agents "
+                "before cancel (avoid orphaning in-container claude)",
+                len(still), self._STOP_DRAIN_GRACE_SECS,
+            )
+            try:
+                await self._kill_all_agents()
+            except Exception:
+                log.exception("stop: re-kill of agents failed")
+            _done2, still = await asyncio.wait(still, timeout=self._STOP_DRAIN_GRACE_SECS)
         if still:
             log.warning(
-                "stop: %d kickoff task(s) exceeded %.0fs drain grace; cancelling",
-                len(still), self._STOP_DRAIN_GRACE_SECS,
+                "stop: %d kickoff task(s) exceeded drain grace; cancelling",
+                len(still),
             )
             for t in still:
                 t.cancel()
