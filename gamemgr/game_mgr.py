@@ -841,12 +841,19 @@ class GameMgr:
     # ── DEFCON: end-of-round service-log snapshots ──────────────────────
 
     async def _persist_service_logs(self, round_id: int) -> None:
-        """Snapshot `docker logs <team{N}_prod>` for every team. End-of-round
-        only — captures the prod container's stdout/stderr across DEFENSE +
-        ATTACK in one file (timestamps from docker preserve sub-phase ordering).
+        """Snapshot `docker logs <team{N}_prod>` for every team.
+
+        Sync: one file per round under `round-<N>/docker.log` (captures
+        DEFENSE + ATTACK; docker timestamps preserve sub-phase ordering).
+
+        Async: there's no per-round split, and `docker logs` is cumulative
+        (each call returns the full history), so a per-round copy would just
+        be a growing duplicate. Write a single flat `artifacts/<team>/docker.log`,
+        overwritten each rotation tick — it ends as the full game log.
         """
         if self.artifacts is None:
             return
+        is_async = self.config.rounds.mode == "async"
         client = self.orchestrator.containers._client
         for team in self.config.topology.teams:
             if not team.prod:
@@ -858,12 +865,19 @@ class GameMgr:
                 log.exception("artifact: docker logs failed for %s", team.prod)
                 continue
             try:
-                p = self.artifacts.path_for(
-                    ArtifactKind.SERVICE_LOG,
-                    team_id=team.id,
-                    round_id=round_id,
-                    filename="docker.log",
-                )
+                if is_async:
+                    p = self.artifacts.team_path_for(
+                        ArtifactKind.SERVICE_LOG,
+                        team_id=team.id,
+                        filename="docker.log",
+                    )
+                else:
+                    p = self.artifacts.path_for(
+                        ArtifactKind.SERVICE_LOG,
+                        team_id=team.id,
+                        round_id=round_id,
+                        filename="docker.log",
+                    )
                 p.write_text(blob)
             except Exception:
                 log.exception(
