@@ -1,8 +1,10 @@
 # Async Mode Plan (v1)
 
-Status: **in progress** (started 2026-06-11). Adds a second game mode alongside
-the existing "sync" mode, selectable via `round_config.mode: sync|async`. Live
-design once shipped: `docs/UML/game_manager.md` + `docs/UML/overview.md`.
+Status: **shipped 2026-06-12** (commit `873e970`). Adds a second game mode
+alongside the existing "sync" mode, selectable via `round_config.mode: sync|async`.
+Live design: `docs/UML/game_manager.md` + `docs/UML/overview.md`. Offline tests
+green (tests/test_dcf_async_mode.py + full suite); the real Docker run
+(`python main.py start -c config/game-async.yaml`) is the remaining end-to-end check.
 
 ## Context
 
@@ -60,15 +62,15 @@ Mirror `RoundLoop`'s constructor `(game, network, config)` and surface so
 
 ### Modify
 - `gamemgr/config.py` — `RoundConfig`: `mode: str = "sync"`, `round_secs: int = 60`;
-  parse + validate. **[done]**
-- `gamemgr/round.py` — add `Phase.LIVE`; no other change. **[done]**
+  parse + validate.
+- `gamemgr/round.py` — add `Phase.LIVE`; no other change.
 - `gamemgr/game_mgr.py` — `_game_over` Event + async handler slots; `start()` mode
   branch (AsyncLoop vs RoundLoop, sync arm byte-identical); `register_async_supervisor_handler`,
   `register_kill_all_agents`, `start_async_agents()`; `record_async_chunk_started/done`
   (writes `stream-async-<n>.jsonl` / `agent-async-<n>.log` / `metadata-async-<n>.json`
   via `path_for(..., round_id=0, ...)`); `is_game_over()`; `stop()` async branch
   (set `_game_over` + `kill_all_agents` before drain); `status()` adds `mode` +
-  async `round_secs`/`seconds_remaining`; `async_agent_config_for(team_id)`.
+  async `round_secs`/`seconds_to_rotation`; `async_agent_config_for(team_id)`.
 - `agents/prompts/` — `build_async_prompt(cfg, *, service_name, port, is_first)` +
   `ASYNC_RESUME_NUDGE`. Concatenate existing attack body + defense recipe in a loop
   wrapper; drop WRONG_PHASE language; reuse per-challenge bodies + `submit_block`.
