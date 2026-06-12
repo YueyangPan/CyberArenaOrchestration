@@ -264,7 +264,8 @@ def test_record_phase_done_writes_three_artifacts(tmp_path):
 
     base = tmp_path / "artifacts" / "team1" / "round-2"
     assert (base / "stream-defense.jsonl").read_bytes() == b'{"line": 1}\n{"line": 2}\n'
-    assert (base / "agent-defense.log").read_bytes() == b"some stderr\n"
+    # agent-*.log is the raw combined archive: stdout followed by stderr.
+    assert (base / "agent-defense.log").read_bytes() == b'{"line": 1}\n{"line": 2}\nsome stderr\n'
     meta = json.loads((base / "metadata-defense.json").read_text())
     assert meta["round_id"] == 2
     assert meta["phase"] == "defense"

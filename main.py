@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import shutil
 import signal
 import sys
 from pathlib import Path
@@ -117,6 +118,13 @@ async def _run_start(args) -> int:
     # Open the run + bring the API server up BEFORE the arena bring-up so
     # the live panel can connect and stream the bring-up events.
     game.begin_run()
+    # Snapshot the raw config into the run dir as a record (teams,
+    # challenge, rounds, per-phase seconds). Copied verbatim so the
+    # `${VAR}` placeholders stay unexpanded — no secrets land on disk.
+    try:
+        shutil.copyfile(args.config, game.run_dir / "config.yaml")
+    except OSError:
+        log.warning("could not snapshot config %s into run dir", args.config)
     shutdown = asyncio.Event()
     app = build_app(game, shutdown)
     uv_config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")

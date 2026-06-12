@@ -8,6 +8,7 @@ All design lives in [docs/](docs/). Read the relevant doc before changing relate
 
 - [docs/CHALLENGE_AUTHORING_SOP.md](docs/CHALLENGE_AUTHORING_SOP.md) — SOP for collaborators packaging new challenges. Hand to outside contributors before they start.
 - [docs/RUN_SAMPLE_CHALLENGE.md](docs/RUN_SAMPLE_CHALLENGE.md) — End-to-end recipe for running the bundled DEF CON ico sample challenge from a blank Linux host. Tested on Amazon Linux 2023; works on Debian / Ubuntu with the same steps.
+- [docs/RUN_ARTIFACT_SPEC.md](docs/RUN_ARTIFACT_SPEC.md) — Consumer-facing spec for a run's output: `runs/<ts>/` layout, per-file meaning, the `stream-*.jsonl` event schema, and `events.jsonl`. Hand to anyone displaying/consuming run artifacts (e.g. the website).
 - [docs/UML/overview.md](docs/UML/overview.md) — system-level UML, **the live design**; drills into [agent_manager.md](docs/UML/agent_manager.md) · [game_manager.md](docs/UML/game_manager.md) · [timeline.md](docs/UML/timeline.md) · [flag.md](docs/UML/flag.md) · [health.md](docs/UML/health.md) · [facility.md](docs/UML/facility.md) · [orchestrator.md](docs/UML/orchestrator.md) · [challenges.md](docs/UML/challenges.md)
 
 **Archived** (superseded designs + per-milestone plans/reports, kept for lineage — the live design is the UML set above):

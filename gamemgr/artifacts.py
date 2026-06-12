@@ -30,7 +30,7 @@ class ArtifactKind(str, Enum):
     Filename conventions per kind (see callers in `gamemgr.game_mgr`):
 
       API_LOG          stream-{phase}.jsonl   (LLM stream-json transcript)
-      AGENT_LOG        agent-{phase}.log      (stderr + exit_code)
+      AGENT_LOG        agent-{phase}.log      (raw combined stdout+stderr)
       SERVICE_LOG      docker.log             (docker logs of team prod)
       SOURCE_SNAPSHOT  source.tar             (reserved)
       BINARY_DIFF      binary.diff            (reserved)
@@ -66,8 +66,11 @@ Per-kind filename conventions (see `gamemgr.artifacts.ArtifactKind`):
 - `stream-defense.jsonl` / `stream-attack.jsonl` — LLM stream-json
   transcript (api-log) for that phase: every turn's prompt, assistant
   message, tool_use, tool_result, usage tokens.
-- `agent-defense.log` / `agent-attack.log` — supervisor stderr +
-  exit_code (agent-log) for that phase.
+- `agent-defense.log` / `agent-attack.log` — raw combined CLI output
+  (agent-log) for that phase: full stdout (the stream-json) followed by
+  stderr. The unparsed original archive; intentionally overlaps
+  `stream-*.jsonl`. stderr is appended last (separate-pipe capture), so
+  it is concatenated, not time-interleaved.
 - `docker.log` — `docker logs --timestamps <team{N}_prod>` snapshot at
   end of round (service-log).
 - `source.tar`, `binary.diff`, `traffic.pcap`, `exploit.bin`,

@@ -883,7 +883,7 @@ class GameMgr:
 
         Writes three sibling files to the team×round artifact dir:
           * `stream-{phase}.jsonl` — raw CLI stdout (stream-json transcript)
-          * `agent-{phase}.log`    — raw CLI stderr
+          * `agent-{phase}.log`    — raw combined stdout+stderr (original archive)
           * `metadata-{phase}.json` — exit_code / timed_out / timings /
             prompt_first_line
 
@@ -906,7 +906,11 @@ class GameMgr:
                     filename=f"stream-{phase}.jsonl",
                 ).parent
                 (base / f"stream-{phase}.jsonl").write_bytes(result.stdout)
-                (base / f"agent-{phase}.log").write_bytes(result.stderr)
+                # Raw combined capture: full stdout (the stream-json) followed
+                # by stderr. stdout/stderr arrive on separate pipes, so this is
+                # concatenated (stderr last), not time-interleaved. Redundant
+                # with stream-*.jsonl by design — the unparsed original archive.
+                (base / f"agent-{phase}.log").write_bytes(result.stdout + result.stderr)
                 (base / f"metadata-{phase}.json").write_text(json.dumps({
                     "round_id": round_id,
                     "phase": phase,
