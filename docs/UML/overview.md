@@ -81,7 +81,7 @@ main.py
   └─ GameMgr.start()
        ├─ install_all_agents()      ← npm install + ssh pivot + agent.env / mcp.json per team
        ├─ dry_run_all_agents()      ← per-team readiness probe (report_ready via MCP)
-       └─ RoundLoop.run()
+       └─ RoundLoop.run()              ← sync mode (round_config.mode: sync)
             ├─ R1: DEFENSE → ATTACK
             ├─ R2: DEFENSE → ATTACK
             └─ R3: DEFENSE → ATTACK → GAME_END
@@ -89,6 +89,12 @@ main.py
          (game.stop closes file sink; panel_snapshot.write_snapshot
           freezes the run into runs/<ts>/panel.html)
 ```
+
+**Async mode** (`round_config.mode: async`) swaps `RoundLoop` for `AsyncLoop`:
+one continuous game at `Phase.LIVE` (networks always open → attack + defense
+simultaneous), one long-lived supervised agent per team that self-directs via
+`get_game_state` over MCP, and a flag-rotation tick every `round_secs`. See
+[game_manager.md](game_manager.md).
 
 Two cross-cutting concerns:
 

@@ -31,6 +31,14 @@ class RoundConfig:
     defense_secs: int = 30
     attack_secs: int = 30
     total_rounds: int = 3
+    # "sync"  — strict DEFENSE→ATTACK phases, fresh agent process per phase.
+    # "async" — one long-lived agent per team (prompted once, supervised
+    #           respawn via --continue); networks always connected; a round
+    #           tick just rotates flags every `round_secs`.
+    mode: str = "sync"
+    # Async only: seconds between flag rotations (one "round" tick).
+    # Ignored in sync mode (which uses defense_secs / attack_secs).
+    round_secs: int = 60
 
 
 @dataclass(frozen=True)
@@ -121,10 +129,15 @@ def _from_dict(raw: dict) -> GameConfig:
     ]
 
     rc = raw.get("round_config", {})
+    mode = str(rc.get("mode", "sync"))
+    if mode not in {"sync", "async"}:
+        raise ValueError(f"round_config.mode must be 'sync' or 'async', got {mode!r}")
     rounds = RoundConfig(
         defense_secs=int(rc.get("defense_secs", 30)),
         attack_secs=int(rc.get("attack_secs", 30)),
         total_rounds=int(rc.get("total_rounds", 3)),
+        mode=mode,
+        round_secs=int(rc.get("round_secs", 60)),
     )
 
     agents: dict[str, AgentConfig] = {}

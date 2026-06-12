@@ -19,7 +19,7 @@ from pathlib import Path
 from orchestrator.orchestrator import Orchestrator
 from orchestrator.handle import ContainerHandle
 
-from agents.prompts import build_attack_prompt, build_defense_prompt
+from agents.prompts import build_async_prompt, build_attack_prompt, build_defense_prompt
 from challenges.interface import Challenge, VulboxTarget
 from challenges.registry import build_challenge, health_interval_secs, initial_start
 from models.agent import AgentConfig
@@ -33,6 +33,7 @@ from .artifacts import ArtifactKind, ArtifactStore
 # TIMEOUT / FAILED. args: (team_id, cfg, round_id, phase_lower, is_first)
 PhaseKickoffHandler = Callable[[str, AgentConfig, int, str, bool], Awaitable[None]]
 
+from .async_loop import AsyncLoop
 from .config import ChallengeConfig, GameConfig
 from .events import EventType, new_event, new_run_dir
 from .round import Phase, RoundLoop
@@ -59,7 +60,10 @@ class GameMgr:
         # nothing internal subscribes. Internal control flow goes
         # through direct method calls on GameMgr.
         self.timeline = Timeline()
-        self.round_loop: RoundLoop | None = None
+        # The active game driver: RoundLoop (sync) or AsyncLoop (async).
+        # status()/stop() read .phase/.round/.stop()/.end_phase_early() off
+        # whichever is active, so they don't branch on mode.
+        self.round_loop: RoundLoop | AsyncLoop | None = None
         self.run_dir: Path | None = None
         # (team_id, service_name) -> Challenge instance. Populated by
         # deploy_challenges, read by FlagServer / HealthChecker /
@@ -167,6 +171,24 @@ class GameMgr:
         # are usually still wrapping up when the loop ends, lose their
         # transcript + terminal AGENT_* event to the shutdown.
         self._kickoff_tasks: set[asyncio.Task] = set()
+        # ── async mode (round_config.mode == "async") ───────────────────
+        # Set by the active driver (AsyncLoop) when the game ends; the
+        # per-team agent supervisors loop until this is set, then stop
+        # respawning. Stays clear in sync mode.
+        self._game_over: asyncio.Event = asyncio.Event()
+        # Long-lived per-team agent supervisor body, registered from main.py
+        # (the agent transport lives there, not in GameMgr). Signature:
+        #   async def handler(team_id, cfg) -> None
+        self._async_supervisor_handler: (
+            Callable[[str, AgentConfig], Awaitable[None]] | None
+        ) = None
+        # Best-effort kill of every live agent process, registered from
+        # main.py. Called by stop() in async mode BEFORE draining so the
+        # in-flight run_phase returns instead of blocking the drain grace.
+        self._kill_all_agents: Callable[[], Awaitable[None]] | None = None
+        # Wall-clock start of the current async flag-rotation tick; status()
+        # uses it to report seconds_to_rotation. None until the loop ticks.
+        self._async_round_started_ts: float | None = None
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
@@ -311,11 +333,20 @@ class GameMgr:
         if self.health_poller is None:
             self._build_health_facility()
 
-        # RoundLoop calls back into GameMgr at each phase / round boundary
-        # (enter_defense_phase, enter_attack_phase, on_round_start,
-        # on_round_stop, on_game_end) so dispatch happens via methods, not
-        # event subscriptions.
-        self.round_loop = RoundLoop(self, self.orchestrator.network, self.config.rounds)
+        # Pick the driver by mode. Sync: RoundLoop's DEFENSE↔ATTACK state
+        # machine (fresh agent per phase, network toggled per phase). Async:
+        # AsyncLoop's single LIVE game (one long-lived supervised agent per
+        # team, networks always-on, round tick only rotates flags). Both
+        # call back into GameMgr via the same method vocabulary; the sync
+        # arm is byte-identical to before.
+        if self.config.rounds.mode == "async":
+            self.round_loop = AsyncLoop(self, self.orchestrator.network, self.config.rounds)
+        else:
+            # RoundLoop calls back into GameMgr at each phase / round boundary
+            # (enter_defense_phase, enter_attack_phase, on_round_start,
+            # on_round_stop, on_game_end) so dispatch happens via methods, not
+            # event subscriptions.
+            self.round_loop = RoundLoop(self, self.orchestrator.network, self.config.rounds)
         await self.round_loop.run()
 
     def _build_health_facility(self) -> None:
@@ -661,6 +692,152 @@ class GameMgr:
         self._track_kickoffs(tasks)
         return tasks
 
+    # ── async mode: one long-lived supervised agent per team ────────────
+
+    def register_async_supervisor_handler(
+        self,
+        handler: Callable[[str, AgentConfig], Awaitable[None]],
+    ) -> None:
+        """Register the per-team long-lived agent supervisor (async mode).
+
+        Signature: `async def handler(team_id, cfg) -> None`. The body
+        prompts the agent ONCE (combined attack+defense briefing carried in
+        `cfg.system_prompt`) and respawns it with `--continue` if it exits
+        before game-over, looping until `is_game_over()`. Kept external (in
+        main.py) for the same reason as the phase kickoff handlers — GameMgr
+        doesn't own the agent transport. `None` = event-only mode (tests)."""
+        self._async_supervisor_handler = handler
+
+    def register_kill_all_agents(
+        self,
+        handler: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Register a best-effort 'kill every live agent process' callback
+        (async mode). `stop()` calls it BEFORE draining so the in-flight
+        long-lived run_phase returns instead of blocking the drain grace."""
+        self._kill_all_agents = handler
+
+    def start_async_agents(self) -> list[asyncio.Task]:
+        """Fire one long-lived supervised agent per team. Called once by
+        AsyncLoop at game start. Returns the tasks so tests can await them.
+
+        No-op (returns []) if no supervisor handler was registered
+        (event-only mode for tests that drive AsyncLoop without real agents).
+        """
+        if self._async_supervisor_handler is None:
+            return []
+        handler = self._async_supervisor_handler
+
+        async def _safe(team_id: str, cfg: AgentConfig) -> None:
+            try:
+                await handler(team_id, cfg)
+            except Exception:
+                log.exception("async supervisor handler raised for %s", team_id)
+
+        tasks: list[asyncio.Task] = []
+        for team in self.config.topology.teams:
+            try:
+                cfg = self.async_agent_config_for(team.id)
+            except Exception:
+                log.exception(
+                    "async_agent_config_for failed for %s; skipping", team.id,
+                )
+                continue
+            self._agent_briefed.add(team.id)
+            tasks.append(asyncio.create_task(_safe(team.id, cfg)))
+
+        self._track_kickoffs(tasks)
+        return tasks
+
+    def is_game_over(self) -> bool:
+        """True once the active driver has ended the game. The async agent
+        supervisors poll this to stop respawning."""
+        return self._game_over.is_set()
+
+    async def record_async_chunk_started(
+        self, team_id: str, chunk_n: int, prompt: str,
+    ) -> None:
+        """AGENT_PROMPT_SENT for one async agent invocation ("chunk"). chunk 0
+        is the full combined briefing; later chunks are the resume nudge."""
+        round_id = self.round_loop.round if self.round_loop is not None else 0
+        self.timeline.record(
+            EventType.AGENT_PROMPT_SENT,
+            team_id=team_id,
+            round_id=round_id,
+            phase=Phase.LIVE.value,
+            payload={
+                "chunk": chunk_n,
+                "is_first": chunk_n == 0,
+                "prompt_first_line": (prompt.splitlines()[0] if prompt else ""),
+            },
+        )
+
+    async def record_async_chunk_done(
+        self,
+        team_id: str,
+        chunk_n: int,
+        result,  # agents.transport.CommandResult
+        started_at: float,
+        ended_at: float,
+    ) -> None:
+        """Artifact persistence + terminal AGENT_* event for one finished
+        async chunk. Mirrors `record_phase_done` but writes chunk-numbered
+        files into the team's `round-0` dir (async has no per-round phase
+        split) and tags events with `phase=LIVE`."""
+        from .artifacts import ArtifactKind
+
+        duration_ms = int((ended_at - started_at) * 1000)
+
+        if self.artifacts is not None:
+            try:
+                base = self.artifacts.path_for(
+                    ArtifactKind.API_LOG,
+                    team_id=team_id, round_id=0,
+                    filename=f"stream-async-{chunk_n}.jsonl",
+                ).parent
+                (base / f"stream-async-{chunk_n}.jsonl").write_bytes(result.stdout)
+                (base / f"agent-async-{chunk_n}.log").write_bytes(
+                    result.stdout + result.stderr
+                )
+                (base / f"metadata-async-{chunk_n}.json").write_text(json.dumps({
+                    "chunk": chunk_n,
+                    "phase": Phase.LIVE.value,
+                    "exit_code": result.exit_code,
+                    "timed_out": result.timed_out,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "duration_ms": duration_ms,
+                }))
+            except Exception:
+                log.exception(
+                    "record_async_chunk_done: artifact write failed for %s chunk=%d",
+                    team_id, chunk_n,
+                )
+
+        round_id = self.round_loop.round if self.round_loop is not None else 0
+        payload = {
+            "chunk": chunk_n,
+            "exit_code": result.exit_code,
+            "duration_ms": duration_ms,
+            "started_at": started_at,
+            "ended_at": ended_at,
+        }
+        if result.pkilled_at is not None:
+            payload["pkilled_at"] = result.pkilled_at
+        if result.timed_out:
+            event_type = EventType.AGENT_TIMEOUT
+        elif result.exit_code == 0:
+            event_type = EventType.AGENT_COMPLETED
+        else:
+            event_type = EventType.AGENT_FAILED
+            payload["error_excerpt"] = f"non-zero exit {result.exit_code}"
+
+        self.timeline.record(
+            event_type,
+            team_id=team_id, round_id=round_id, phase=Phase.LIVE.value,
+            payload=payload,
+        )
+
     # ── DEFCON: end-of-round service-log snapshots ──────────────────────
 
     async def _persist_service_logs(self, round_id: int) -> None:
@@ -792,6 +969,18 @@ class GameMgr:
     async def stop(self) -> None:
         if self.round_loop is not None:
             self.round_loop.stop()
+        # Async mode: agents are long-lived and the in-flight run_phase can be
+        # mid-await on a multi-minute chunk. Cancelling the supervisor task
+        # does NOT kill the detached in-container claude, so kill the agent
+        # processes explicitly BEFORE draining — otherwise the drain blocks up
+        # to the chunk timeout. No-op (None) in sync mode, so sync stop() is
+        # unchanged. _game_over is also set so any looping supervisor exits.
+        self._game_over.set()
+        if self._kill_all_agents is not None:
+            try:
+                await self._kill_all_agents()
+            except Exception:
+                log.exception("stop: kill_all_agents failed")
         # Drain in-flight per-phase agent tasks BEFORE closing the timeline,
         # so the final round's transcripts + terminal AGENT_* events are
         # captured (the last attack agents are typically still wrapping up
@@ -804,13 +993,29 @@ class GameMgr:
     # ── read-only views ─────────────────────────────────────────────────
 
     def status(self) -> dict:
+        total = self.config.rounds.total_rounds
+        mode = self.config.rounds.mode
         if self.round_loop is None:
-            return {"phase": Phase.INIT.value, "round": 0, "total_rounds": self.config.rounds.total_rounds}
-        return {
-            "phase": self.round_loop.phase.value,
-            "round": self.round_loop.round,
-            "total_rounds": self.config.rounds.total_rounds,
-        }
+            st = {"phase": Phase.INIT.value, "round": 0, "total_rounds": total}
+        else:
+            st = {
+                "phase": self.round_loop.phase.value,
+                "round": self.round_loop.round,
+                "total_rounds": total,
+            }
+        # `mode` is global (not team-specific), safe to expose to any agent.
+        st["mode"] = mode
+        if mode == "async":
+            # Pacing hints for the self-directing async agent: how long the
+            # flag-rotation interval is, and roughly how long until the next
+            # rotation (flags it stole go stale at rotation).
+            st["round_secs"] = self.config.rounds.round_secs
+            if self._async_round_started_ts is not None:
+                elapsed = time.time() - self._async_round_started_ts
+                st["seconds_to_rotation"] = max(
+                    0, int(self.config.rounds.round_secs - elapsed)
+                )
+        return st
 
     async def submit_flag(self, team_id: str, flag: str) -> SubmitResult:
         """Thin delegate to FlagServer.submit. Kept `async` for caller
@@ -1342,6 +1547,69 @@ class GameMgr:
                 service_name=service_name,
                 port=port,
                 is_first=is_first,
+            ),
+        )
+
+    def async_agent_config_for(
+        self,
+        team_id: str,
+        submit_base_url: str = "http://host.docker.internal:8000",
+    ) -> AgentConfig:
+        """Build the per-team AgentConfig for ASYNC mode.
+
+        Combines the attack topology (opposing prods, like `agent_config_for`)
+        and the defense context (own service + port, like
+        `defense_agent_config_for`) into one config whose `system_prompt` is
+        the combined attack+defense briefing (`build_async_prompt`). Always
+        the full briefing — the supervisor sends the short resume nudge on
+        respawn itself, so there's no `is_first` parameter here.
+        """
+        base = self.config.agents.get(team_id)
+        if base is None:
+            raise KeyError(f"no agent config for team {team_id!r} in game.yaml")
+
+        teams_by_id = {t.id: t for t in self.config.topology.teams}
+        if team_id not in teams_by_id:
+            raise KeyError(f"unknown team_id {team_id!r}")
+        own_team = teams_by_id[team_id]
+        opposing = tuple(t.prod for tid, t in teams_by_id.items() if tid != team_id)
+
+        from .mcp_server import canonical_endpoint_url
+
+        cfg = replace(
+            base,
+            team_id=team_id,
+            team_token=own_team.token,
+            own_prod_host=own_team.prod,
+            own_prod_container_name=own_team.prod,
+            opposing_prod_hosts=opposing,
+            submit_url=f"{submit_base_url.rstrip('/')}/game/flag/submit",
+            mcp_endpoint=canonical_endpoint_url(submit_base_url),
+        )
+
+        # The single configured challenge for this team drives both halves of
+        # the prompt (attack target service + own defendable service + port).
+        # A challenge is defendable iff it exposes a restart_handler (attack-
+        # only challenges like notes don't) — when it isn't, the defense half
+        # collapses to a one-liner so the agent doesn't call restart_service
+        # on a service that would reject it.
+        service: str | None = None
+        port = 0
+        defendable = False
+        deployable = [c for c in self.config.challenges if team_id in c.deploy_on]
+        if len(deployable) == 1:
+            service = deployable[0].name
+            try:
+                challenge = build_challenge(service)
+                port = next(iter(challenge.vulbox.exposed_ports.values()), 0)
+                defendable = challenge.restart_handler is not None
+            except KeyError:
+                port = 0
+        return replace(
+            cfg,
+            system_prompt=build_async_prompt(
+                cfg, service_name=service, port=port,
+                defendable=defendable, is_first=True,
             ),
         )
 

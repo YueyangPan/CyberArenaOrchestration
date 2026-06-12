@@ -186,6 +186,19 @@ _ROUND_RE = re.compile(r"^round-(?P<round>\d+)$")
 # Phases run defense → attack within a round; a plain string sort would
 # put "attack" before "defense". Rank so transcripts list chronologically.
 _PHASE_RANK = {"defense": 0, "attack": 1}
+# Async mode writes `stream-async-<n>.jsonl` chunks (no defense/attack split).
+_ASYNC_RE = re.compile(r"^async-(?P<n>\d+)$")
+
+
+def _phase_sort_key(phase: str) -> tuple[int, int]:
+    """Order transcripts within a (team, round): sync phases defense→attack,
+    then async chunks by their numeric index. Unknown phases sort last."""
+    if phase in _PHASE_RANK:
+        return (_PHASE_RANK[phase], 0)
+    m = _ASYNC_RE.match(phase)
+    if m:
+        return (50, int(m.group("n")))
+    return (99, 0)
 
 # Parsed-result cache keyed by run dir → ((path, mtime_ns, size) signature,
 # transcripts). The panel polls collect_transcripts every few seconds and
@@ -234,6 +247,6 @@ def collect_transcripts(run_dir: Path | str) -> list[dict]:
             "stats": summary_stats(events),
             "events": [asdict(e) for e in events],
         })
-    out.sort(key=lambda t: (t["team_id"], t["round_id"], _PHASE_RANK.get(t["phase"], 99)))
+    out.sort(key=lambda t: (t["team_id"], t["round_id"], _phase_sort_key(t["phase"])))
     _CACHE[str(run_dir)] = (sig, out)
     return out

@@ -32,6 +32,10 @@ class Phase(str, Enum):
     SETUP = "SETUP"
     DEFENSE = "DEFENSE"
     ATTACK = "ATTACK"
+    # Async mode: attack + defense happen simultaneously (no DEFENSE/ATTACK
+    # split). The game sits at LIVE for its whole duration; AsyncLoop only
+    # ticks flag rotations underneath. STOPPED at end, same as sync.
+    LIVE = "LIVE"
     STOPPED = "STOPPED"
 
 

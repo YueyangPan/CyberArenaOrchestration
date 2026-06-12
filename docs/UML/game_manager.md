@@ -140,7 +140,26 @@ classDiagram
   RoundLoop ..> GameMgr : calls on_round_start / enter_*_phase / on_round_stop / on_game_end
 ```
 
-## Phase state machine
+## Game mode: sync vs async
+
+`round_config.mode` selects the driver assigned to `self.round_loop` (kept as
+"the active driver" so `status()`/`stop()` don't branch):
+
+- **sync** — `RoundLoop` ([round.py](../../gamemgr/round.py)): strict
+  DEFENSE↔ATTACK phases, a fresh agent process per phase, cross-team network
+  toggled per phase. State machine below.
+- **async** — `AsyncLoop` ([async_loop.py](../../gamemgr/async_loop.py)): one
+  continuous game at `Phase.LIVE`. Networks connected once and left up (attack
+  + defense simultaneous); one long-lived **supervised** agent per team
+  (prompted once via `async_agent_config_for` → `build_async_prompt`, respawned
+  with `--continue` by the main.py supervisor until `is_game_over()`); health
+  polling runs continuously; a "round" tick only rotates flags every
+  `round_secs`. Submission/restart are never phase-gated because `LIVE` is
+  neither `DEFENSE` nor `ATTACK`. Per-team chunk artifacts via
+  `record_async_chunk_started/done`; `stop()` calls the registered
+  `kill_all_agents` before draining.
+
+## Phase state machine (sync mode)
 
 ```mermaid
 stateDiagram-v2
@@ -162,6 +181,10 @@ stateDiagram-v2
     HealthPoller running (per-spec interval)
   end note
 ```
+
+In **async mode** the machine collapses to `… SETUP --> LIVE --> STOPPED`: cross-team
+net OPEN throughout, HealthPoller running throughout, flags rotated on each
+`round_secs` tick.
 
 ## RoundLoop ↔ GameMgr dispatch
 

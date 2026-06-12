@@ -232,7 +232,8 @@ def test_get_game_state_returns_snapshot(server, game):
     res = asyncio.run(_call_tool(TOKEN_TEAM1, "get_game_state"))
     state = _result_dict(res)
     assert state == game.status(), f"get_game_state diverged from status(): {state}"
-    assert set(state) == {"phase", "round", "total_rounds"}, state
+    # `mode` is always present; async runs also add round_secs/seconds_to_rotation.
+    assert {"phase", "round", "total_rounds", "mode"} <= set(state), state
 
 
 @pytest.mark.parametrize("tool", ["submit_flag", "get_game_state", "report_ready", "report_deploy_complete"])

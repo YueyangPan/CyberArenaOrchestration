@@ -16,6 +16,7 @@ import docker
 import uvicorn
 
 from agents.manager import AgentManager
+from agents.prompts import ASYNC_RESUME_NUDGE
 from agents.registry import build as build_agent_manager
 from agents.transport_docker import DockerExecBackend
 from gamemgr.api import build_app
@@ -69,6 +70,22 @@ _DRY_RUN_PROMPT = (
 # would only fire if the transport itself hung).
 DRY_RUN_AGENT_TIMEOUT_SECS = 180.0
 
+# ── async-mode supervisor tuning ────────────────────────────────────────
+# Per-invocation ("chunk") cap on the long-lived async agent. Generous: the
+# agent is meant to loop continuously until the game ends, so this is a hang
+# safety net (and an upper bound on per-process context growth for very long
+# games — a timed-out chunk is respawned with --continue, losing no memory).
+# End-of-game teardown does NOT rely on this — stop() kills agents explicitly.
+ASYNC_CHUNK_TIMEOUT_SECS = 3600.0
+# If a chunk exits faster than this, treat it as an unhealthy/crash exit for
+# backoff purposes (a healthy agent runs for minutes). Cold-start can be slow,
+# so this is well below a normal first-token latency budget but above an
+# instant auth/mcp.json failure.
+ASYNC_MIN_HEALTHY_SECS = 20.0
+# Give up respawning a team's agent after this many consecutive fast exits, so
+# a broken config (bad api_key, unreachable MCP) can't hot-loop the API.
+ASYNC_MAX_FAST_EXITS = 5
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cyberarena")
@@ -111,9 +128,14 @@ async def _run_start(args) -> int:
     orch = Orchestrator(graph=cfg.topology)
     game = GameMgr(config=cfg, orchestrator=orch)
 
-    # Persistent-memory v1: install once pre-loop, run_phase per phase.
-    # Wires install + defense/attack kickoff handlers on game.
-    _wire_phase_kickoffs(game)
+    # Persistent-memory v1: install once pre-loop, run_phase per phase (sync)
+    # or one long-lived supervised agent per team (async). Both wire install +
+    # dry-run handlers; they differ only in how agents are driven during the
+    # game.
+    if cfg.rounds.mode == "async":
+        _wire_async_supervisor(game)
+    else:
+        _wire_phase_kickoffs(game)
 
     # Open the run + bring the API server up BEFORE the arena bring-up so
     # the live panel can connect and stream the bring-up events.
@@ -250,22 +272,17 @@ def _build_challenge_images(config_path: str) -> None:
         log.info("built/cached %d challenge image(s): %s", len(tags), tags)
 
 
-def _wire_phase_kickoffs(game: GameMgr) -> None:
-    """Wire the agent layer into GameMgr for persistent-memory v1.
+def _wire_agent_common(game: GameMgr):
+    """Shared agent-layer setup for both modes: one transport
+    (DockerExecBackend), one manager per provider (via `agents.registry.build`),
+    and the two pre-loop handlers GameMgr.start() always runs —
 
-    One transport (DockerExecBackend), one manager per provider
-    (resolved via `agents.registry.build`). Three handlers:
+      * `install_handler` — once per team from `game.install_all_agents()`;
+        bridges the sync `AgentManager.install` into the loop via executor.
+      * `dry_run_handler` — pre-R1 readiness probe (one report_ready call).
 
-      * `install_handler`  — runs once per team from
-        `game.install_all_agents()` (pre-loop). Bridges the sync
-        `AgentManager.install` into the loop via run_in_executor.
-      * `_make_phase_handler` (defense + attack) — runs per (team,
-        phase) from the kickoff subscribers. The whole body is the
-        5-line dance: lookup handle → record_phase_started →
-        mgr.run_phase → record_phase_done. All CLI-specific
-        details (prompt path, claude argv, kill pattern) live behind
-        `mgr.PROMPT_PATH` / `mgr.phase_command()` / `mgr.PHASE_KILL_PATTERN`.
-    """
+    Returns `(backend, _mgr_for)` so the caller can wire the mode-specific
+    agent driver (sync per-phase kickoffs or the async supervisor)."""
     client = docker.from_env()
     backend = DockerExecBackend(client=client)
 
@@ -335,6 +352,19 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
 
     game.register_dry_run_handler(dry_run_handler)
 
+    return backend, _mgr_for
+
+
+def _wire_phase_kickoffs(game: GameMgr) -> None:
+    """Sync mode: wire per-phase defense/attack kickoff handlers.
+
+    Each runs per (team, phase) from the kickoff subscribers. The whole body
+    is the 5-line dance: lookup handle → record_phase_started → mgr.run_phase
+    → record_phase_done. CLI-specific details (prompt path, claude argv, kill
+    pattern) live behind `mgr.PROMPT_PATH` / `mgr.phase_command()` /
+    `mgr.PHASE_KILL_PATTERN`."""
+    backend, _mgr_for = _wire_agent_common(game)
+
     # ── per-phase kickoff handler ──────────────────────────────────────
     def _make_phase_handler(timeout_secs: float):
         async def handler(
@@ -387,6 +417,120 @@ def _wire_phase_kickoffs(game: GameMgr) -> None:
     game.register_attack_kickoff_handler(
         _make_phase_handler(game.config.rounds.attack_secs)
     )
+
+
+async def _run_async_agent(
+    game: GameMgr,
+    backend,
+    mgr: AgentManager,
+    handle,
+    team_id: str,
+    cfg: AgentConfig,
+) -> None:
+    """The long-lived async agent loop for one team.
+
+    Prompts the agent ONCE with the combined briefing (`cfg.system_prompt`),
+    then respawns it with the short resume nudge (`--continue` carries the
+    briefing in session memory) whenever it exits before the game is over.
+    A crash-loop guard (fast-exit backoff + giveup) stops a broken config from
+    hot-looping the API. Module-level (not a closure) so it's unit-testable
+    with fakes."""
+    from gamemgr.events import EventType
+
+    model = cfg.model or None
+    prompt = cfg.system_prompt or ""   # chunk 0 = full combined briefing
+    n = 0
+    fast_exits = 0
+    while not game.is_game_over():
+        await game.record_async_chunk_started(team_id, n, prompt)
+        started_at = time.time()
+        try:
+            result = await mgr.run_phase(
+                backend, handle, prompt,
+                timeout=ASYNC_CHUNK_TIMEOUT_SECS, model=model,
+            )
+        except Exception as e:
+            log.exception("async supervisor: run_phase raised for %s (chunk %d)", team_id, n)
+            game.timeline.record(
+                EventType.AGENT_FAILED,
+                team_id=team_id, round_id=0, phase="LIVE",
+                payload={"chunk": n, "error": f"{type(e).__name__}: {e}"[:200]},
+            )
+            result = None
+        ended_at = time.time()
+
+        if result is not None:
+            await game.record_async_chunk_done(team_id, n, result, started_at, ended_at)
+
+        if game.is_game_over():
+            break
+
+        # Crash-loop guard: a healthy agent runs for minutes. Repeated
+        # near-instant exits mean a broken config (bad token, MCP unreachable)
+        # — back off, and give up before hot-looping the API.
+        if (ended_at - started_at) < ASYNC_MIN_HEALTHY_SECS:
+            fast_exits += 1
+            if fast_exits >= ASYNC_MAX_FAST_EXITS:
+                log.warning(
+                    "async supervisor: team %s exited fast %d times; giving up",
+                    team_id, fast_exits,
+                )
+                game.timeline.record(
+                    EventType.AGENT_FAILED,
+                    team_id=team_id, round_id=0, phase="LIVE",
+                    payload={"chunk": n, "error": f"gave up after {fast_exits} fast exits"},
+                )
+                break
+            await asyncio.sleep(min(2 ** fast_exits, 30))
+        else:
+            fast_exits = 0
+        n += 1
+        prompt = ASYNC_RESUME_NUDGE
+
+
+def _wire_async_supervisor(game: GameMgr) -> None:
+    """Async mode: wire one long-lived supervised agent per team.
+
+    Resolves each team's dev handle + manager, then drives the agent via
+    `_run_async_agent`. `kill_all_agents` lets stop() reap live agents so
+    end-of-game teardown doesn't block on the chunk timeout."""
+    backend, _mgr_for = _wire_agent_common(game)
+
+    async def supervisor(team_id: str, cfg: AgentConfig) -> None:
+        team = next((t for t in game.config.topology.teams if t.id == team_id), None)
+        if team is None or not team.dev:
+            log.warning("async supervisor: team %s has no dev container; skipping", team_id)
+            return
+        try:
+            handle = game.handle_for(team.dev)
+        except Exception:
+            log.exception("async supervisor: cannot resolve dev handle for %s", team_id)
+            return
+        await _run_async_agent(game, backend, _mgr_for(team_id), handle, team_id, cfg)
+
+    game.register_async_supervisor_handler(supervisor)
+
+    async def kill_all_agents() -> None:
+        """Best-effort pkill of every team's claude process. Called by stop()
+        before draining so an in-flight chunk returns promptly."""
+        loop = asyncio.get_running_loop()
+        for team in game.config.topology.teams:
+            if not team.dev:
+                continue
+            try:
+                handle = game.handle_for(team.dev)
+            except Exception:
+                continue
+            mgr = _mgr_for(team.id)
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda h=handle, m=mgr: backend.kill_process(h, m.PHASE_KILL_PATTERN),
+                )
+            except Exception:
+                log.exception("kill_all_agents: pkill failed for %s", team.id)
+
+    game.register_kill_all_agents(kill_all_agents)
 
 
 if __name__ == "__main__":

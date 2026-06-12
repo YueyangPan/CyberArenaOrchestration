@@ -132,18 +132,24 @@ def build_mcp_app(game: "GameMgr") -> tuple[FastMCP, "Starlette"]:
 
     @mcp.tool()
     async def get_game_state(ctx: Context) -> dict:
-        """Query the live game state. Returns {phase, round, total_rounds}.
+        """Query the live game state. Returns {phase, round, total_rounds, mode}.
 
         Read-only. Agents get a state snapshot baked into their startup
         prompt, but that snapshot goes stale during a long task — call this
         to confirm the current round/phase before a phase-sensitive action
         (e.g. to avoid burning a WRONG_PHASE submit during DEFENSE).
 
+        In ASYNC mode this is the agent's primary clock: it is the only way
+        to learn the current round (flags rotate each round) and to detect
+        game-over (phase == STOPPED). Async responses also carry `round_secs`
+        and `seconds_to_rotation` (time until the next flag rotation).
+
         Requires a valid X-Team-Token like every other tool, but the
         response is identical for all teams — it carries no team-specific
         or opponent information, so it's safe to expose to any live agent.
 
-        phase is one of: INIT, PREFLIGHT, SETUP, DEFENSE, ATTACK, STOPPED.
+        phase is one of: INIT, PREFLIGHT, SETUP, DEFENSE, ATTACK, LIVE
+        (async mode runs at LIVE the whole game), STOPPED.
         """
         _team_id_from_ctx(ctx)
         return game.status()
