@@ -213,6 +213,36 @@ def test_async_prompt_drops_defense_for_attack_only_service():
     assert "No defendable service" in cfg.system_prompt
 
 
+def test_async_prompt_folds_per_challenge_defense_for_defendable_service():
+    """A defendable challenge (nautilus-ico) folds its RICH per-challenge
+    defense content (source layout + vuln hotspots) into the combined
+    briefing, minus the phase-gate language."""
+    game = _make_game(
+        challenges=[ChallengeConfig(name="nautilus-ico", type="nautilus-ico",
+                                    port=4265, deploy_on=["team1"])],
+        agents=_agents("team1"),
+    )
+    p = game.async_agent_config_for("team1").system_prompt
+    assert "ATTACK PLAYBOOK" in p and "DEFENSE PLAYBOOK" in p
+    assert "DO NOT SUBMIT" not in p              # phase gate dropped for async
+    assert "LIKELY VULN HOTSPOTS" in p           # per-challenge defense content folded in
+    assert "image.pas" in p
+
+
+def test_generic_defense_phase_gated_toggle():
+    """generic_defense_prompt includes the WRONG_PHASE block only when gated."""
+    from agents.prompts import generic_defense_prompt
+    cfg = AgentConfig(cli="c", model="m", api_key="k", base_url="u",
+                      team_id="team1", own_prod_host="team1_prod")
+    gated = generic_defense_prompt(cfg, service_name="svc", port=1, source_dir="/s",
+                                   phase_gated=True)
+    ungated = generic_defense_prompt(cfg, service_name="svc", port=1, source_dir="/s",
+                                     phase_gated=False)
+    assert "DO NOT SUBMIT" in gated
+    assert "DO NOT SUBMIT" not in ungated
+    assert "DEFENSE RECIPE" in ungated           # the actual recipe is kept
+
+
 # ── status() / get_game_state fields ────────────────────────────────────
 
 

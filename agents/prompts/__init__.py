@@ -29,7 +29,7 @@ from models.agent import AgentConfig
 # Re-export so legacy `from agents.prompts import submit_block` callers
 # keep working. New code should import from `agents.prompts._helpers`.
 from ._helpers import (  # noqa: F401
-    async_defense_block,
+    NO_DEFENDABLE_SERVICE,
     generic_defense_prompt,
     short_attack_cue,
     short_defense_cue,
@@ -88,12 +88,18 @@ def build_defense_prompt(
     port: int,
     source_dir: str = "/srv/challenge",
     is_first: bool = True,
+    phase_gated: bool = True,
 ) -> str:
     """Return the defense-mode prompt for `service_name`.
 
     `is_first=True` (default) → full briefing for the first phase.
     `is_first=False` → short continuation cue (the full source-layout +
     SSH instructions live in Claude's `--continue` session memory).
+
+    `phase_gated=True` (default, sync mode) includes the "DO NOT SUBMIT /
+    WRONG_PHASE" block; `phase_gated=False` (async mode) omits it, since
+    attack and defense run simultaneously there. Per-challenge
+    `build_defense_prompt` overrides must accept `phase_gated`.
 
     Per-challenge module may export `build_defense_prompt` to override
     the generic recipe — useful when the challenge wants to hint at
@@ -105,9 +111,11 @@ def build_defense_prompt(
     if mod is not None and hasattr(mod, "build_defense_prompt"):
         return mod.build_defense_prompt(
             cfg, service_name=service_name, port=port, source_dir=source_dir,
+            phase_gated=phase_gated,
         )
     return generic_defense_prompt(
         cfg, service_name=service_name, port=port, source_dir=source_dir,
+        phase_gated=phase_gated,
     )
 
 
@@ -132,12 +140,17 @@ def build_async_prompt(
     the agent doesn't waste turns calling restart_service on a service that
     rejects it.
     """
-    # Reuse the per-challenge attack body (concrete exploit + submit_block) and
-    # a phase-neutral defense block; frame both under one continuous loop.
+    # Reuse the SAME per-challenge bodies as sync — the full attack recipe and
+    # the full defense recipe (source layout, vuln hotspots, mitigations) — just
+    # with the defense's WRONG_PHASE block dropped (phase_gated=False). Frame
+    # both under one continuous loop.
     attack = build_attack_prompt(cfg, service_name=service_name, is_first=True)
-    defense = async_defense_block(
-        cfg, service_name=(service_name if defendable else None), port=port,
-    )
+    if defendable and service_name:
+        defense = build_defense_prompt(
+            cfg, service_name=service_name, port=port, phase_gated=False,
+        )
+    else:
+        defense = NO_DEFENDABLE_SERVICE
     return f"""\
 You are the autonomous agent for team {cfg.team_id} in an ASYNC Attack/Defense CTF.
 

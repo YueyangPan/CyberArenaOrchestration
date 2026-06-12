@@ -73,9 +73,13 @@ Mirror `RoundLoop`'s constructor `(game, network, config)` and surface so
   async `round_secs`/`seconds_to_rotation`; `async_agent_config_for(team_id)`.
 - `agents/prompts/` — `build_async_prompt(cfg, *, service_name, port, defendable)`:
   the agent's ONLY prompt, given once at start and re-sent verbatim on restart (no
-  separate resume prompt). Concatenate existing attack body + a phase-neutral
-  defense block in a loop wrapper; drop WRONG_PHASE language; reuse per-challenge
-  bodies + `submit_block`.
+  separate resume prompt). Frames the SAME per-challenge attack body + the SAME
+  per-challenge defense body as sync under one continuous loop — the defense body
+  comes from `build_defense_prompt(..., phase_gated=False)`, which drops only the
+  WRONG_PHASE block (keeping source layout / vuln hotspots / mitigations). A
+  `phase_gated` flag was threaded through the defense dispatcher → per-challenge
+  override (nautilus_ico) + `generic_defense_prompt`. Non-defendable services
+  (attack-only, e.g. notes) get the `NO_DEFENDABLE_SERVICE` one-liner instead.
 - `main.py` — `_wire_async_supervisor(game)` (parallel to `_wire_phase_kickoffs`,
   reusing `backend`/`_mgr_for`/`handle_for`): per-team supervisor + `kill_all_agents`
   callback. Branch in `_run_start` on `cfg.rounds.mode`. Constants
